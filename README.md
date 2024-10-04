@@ -3,7 +3,7 @@
 
 ![Syncra](./Syncra.png)
 
-### Plex Playlist Dock is a powerful and intuitive application designed to manage your Plex playlists effortlessly. With a modern and user-friendly interface, it allows you to:
+### Syncra is a powerful and intuitive application designed to manage your Plex playlists effortlessly. With a modern and user-friendly interface, it allows you to:
 
 - Import .m3u and .m3u8 playlists into Plex.
 - Export your Plex playlists to .m3u files.
