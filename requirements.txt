@@ -1,0 +1,10 @@
+PyQt5
+PyQtWebEngine
+requests
+PlexAPI
+bs4
+deezer-python
+spotipy
+fuzzywuzzy 
+python-Levenshtein
+Pillow
