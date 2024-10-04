@@ -1,7 +1,7 @@
 
-## Plex Playlist Dock
+## Syncra
 
-![Plex_Dock](./Plex_Playlist_Dock.png)
+![Plex_Dock](./Syncra.png)
 
 ### Plex Playlist Dock is a powerful and intuitive application designed to manage your Plex playlists effortlessly. With a modern and user-friendly interface, it allows you to:
 
