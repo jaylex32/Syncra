@@ -219,15 +219,15 @@ class PlaylistConverterThread(QThread):
             response = requests.get(f'https://api.spotify.com/v1/playlists/{playlist_id}', headers=headers)
             response.raise_for_status()
             playlist_data = response.json()
-
+    
             tracks = []
             for item in playlist_data['tracks']['items']:
                 track = item['track']
                 tracks.append(f"{track['name']} - {track['artists'][0]['name']}")
-
+    
             playlist_name = playlist_data['name']
             playlist_image_url = playlist_data['images'][0]['url'] if playlist_data['images'] else None
-
+    
             logging.info(f"Fetched {len(tracks)} tracks from Spotify playlist '{playlist_name}'")
             return tracks, playlist_name, playlist_image_url
         except Exception as e:
@@ -303,6 +303,21 @@ class PlaylistConverterThread(QThread):
         except Exception as e:
             raise ValueError(f"Error reading local playlist file: {e}")
 
+    def set_playlist_thumbnail(self, plex_playlist, image_url):
+        try:
+            poster_url = f"{self.plex_server._baseurl}/library/metadata/{plex_playlist.ratingKey}/posters"
+            querystring = {
+                "url": image_url,
+                "X-Plex-Token": self.plex_server._token
+            }
+            payload = ""
+            response = requests.post(poster_url, data=payload, params=querystring)
+            response.raise_for_status()
+            logging.info(f"Successfully set thumbnail for playlist '{plex_playlist.title}'")
+        except Exception as e:
+            logging.error(f"Error setting playlist thumbnail: {str(e)}")
+            raise    
+
     def create_plex_playlist(self, tracks, playlist_name, playlist_image_url):
         try:
             library_section = self.plex_server.library.sectionByID(self.library_section)
@@ -317,22 +332,14 @@ class PlaylistConverterThread(QThread):
                 else:
                     not_found_tracks.append(track)
                 self.progress_update.emit(50 + int((i + 1) / total_tracks * 50))
-
+    
             if plex_tracks:
                 plex_playlist = self.plex_server.createPlaylist(playlist_name, items=plex_tracks)
                 
                 # Set the playlist image if available
                 if playlist_image_url:
                     try:
-                        encoded_url = quote(playlist_image_url)
-                        poster_url = f"{self.plex_server._baseurl}/library/metadata/{plex_playlist.ratingKey}/posters"
-                        params = {
-                            'url': encoded_url,
-                            'X-Plex-Token': self.plex_server._token
-                        }
-                        response = requests.post(poster_url, params=params)
-                        response.raise_for_status()
-                        logging.info(f"Successfully set thumbnail for playlist '{playlist_name}'")
+                        self.set_playlist_thumbnail(plex_playlist, playlist_image_url)
                     except Exception as thumb_error:
                         logging.error(f"Failed to set thumbnail: {str(thumb_error)}")
                 
