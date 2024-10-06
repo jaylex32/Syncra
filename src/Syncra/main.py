@@ -180,10 +180,22 @@ class PlaylistConverterThread(QThread):
             playlist_uuid = self.playlist_source.split('/')[-1]
             playlist_data = self.tidal_client.get_playlist(playlist_uuid)
             tracks_data = self.tidal_client.get_playlist_tracks(playlist_uuid)
-
+    
+            # Log the entire playlist data
+            logging.debug(f"Full Tidal playlist data: {json.dumps(playlist_data, indent=2)}")
+    
             playlist_name = playlist_data['title']
-            playlist_image_url = playlist_data['image']
-
+            
+            # Get the squareImage UUID
+            square_image_uuid = playlist_data.get('squareImage')
+            if square_image_uuid:
+                playlist_image_url = f"https://resources.tidal.com/images/{square_image_uuid.replace('-', '/')}/640x640.jpg"
+            else:
+                logging.warning("No squareImage UUID found in the Tidal playlist data")
+                playlist_image_url = None
+    
+            logging.debug(f"Constructed Tidal playlist image URL: {playlist_image_url}")
+    
             tracks = []
             with ThreadPoolExecutor(max_workers=25) as executor:
                 future_to_track = {executor.submit(self.process_tidal_track, item): item for item in tracks_data['items']}
@@ -192,8 +204,9 @@ class PlaylistConverterThread(QThread):
                     if track:
                         tracks.append(track)
                     self.progress_update.emit(int(len(tracks) / tracks_data['totalNumberOfItems'] * 50))
-
+    
             logging.info(f"Fetched {len(tracks)} tracks from Tidal playlist '{playlist_name}'")
+            
             return tracks, playlist_name, playlist_image_url
         except Exception as e:
             logging.error(f"Error fetching Tidal playlist: {str(e)}")
@@ -270,19 +283,23 @@ class PlaylistConverterThread(QThread):
             raise ValueError(f"Error fetching Deezer playlist: {e}")
 
     def get_deezer_playlist_info(self):
-        playlist_id = self.playlist_source.split('/')[-1]
-        playlist = self.deezer_client.get_playlist(playlist_id)
-        
-        tracks = []
-        for track in playlist.tracks:
-            tracks.append(f"{track.title} - {track.artist.name}")
-            self.progress_update.emit(int(len(tracks) / playlist.nb_tracks * 50))
-
-        playlist_name = playlist.title
-        playlist_image_url = playlist.picture_xl
-
-        logging.info(f"Fetched {len(tracks)} tracks from Deezer playlist '{playlist_name}'")
-        return tracks, playlist_name, playlist_image_url
+        try:
+            playlist_id = self.playlist_source.split('/')[-1]
+            playlist = self.deezer_client.get_playlist(playlist_id)
+            
+            tracks = []
+            for track in playlist.tracks:
+                tracks.append(f"{track.title} - {track.artist.name}")
+                self.progress_update.emit(int(len(tracks) / playlist.nb_tracks * 50))
+    
+            playlist_name = playlist.title
+            playlist_image_url = playlist.picture_xl  # This is the high-quality image URL
+    
+            logging.info(f"Fetched {len(tracks)} tracks from Deezer playlist '{playlist_name}'")
+            return tracks, playlist_name, playlist_image_url
+        except Exception as e:
+            logging.error(f"Error fetching Deezer playlist: {str(e)}")
+            raise
 
     def get_deezer_playlist_image(self, image_url):
         try:
