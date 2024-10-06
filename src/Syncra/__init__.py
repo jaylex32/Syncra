@@ -1,1 +1,1 @@
-from .main import main
+from .Syncra import main
