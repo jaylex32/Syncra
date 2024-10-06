@@ -1,7 +1,7 @@
 [project]
 name = "Syncra"
 version = "1.6.5"
-description = Syncra is a powerful and intuitive application designed to manage your Plex playlists effortlessly. With a modern and user-friendly interface.
+description = "Syncra is a powerful and intuitive application designed to manage your Plex playlists effortlessly. With a modern and user-friendly interface."
 authors = [{name = "jaylex32", email = "jayrossproduction@gmail.com"}]
 [build-system]
 requires = ["hatchling"]
