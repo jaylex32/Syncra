@@ -11,5 +11,6 @@
 - Convert playlists from popular streaming services like Spotify, Deezer, and Tidal directly into Plex playlists.
 
 
+### If you like my work and want to buy me a coffee to support me, you can do so here: https://buymeacoffee.com/jayross
 
 
