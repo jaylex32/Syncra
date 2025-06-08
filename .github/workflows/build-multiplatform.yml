@@ -2,10 +2,12 @@ name: Build Syncra Multi-Platform
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:  # Allows manual trigger
+  release:
+    types: [created]
 
 jobs:
   build:
@@ -17,22 +19,22 @@ jobs:
           - os: windows-latest
             name: Windows
             ext: .exe
-            icon: --icon="Syncra Icon.ico"
+            build_cmd: python -m pyinstaller --onefile --windowed --name="Syncra-Windows" --icon="Syncra Icon.ico" --add-data="Syncra Icon.ico;." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
           - os: ubuntu-latest
             name: Linux
             ext: ""
-            icon: ""
+            build_cmd: xvfb-run -a python -m pyinstaller --onefile --windowed --name="Syncra-Linux" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
           - os: macos-latest
             name: macOS
             ext: ""
-            icon: ""
+            build_cmd: python -m pyinstaller --onefile --windowed --name="Syncra-macOS" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
@@ -40,41 +42,44 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
-        sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtsvg python3-pyqt5.qtwebengine xvfb-run
+        sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtsvg xvfb
 
     - name: Install system dependencies (macOS)
       if: matrix.os == 'macos-latest'
       run: |
-        brew install python-tk
+        brew install create-dmg || true
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
 
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install PyQt5 plexapi requests spotipy fuzzywuzzy python-levenshtein pyotp deezer-python Pillow pyinstaller
+        pip install pyinstaller
+        pip install -r requirements.txt
 
-    - name: Build executable (Windows)
-      if: matrix.os == 'windows-latest'
-      run: |
-        python -m pyinstaller --onefile --windowed --name="Syncra-${{ matrix.name }}" --icon="Syncra Icon.ico" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+    - name: Build executable
+      run: ${{ matrix.build_cmd }}
 
-    - name: Build executable (Linux)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        xvfb-run -a python -m pyinstaller --onefile --windowed --name="Syncra-${{ matrix.name }}" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+    - name: List dist contents (Debug)
+      run: ls -la dist/
 
-    - name: Build executable (macOS)
-      if: matrix.os == 'macos-latest'
-      run: |
-        python -m pyinstaller --onefile --windowed --name="Syncra-${{ matrix.name }}" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
       with:
         name: Syncra-${{ matrix.name }}
         path: dist/Syncra-${{ matrix.name }}${{ matrix.ext }}
+        retention-days: 30
 
-    - name: Create release assets
-      if: startsWith(github.ref, 'refs/tags/')
+    - name: Upload to release
+      if: github.event_name == 'release'
       uses: softprops/action-gh-release@v1
       with:
         files: dist/Syncra-${{ matrix.name }}${{ matrix.ext }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
