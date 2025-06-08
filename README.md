@@ -1,4 +1,4 @@
-# Syncra - Enhanced Plex Playlist Manager
+# Syncra - Plex Playlist Manager
 
 🎵 **Advanced playlist management for Plex Media Server with streaming service integration**
 
