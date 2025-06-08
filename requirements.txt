@@ -1,0 +1,9 @@
+PyQt5>=5.15.0
+plexapi>=4.13.0
+requests>=2.28.0
+spotipy>=2.22.0
+fuzzywuzzy>=0.18.0
+python-levenshtein>=0.20.0
+pyotp>=2.8.0
+deezer-python>=5.8.0
+Pillow>=9.0.0
