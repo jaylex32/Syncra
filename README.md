@@ -46,13 +46,21 @@ Get the latest version for your platform from the [Releases](https://github.com/
 4. Set **sync interval** (hourly, daily, etc.)
 5. **Enable auto-sync** and let Syncra keep your playlists updated!
 
-## 🛠️ System Requirements
+## 🚀 Download
 
+**Latest Version: [v2.0.1](https://github.com/jaylex32/Syncra/releases/latest)**
+
+| Platform | Download | Notes |
+|----------|----------|-------|
+| 🪟 **Windows** | [Syncra-Windows](https://github.com/jaylex32/Syncra/releases/latest/download/Syncra.zip) | Ready to run |
+| 🍎 **macOS** | [Syncra-macOS](https://github.com/jaylex32/Syncra/releases/latest/download/Syncra-macOS) | May need security approval |
+| 🐧 **Linux** | [Syncra-Linux](https://github.com/jaylex32/Syncra/releases/latest/download/Syncra-Linux) | Make executable first |
+
+### 📋 System Requirements
 - **Windows**: Windows 10/11 (64-bit)
-- **macOS**: macOS 10.14+ (Mojave or later)
+- **macOS**: macOS 10.14+ (Mojave or later)  
 - **Linux**: Ubuntu 18.04+ or equivalent
-- **Plex Media Server** with music library
-- **Internet connection** for streaming service sync
+- **All platforms**: Plex Media Server with music library
 
 ## 📱 Supported Streaming Services
 
