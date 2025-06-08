@@ -7,6 +7,9 @@
 ### Home
 ![Home](https://github-production-user-asset-6210df.s3.amazonaws.com/16381097/452819081-04819d16-4b33-4a9b-871a-94fb2d46a896.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20250608%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250608T204656Z&X-Amz-Expires=300&X-Amz-Signature=8e969b2c7adf725a78952b6eecd966ac9195d21d4dd815e57e58e52cf1a6ec6a&X-Amz-SignedHeaders=host)
 
+### Advanced Playlist Editor
+![Playlist Editor](https://github-production-user-asset-6210df.s3.amazonaws.com/16381097/452819350-45aa8375-6cb1-46e0-bab3-6a0a8197eb05.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20250608%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250608T205145Z&X-Amz-Expires=300&X-Amz-Signature=ddcfe4df4d2e7412844b27c3eb5213ed94338509c71daa71513cf30a44f850fa&X-Amz-SignedHeaders=host)
+
 ## ✨ Features
 
 - 🎛️ **Advanced Playlist Editor** with search, filtering, and drag-and-drop reordering
