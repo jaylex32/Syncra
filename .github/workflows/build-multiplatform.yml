@@ -50,7 +50,7 @@ jobs:
     - name: Build executable (Windows)
       if: matrix.os == 'windows-latest'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra-Windows" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+        pyinstaller --onefile --windowed --name="Syncra-Windows" --icon="Syncra Icon.ico" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
 
     - name: Build executable (Linux)
       if: matrix.os == 'ubuntu-latest'
