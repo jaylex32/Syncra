@@ -37,22 +37,15 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtsvg xvfb
 
-    - name: Upgrade pip
-      run: |
-        python -m pip install --upgrade pip
-
-    - name: Install PyInstaller
-      run: |
-        pip install pyinstaller
-
     - name: Install all dependencies
       run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
         pip install PyQt5 plexapi requests spotipy fuzzywuzzy python-levenshtein pyotp deezer-python Pillow
 
-    - name: Verify PyInstaller installation
+    - name: Verify PyInstaller (direct command only)
       run: |
         pyinstaller --version
-        python -m pyinstaller --version
 
     - name: Build executable (Windows)
       if: matrix.os == 'windows-latest'
