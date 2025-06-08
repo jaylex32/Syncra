@@ -64,9 +64,9 @@ Get the latest version for your platform from the [Releases](https://github.com/
 
 | Platform | Download | Notes |
 |----------|----------|-------|
-| 🪟 **Windows** | [Syncra-Windows](https://github.com/jaylex32/Syncra/releases/latest/download/Syncra.zip) | Ready to run |
-| 🍎 **macOS** | [Syncra-macOS](https://github.com/jaylex32/Syncra/releases/latest/download/Syncra-macOS) | May need security approval |
-| 🐧 **Linux** | [Syncra-Linux](https://github.com/jaylex32/Syncra/releases/latest/download/Syncra-Linux) | Make executable first |
+| 🪟 **Windows** | [Syncra-Windows](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-Windows.zip) | Ready to run |
+| 🍎 **macOS** | [Syncra-macOS](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-macOS.zip) | May need security approval |
+| 🐧 **Linux** | [Syncra-Linux](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-Linux.zip) | Make executable first |
 
 ### 📋 System Requirements
 - **Windows**: Windows 10/11 (64-bit)
