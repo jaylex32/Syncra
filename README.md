@@ -103,6 +103,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## ⭐ Show Your Support
 
+ - If you like my work and want to buy me a coffee to support me, you can do so here: https://buymeacoffee.com/jayross
+
+
 If Syncra makes managing your Plex playlists easier, please:
 - ⭐ **Star this repository**
 - 🔄 **Share with fellow Plex users**
