@@ -10,6 +10,9 @@
 ### Advanced Playlist Editor
 ![Playlist Editor](https://github-production-user-asset-6210df.s3.amazonaws.com/16381097/452819350-45aa8375-6cb1-46e0-bab3-6a0a8197eb05.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20250608%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250608T205145Z&X-Amz-Expires=300&X-Amz-Signature=ddcfe4df4d2e7412844b27c3eb5213ed94338509c71daa71513cf30a44f850fa&X-Amz-SignedHeaders=host)
 
+### Sync Manager
+![Sync Manager](https://github.com/user-attachments/assets/fb07dc8d-a905-457b-91f2-6a436a2fdf2d)
+
 ## ✨ Features
 
 - 🎛️ **Advanced Playlist Editor** with search, filtering, and drag-and-drop reordering
