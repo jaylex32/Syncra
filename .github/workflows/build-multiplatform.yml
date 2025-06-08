@@ -43,7 +43,7 @@ jobs:
         pip install pyinstaller
         pip install PyQt5 plexapi requests spotipy fuzzywuzzy python-levenshtein pyotp deezer-python Pillow
 
-    - name: Verify PyInstaller (direct command only)
+    - name: Verify PyInstaller
       run: |
         pyinstaller --version
 
@@ -62,7 +62,13 @@ jobs:
       run: |
         pyinstaller --onefile --windowed --name="Syncra-macOS" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
 
-    - name: List build output
+    - name: List build output (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        dir dist\
+
+    - name: List build output (Unix)
+      if: matrix.os != 'windows-latest'
       run: |
         ls -la dist/
 
