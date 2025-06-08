@@ -1,7 +1,14 @@
 
-## Syncra
+# Syncra
 
-![Syncra](./Syncra.png)
+![Syncra](./assets/Syncra_Home.png)
+
+![Syncra](./assets/Syncra_Playlists.png)
+
+![Syncra](./assets/Syncra_Stream_Services.png)
+
+![Syncra](./assets/Syncra_Sync_Services.png)
+
 
 ### Syncra is a powerful and intuitive application designed to manage your Plex playlists effortlessly. With a modern and user-friendly interface, it allows you to:
 
