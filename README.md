@@ -13,6 +13,9 @@
 ### Sync Manager
 ![Sync Manager](https://github.com/user-attachments/assets/fb07dc8d-a905-457b-91f2-6a436a2fdf2d)
 
+### Tools & Utilities
+![Tools & Utilities](https://github.com/user-attachments/assets/02bd9f7d-7eab-4c83-950a-5a9d8ea20863)
+
 ## ✨ Features
 
 - 🎛️ **Advanced Playlist Editor** with search, filtering, and drag-and-drop reordering
