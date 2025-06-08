@@ -1,15 +1,6 @@
 
 # Syncra
 
-![Syncra](./assets/Syncra_Home.png)
-
-![Syncra](./assets/Syncra_Playlists.png)
-
-![Syncra](./assets/Syncra_Stream_Services.png)
-
-![Syncra](./assets/Syncra_Sync_Services.png)
-
-
 ### Syncra is a powerful and intuitive application designed to manage your Plex playlists effortlessly. With a modern and user-friendly interface, it allows you to:
 
 - Import .m3u and .m3u8 playlists into Plex.
@@ -19,5 +10,14 @@
 
 
 ### If you like my work and want to buy me a coffee to support me, you can do so here: https://buymeacoffee.com/jayross
+
+![Syncra](./assets/Syncra_Home.png)
+
+![Syncra](./assets/Syncra_Playlists.png)
+
+![Syncra](./assets/Syncra_Stream_Services.png)
+
+![Syncra](./assets/Syncra_Sync_Services.png)
+
 
 
