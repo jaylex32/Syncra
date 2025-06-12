@@ -33,6 +33,8 @@ import re
 from fuzzywuzzy import fuzz
 from datetime import datetime, timedelta
 import threading
+from email.utils import parsedate_to_datetime
+import secrets
 
 CONFIG_FILE = "app_config.json"
 SYNC_CONFIG_FILE = "sync_config.json"
@@ -1898,183 +1900,291 @@ class SpotifyAnonymousAuth:
 
     def generate_totp(self):
         """
-        Generate Spotify auth TOTP using the PyOTP library
-        This matches the TypeScript implementation which uses the TOTP library
+        Generate TOTP using the updated method from the GitHub solution
         """
         try:
-            # Secret cipher bytes exactly as in TypeScript
-            secret_cipher_bytes = [12, 56, 76, 33, 88, 44, 88, 33, 78, 78, 11, 66, 22, 22, 55, 69, 54]
+            secret_cipher_bytes = [
+                12, 56, 76, 33, 88, 44, 88, 33,
+                78, 78, 11, 66, 22, 22, 55, 69, 54
+            ]
             
-            # Apply the XOR operation as in TypeScript
-            secret_bytes = []
-            for i, e in enumerate(secret_cipher_bytes):
-                secret_bytes.append(e ^ ((i % 33) + 9))
+            # Apply transformation as in the GitHub solution
+            transformed = [e ^ ((t % 33) + 9) for t, e in enumerate(secret_cipher_bytes)]
+            joined = "".join(str(num) for num in transformed)
             
-            # Join the bytes to a string
-            secret_str = ''.join(str(b) for b in secret_bytes)
+            # Simplified hex conversion
+            hex_str = joined.encode().hex()
+            secret = base64.b32encode(bytes.fromhex(hex_str)).decode().rstrip("=")
             
-            # Convert to bytes and encode to base32
-            secret_bytes_encoded = secret_str.encode('utf-8')
-            secret = base64.b32encode(secret_bytes_encoded).decode('utf-8')
+            # Return TOTP object
+            return pyotp.TOTP(secret, digits=6, interval=30)
             
-            # Get server time from Spotify
-            response = requests.get('https://open.spotify.com/server-time')
-            server_time_seconds = response.json()['serverTime']
-            
-            # Create a TOTP object using the PyOTP library
-            totp_obj = pyotp.TOTP(secret)
-            
-            # Generate TOTP at the specific time
-            # Note: PyOTP uses .now() instead of .at() 
-            # We need to use a custom timecode based on Spotify's server time
-            timecode = int(server_time_seconds // 30)
-            otp = totp_obj.generate_otp(timecode)
-            
-            logging.info(f"Generated TOTP: {otp}")
-            return otp
         except Exception as e:
-            logging.error(f"Error generating TOTP: {str(e)}", exc_info=True)
+            logging.error(f"Error generating TOTP: {str(e)}")
             raise
 
     def get_token(self):
         """
-        Get Spotify token using TOTP and multiple user agents
+        Get Spotify token using the updated authentication method
         """
         if self.access_token and time.time() < self.token_expiration:
             return self.access_token
-
-        # Try the main method with TOTP
+    
         try:
-            timestamp = int(time.time())
-            totp = self.generate_totp()
+            session = requests.Session()
             
-            logging.info(f"Attempting to get Spotify token with TOTP: {totp} and timestamp: {timestamp}")
+            # Get server time using the new method
+            server_time = self.fetch_server_time(session)
             
-            # User agents to try
-            user_agents = [
-                # Spotify app user agent
-                self.spotify_user_agent,
-                # iPhone user agent
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-                # Chrome user agent
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36",
+            # Generate TOTP
+            totp_obj = self.generate_totp()
+            client_time = int(time.time() * 1000)  # milliseconds
+            otp_value = totp_obj.at(server_time)
+            
+            logging.info(f"Generated OTP: {otp_value} for server time: {server_time}")
+            
+            # Updated parameters based on the GitHub solution
+            params = {
+                "reason": "transport",
+                "productType": "web_player",
+                "totp": otp_value,
+                "totpVer": 5,
+                "sTime": server_time,
+                "cTime": client_time,
+                "buildDate": time.strftime("%Y-%m-%d", time.gmtime(server_time)),
+                "buildVer": f"web-player_{time.strftime('%Y-%m-%d', time.gmtime(server_time))}_{server_time * 1000}_{secrets.token_hex(4)}",
+            }
+            
+            # Updated headers based on the GitHub solution
+            headers = {
+                "User-Agent": self.spotify_user_agent,
+                "Accept": "application/json",
+                "Referer": "https://open.spotify.com/",
+                "App-Platform": "WebPlayer",
+            }
+            
+            # Try the updated token URL first
+            token_urls = [
+                "https://open.spotify.com/api/token",  # New URL from GitHub solution
+                "https://open.spotify.com/get_access_token"  # Fallback to old URL
             ]
             
-            # Try each user agent
-            for agent in user_agents:
+            for token_url in token_urls:
                 try:
-                    response = requests.get(
-                        'https://open.spotify.com/get_access_token',
-                        params={
-                            'reason': 'transport',
-                            'productType': 'web_player',
-                            'totp': totp,
-                            'totpVer': '5',
-                            'ts': timestamp
-                        },
-                        headers={
-                            'User-Agent': agent,
-                            'app-platform': 'WebPlayer',
-                        }
+                    logging.info(f"Attempting to get token from: {token_url}")
+                    
+                    response = session.get(
+                        token_url,
+                        params=params,
+                        headers=headers,
+                        timeout=15
                     )
                     
                     if response.status_code == 200:
                         data = response.json()
                         
-                        # Check if token is valid (contains '_' or '-' as in TypeScript)
-                        if '_' in data['accessToken'] or '-' in data['accessToken']:
+                        if 'accessToken' in data:
                             self.access_token = data['accessToken']
-                            self.token_expiration = data['accessTokenExpirationTimestampMs'] / 1000
+                            self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
                             self.client_id = data.get('clientId')
                             
-                            logging.info(f"Successfully obtained Spotify token with agent {agent}")
+                            logging.info(f"Successfully obtained token from {token_url}")
                             return self.access_token
+                        elif 'access_token' in data:
+                            # Handle different response format
+                            self.access_token = data['access_token']
+                            expires_in = data.get('expires_in', 3600)
+                            self.token_expiration = time.time() + expires_in
+                            self.client_id = data.get('client_id')
+                            
+                            logging.info(f"Successfully obtained token from {token_url} (alt format)")
+                            return self.access_token
+                    else:
+                        logging.warning(f"Failed to get token from {token_url}: HTTP {response.status_code}")
+                        
                 except Exception as e:
-                    logging.warning(f"Failed with agent {agent}: {str(e)}")
+                    logging.warning(f"Error with {token_url}: {str(e)}")
                     continue
-        
-            # If TOTP method fails, try alternative methods
-            alternative_methods = [
-                self._try_without_totp,
-                self._try_embed_method
-            ]
             
-            for method_num, method in enumerate(alternative_methods):
-                try:
-                    logging.info(f"Trying alternative method {method_num+1}")
-                    token = method()
-                    if token:
-                        return token
-                except Exception as e:
-                    logging.warning(f"Alternative method {method_num+1} failed: {str(e)}")
+            # If the updated method fails, try fallback methods
+            return self._try_fallback_methods(session)
             
-            # If all methods fail
-            raise ValueError("Failed to obtain Spotify access token through any available method")
-                
         except Exception as e:
-            logging.error(f"Failed to get Spotify anonymous token: {str(e)}", exc_info=True)
-            raise
-            
-    def _try_without_totp(self):
-        """Try to get token without TOTP"""
-        for agent in [
-            self.spotify_user_agent,
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-        ]:
+            logging.error(f"Error in main token method: {str(e)}")
+            # Try fallback methods
+            return self._try_fallback_methods()
+        
+    def fetch_server_time(self, session=None):
+       """
+       Fetch server time from Spotify using Date header instead of dedicated endpoint
+       """
+       if session is None:
+           session = requests.Session()
+           
+       headers = {
+           "Host": "open.spotify.com",
+           "User-Agent": self.spotify_user_agent,
+           "Accept": "*/*",
+       }
+       
+       try:
+           response = session.head("https://open.spotify.com/", headers=headers, timeout=10)
+           response.raise_for_status()
+           
+           # Extract server time from Date header
+           date_header = response.headers.get("Date")
+           if date_header:
+               server_time = int(parsedate_to_datetime(date_header).timestamp())
+               logging.info(f"Successfully obtained server time from Date header: {server_time}")
+               return server_time
+           else:
+               raise Exception("No Date header found in response")
+               
+       except Exception as e:
+           logging.warning(f"Failed to get server time from Date header: {str(e)}")
+           # Fallback to local time
+           return int(time.time())       
+        
+    def _try_fallback_methods(self, session=None):
+       """
+       Try fallback authentication methods
+       """
+       if session is None:
+           session = requests.Session()
+           
+       fallback_methods = [
+           self._try_without_totp,
+           self._try_embed_method,
+           self._try_web_player_method
+       ]
+       
+       for method in fallback_methods:
+           try:
+               token = method(session)
+               if token:
+                   return token
+           except Exception as e:
+               logging.warning(f"Fallback method {method.__name__} failed: {str(e)}")
+               continue
+               
+       raise ValueError("Failed to obtain Spotify access token through any available method")       
+     
+    def _try_web_player_method(self, session):
+        """Try alternative web player method"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://open.spotify.com/',
+        }
+        
+        # Try different parameter combinations
+        param_sets = [
+            {"reason": "transport", "productType": "web_player"},
+            {"reason": "init", "productType": "web_player"},
+            {"productType": "web_player"},
+        ]
+        
+        for params in param_sets:
             try:
-                response = requests.get(
-                    'https://open.spotify.com/get_access_token',
-                    params={
-                        'reason': 'transport',
-                        'productType': 'web_player'
-                    },
-                    headers={
-                        'User-Agent': agent,
-                        'app-platform': 'WebPlayer',
-                    }
+                response = session.get(
+                    "https://open.spotify.com/get_access_token",
+                    params=params,
+                    headers=headers,
+                    timeout=10
                 )
+                
                 if response.status_code == 200:
                     data = response.json()
-                    
-                    self.access_token = data['accessToken']
-                    self.token_expiration = data['accessTokenExpirationTimestampMs'] / 1000
-                    self.client_id = data.get('clientId')
-                    
-                    logging.info(f"Successfully obtained Spotify token without TOTP with agent: {agent}")
-                    return self.access_token
-            except:
+                    if 'accessToken' in data:
+                        self.access_token = data['accessToken']
+                        self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
+                        self.client_id = data.get('clientId')
+                        
+                        logging.info(f"Successfully obtained token with params: {params}")
+                        return self.access_token
+            except Exception as e:
                 continue
-        raise Exception("Failed to get token without TOTP")
+                
+        raise Exception("Web player method failed")     
+       
+    def is_token_valid(self):
+        """Check if current token is still valid"""
+        return self.access_token and time.time() < self.token_expiration
     
-    def _try_embed_method(self):
-        """Try simpler embed method"""
-        for agent in [
-            self.spotify_user_agent,
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-        ]:
-            try:
-                response = requests.get(
-                    'https://open.spotify.com/get_access_token',
-                    params={
-                        'reason': 'transport',
-                        'productType': 'embed'
-                    },
-                    headers={
-                        'User-Agent': agent
-                    }
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    
-                    self.access_token = data['accessToken']
-                    self.token_expiration = data['accessTokenExpirationTimestampMs'] / 1000
-                    self.client_id = data.get('clientId')
-                    
-                    logging.info(f"Successfully obtained Spotify token using embed method with agent: {agent}")
-                    return self.access_token
-            except:
-                continue
-        raise Exception("Failed to get token with embed method")
+    def refresh_token_if_needed(self):
+        """Refresh token if it's about to expire"""
+        if not self.is_token_valid():
+            self.access_token = None
+            self.token_expiration = 0
+            return self.get_token()
+        return self.access_token       
+            
+    def _try_without_totp(self, session):
+        """Try to get token without TOTP"""
+        headers = {
+            "User-Agent": self.spotify_user_agent,
+            "Accept": "application/json",
+            "Referer": "https://open.spotify.com/",
+            "App-Platform": "WebPlayer",
+        }
+        
+        params = {
+            "reason": "transport",
+            "productType": "web_player"
+        }
+        
+        response = session.get(
+            "https://open.spotify.com/get_access_token",
+            params=params,
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if 'accessToken' in data:
+                self.access_token = data['accessToken']
+                self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
+                self.client_id = data.get('clientId')
+                
+                logging.info("Successfully obtained token without TOTP")
+                return self.access_token
+        
+        raise Exception("No-TOTP method failed")
+    
+    def _try_embed_method(self, session):
+        """Try embed method"""
+        headers = {
+            "User-Agent": self.spotify_user_agent,
+            "Accept": "application/json",
+        }
+        
+        params = {
+            "reason": "transport",
+            "productType": "embed"
+        }
+        
+        response = session.get(
+            "https://open.spotify.com/get_access_token",
+            params=params,
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if 'accessToken' in data:
+                self.access_token = data['accessToken']
+                self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
+                self.client_id = data.get('clientId')
+                
+                logging.info("Successfully obtained token using embed method")
+                return self.access_token
+        
+        raise Exception("Embed method failed")
 
 class TidalClient:
     BASE_URL = 'https://api.tidal.com/v1/'
@@ -2160,61 +2270,141 @@ class PlaylistConverterThread(QThread):
 
     def get_spotify_playlist_info(self):
         """
-        Get Spotify playlist info using the token from SpotifyAnonymousAuth
+        Get Spotify playlist info with improved error handling and the fixed authentication
         """
-        try:
-            token = self.spotify_auth.get_token()
-            playlist_id = self.playlist_source.split('/')[-1].split('?')[0]
-            
-            logging.info(f"Successfully obtained token for Spotify. Processing playlist ID: {playlist_id}")
-            
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json',
-                'User-Agent': "Spotify/8.7.68.568 Android/30 (SM-N970F)"
-            }
-            
-            # Get playlist details
-            logging.info(f"Fetching playlist details from Spotify API")
-            response = requests.get(f'https://api.spotify.com/v1/playlists/{playlist_id}', headers=headers)
-            response.raise_for_status()
-            playlist_data = response.json()
-            
-            playlist_name = playlist_data['name']
-            playlist_image_url = playlist_data['images'][0]['url'] if playlist_data['images'] else None
-            
-            logging.info(f"Found playlist: {playlist_name} with {playlist_data['tracks']['total']} tracks")
-            
-            # Get all tracks (handle pagination)
-            tracks = []
-            tracks_url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks'
-            
-            total_tracks = playlist_data['tracks']['total']
-            processed_tracks = 0
-            
-            while tracks_url:
-                logging.info(f"Fetching tracks batch from Spotify API: {processed_tracks}/{total_tracks}")
-                response = requests.get(tracks_url, headers=headers)
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Use the new authentication method
+                token = self.spotify_auth.refresh_token_if_needed()
+                playlist_id = self.playlist_source.split('/')[-1].split('?')[0]
+                
+                logging.info(f"Processing Spotify playlist ID: {playlist_id} (attempt {retry_count + 1})")
+                
+                headers = {
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json',
+                    'User-Agent': self.spotify_auth.spotify_user_agent,
+                    'Accept': 'application/json',
+                    'Referer': 'https://open.spotify.com/',
+                }
+                
+                # Get playlist details
+                logging.info("Fetching playlist details from Spotify API")
+                response = requests.get(
+                    f'https://api.spotify.com/v1/playlists/{playlist_id}',
+                    headers=headers,
+                    timeout=30
+                )
+                
+                # Handle different HTTP status codes
+                if response.status_code == 401:  # Unauthorized
+                    logging.warning("Token expired or invalid, attempting to refresh...")
+                    self.spotify_auth.access_token = None  # Force token refresh
+                    retry_count += 1
+                    time.sleep(2)  # Brief pause before retry
+                    continue
+                elif response.status_code == 429:  # Rate limited
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    logging.warning(f"Rate limited, waiting {retry_after} seconds...")
+                    time.sleep(min(retry_after, 60))
+                    retry_count += 1
+                    continue
+                elif response.status_code == 403:  # Forbidden
+                    raise ValueError("Access denied. Playlist may be private or unavailable.")
+                elif response.status_code == 404:  # Not found
+                    raise ValueError("Playlist not found. Please check the URL.")
+                
                 response.raise_for_status()
-                tracks_data = response.json()
+                playlist_data = response.json()
                 
-                for item in tracks_data['items']:
-                    if item['track']:
-                        track = item['track']
-                        artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
-                        tracks.append(f"{track['name']} - {artist_name}")
-                        processed_tracks += 1
-                        if total_tracks > 0:  # Avoid division by zero
-                            self.progress_update.emit(int(processed_tracks / total_tracks * 50))
+                playlist_name = playlist_data['name']
+                playlist_image_url = playlist_data['images'][0]['url'] if playlist_data['images'] else None
+                total_tracks = playlist_data['tracks']['total']
                 
-                # Get next page if it exists
-                tracks_url = tracks_data.get('next')
-    
-            logging.info(f"Successfully fetched {len(tracks)} tracks from Spotify playlist '{playlist_name}'")
-            return tracks, playlist_name, playlist_image_url
-        except Exception as e:
-            logging.error(f"Error fetching Spotify playlist: {str(e)}", exc_info=True)
-            raise
+                logging.info(f"Found playlist: {playlist_name} with {total_tracks} tracks")
+                
+                # Get all tracks with pagination
+                tracks = []
+                tracks_url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=50'
+                processed_tracks = 0
+                
+                while tracks_url:
+                    try:
+                        logging.info(f"Fetching tracks batch: {processed_tracks}/{total_tracks}")
+                        
+                        response = requests.get(tracks_url, headers=headers, timeout=30)
+                        
+                        # Handle rate limiting for tracks
+                        if response.status_code == 429:
+                            retry_after = int(response.headers.get('Retry-After', 30))
+                            logging.warning(f"Rate limited on tracks, waiting {retry_after} seconds...")
+                            time.sleep(min(retry_after, 30))
+                            continue
+                        elif response.status_code == 401:
+                            # Token expired during track fetching
+                            logging.warning("Token expired during track fetching, refreshing...")
+                            token = self.spotify_auth.get_token()  # Get fresh token
+                            headers['Authorization'] = f'Bearer {token}'
+                            continue
+                        
+                        response.raise_for_status()
+                        tracks_data = response.json()
+                        
+                        for item in tracks_data['items']:
+                            if item and item.get('track'):
+                                track = item['track']
+                                if track and track.get('name'):
+                                    artist_name = 'Unknown Artist'
+                                    if track.get('artists') and len(track['artists']) > 0:
+                                        artist_name = track['artists'][0]['name']
+                                    
+                                    tracks.append(f"{track['name']} - {artist_name}")
+                                    processed_tracks += 1
+                                    
+                                    # Update progress
+                                    if total_tracks > 0:
+                                        progress = int((processed_tracks / total_tracks) * 50)
+                                        self.progress_update.emit(progress)
+                        
+                        # Get next page
+                        tracks_url = tracks_data.get('next')
+                        
+                        # Small delay to avoid rate limits
+                        if tracks_url:
+                            time.sleep(0.1)
+                            
+                    except requests.exceptions.Timeout:
+                        logging.warning("Request timeout, retrying...")
+                        time.sleep(2)
+                        continue
+                    except requests.exceptions.ConnectionError:
+                        logging.warning("Connection error, retrying...")
+                        time.sleep(5)
+                        continue
+        
+                logging.info(f"Successfully fetched {len(tracks)} tracks from Spotify playlist '{playlist_name}'")
+                return tracks, playlist_name, playlist_image_url
+                
+            except ValueError as e:
+                # Don't retry on these errors
+                logging.error(f"Spotify playlist error: {str(e)}")
+                raise
+                
+            except Exception as e:
+                logging.error(f"Unexpected error on attempt {retry_count + 1}: {str(e)}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = 2 ** retry_count  # Exponential backoff
+                    logging.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise ValueError(f"Failed to fetch Spotify playlist after {max_retries} attempts: {str(e)}")
+        
+        raise ValueError("Failed to fetch Spotify playlist after all retry attempts")
 
     def get_deezer_playlist_info(self):
         playlist_id = self.playlist_source.split('/')[-1]
