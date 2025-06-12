@@ -1,8 +1,20 @@
-# Syncra - Enhanced Plex Playlist Manager
+# Syncra - Plex Playlist Manager
 
 🎵 **Advanced playlist management for Plex Media Server with streaming service integration**
 
-![Build Status](https://github.com/yourusername/syncra/workflows/Build%20Syncra%20Multi-Platform/badge.svg)
+## 📸 Screenshots
+
+### Home
+![Home](https://github-production-user-asset-6210df.s3.amazonaws.com/16381097/452819081-04819d16-4b33-4a9b-871a-94fb2d46a896.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20250608%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250608T204656Z&X-Amz-Expires=300&X-Amz-Signature=8e969b2c7adf725a78952b6eecd966ac9195d21d4dd815e57e58e52cf1a6ec6a&X-Amz-SignedHeaders=host)
+
+### Advanced Playlist Editor
+![Playlist Editor](https://github-production-user-asset-6210df.s3.amazonaws.com/16381097/452819350-45aa8375-6cb1-46e0-bab3-6a0a8197eb05.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20250608%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250608T205145Z&X-Amz-Expires=300&X-Amz-Signature=ddcfe4df4d2e7412844b27c3eb5213ed94338509c71daa71513cf30a44f850fa&X-Amz-SignedHeaders=host)
+
+### Sync Manager
+![Sync Manager](https://github.com/user-attachments/assets/fb07dc8d-a905-457b-91f2-6a436a2fdf2d)
+
+### Tools & Utilities
+![Tools & Utilities](https://github.com/user-attachments/assets/02bd9f7d-7eab-4c83-950a-5a9d8ea20863)
 
 ## ✨ Features
 
@@ -46,13 +58,21 @@ Get the latest version for your platform from the [Releases](https://github.com/
 4. Set **sync interval** (hourly, daily, etc.)
 5. **Enable auto-sync** and let Syncra keep your playlists updated!
 
-## 🛠️ System Requirements
+## 🚀 Download
 
+**Latest Version: [v2.0.1](https://github.com/jaylex32/Syncra/releases/latest)**
+
+| Platform | Download | Notes |
+|----------|----------|-------|
+| 🪟 **Windows** | [Syncra-Windows](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-Windows.zip) | Ready to run |
+| 🍎 **macOS** | [Syncra-macOS](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-macOS.zip) | Untested |
+| 🐧 **Linux** | [Syncra-Linux](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-Linux.zip) | Untested |
+
+### 📋 System Requirements
 - **Windows**: Windows 10/11 (64-bit)
-- **macOS**: macOS 10.14+ (Mojave or later)
+- **macOS**: macOS 10.14+ (Mojave or later)  
 - **Linux**: Ubuntu 18.04+ or equivalent
-- **Plex Media Server** with music library
-- **Internet connection** for streaming service sync
+- **All platforms**: Plex Media Server with music library
 
 ## 📱 Supported Streaming Services
 
@@ -82,6 +102,9 @@ Built with:
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## ⭐ Show Your Support
+
+ - If you like my work and want to buy me a coffee to support me, you can do so here: https://buymeacoffee.com/jayross
+
 
 If Syncra makes managing your Plex playlists easier, please:
 - ⭐ **Star this repository**
