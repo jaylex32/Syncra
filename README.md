@@ -29,7 +29,7 @@
 
 ## 🚀 Download
 
-Get the latest version for your platform from the [Releases](https://github.com/yourusername/syncra/releases) page:
+Get the latest version for your platform from the [Releases](https://github.com/jaylex32/syncra/releases) page:
 
 - **🪟 Windows**: `Syncra-Windows.exe`
 - **🍎 macOS**: `Syncra-macOS`
