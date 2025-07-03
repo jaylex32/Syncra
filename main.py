@@ -1895,232 +1895,307 @@ class SpotifyAnonymousAuth:
         self.access_token = None
         self.token_expiration = 0
         self.client_id = None
-        # Use a Spotify mobile app user agent
-        self.spotify_user_agent = "Spotify/8.7.68.568 Android/30 (SM-N970F)"
+        # Use a modern browser user agent for better compatibility
+        self.spotify_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        self.user_agent = self.spotify_user_agent  # For compatibility
+        self.session = requests.Session()
+        
+        # Configure session with retries
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=3,
+            connect=2,
+            read=2,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD", "OPTIONS"],
+            raise_on_status=False,
+            respect_retry_after_header=True
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def generate_totp(self):
         """
-        Generate TOTP using the updated method from the GitHub solution
+        Generate TOTP using the exact same method as the working JavaScript version
         """
         try:
-            secret_cipher_bytes = [
-                12, 56, 76, 33, 88, 44, 88, 33,
-                78, 78, 11, 66, 22, 22, 55, 69, 54
-            ]
+            # cipher
+            secret_cipher_bytes = [37, 84, 32, 76, 87, 90, 87, 47, 13, 75, 48, 54, 44, 28, 19, 21, 22]
             
-            # Apply transformation as in the GitHub solution
+            # Apply transformation: e ^ ((t % 33) + 9)
             transformed = [e ^ ((t % 33) + 9) for t, e in enumerate(secret_cipher_bytes)]
+            
+            # Join as string and encode
             joined = "".join(str(num) for num in transformed)
+            secret_bytes = joined.encode('utf-8')
+            secret = base64.b32encode(secret_bytes).decode().rstrip("=")
             
-            # Simplified hex conversion
-            hex_str = joined.encode().hex()
-            secret = base64.b32encode(bytes.fromhex(hex_str)).decode().rstrip("=")
+            # Create TOTP object
+            totp_obj = pyotp.TOTP(secret, digits=6, interval=30)
             
-            # Return TOTP object
-            return pyotp.TOTP(secret, digits=6, interval=30)
+            logging.info(f"Generated TOTP secret successfully")
+            return totp_obj
             
         except Exception as e:
             logging.error(f"Error generating TOTP: {str(e)}")
             raise
 
-    def get_token(self):
+    def fetch_server_time(self):
         """
-        Get Spotify token using the updated authentication method
+        Fetch server time from Spotify using Date header
         """
-        if self.access_token and time.time() < self.token_expiration:
-            return self.access_token
-    
+        headers = {
+            "User-Agent": self.spotify_user_agent,
+            "Accept": "*/*",
+        }
+        
         try:
-            session = requests.Session()
+            response = self.session.head("https://open.spotify.com/", headers=headers, timeout=10)
+            response.raise_for_status()
             
-            # Get server time using the new method
-            server_time = self.fetch_server_time(session)
+            # Extract server time from Date header
+            date_header = response.headers.get("Date")
+            if date_header:
+                server_time = int(parsedate_to_datetime(date_header).timestamp())
+                logging.info(f"Successfully obtained server time: {server_time}")
+                return server_time
+            else:
+                raise Exception("No Date header found in response")
+                
+        except Exception as e:
+            logging.warning(f"Failed to get server time from Date header: {str(e)}")
+            # Fallback to local time
+            return int(time.time())
+
+    def generate_random_hex(self, length=8):
+        """Generate random hex string for unique requests"""
+        return secrets.token_hex(length // 2)
+
+    def validate_token(self, access_token, client_id=None):
+        """
+        Test if token is valid by making a lightweight API call
+        """
+        try:
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'User-Agent': self.spotify_user_agent,
+            }
+            
+            if client_id:
+                headers['Client-Id'] = client_id
+
+            # Try markets endpoint first (public data)
+            response = self.session.get('https://api.spotify.com/v1/markets', 
+                                      headers=headers, timeout=10)
+            
+            logging.info(f"Token validation response: {response.status_code}")
+            
+            if response.status_code == 200:
+                return True
+            
+            # Fallback: try a track endpoint
+            response = self.session.get('https://api.spotify.com/v1/tracks/4iV5W9uYEdYUVa79Axb7Rh', 
+                                      headers=headers, timeout=10)
+            
+            # Consider token valid if we don't get 401 Unauthorized
+            return response.status_code != 401
+            
+        except Exception as e:
+            logging.warning(f"Token validation failed: {str(e)}")
+            return False
+
+    def refresh_access_token(self, mode='transport'):
+        """
+        Refresh access token using the updated method
+        """
+        try:
+            server_time = self.fetch_server_time()
+            client_time = int(time.time() * 1000)  # milliseconds
             
             # Generate TOTP
             totp_obj = self.generate_totp()
-            client_time = int(time.time() * 1000)  # milliseconds
             otp_value = totp_obj.at(server_time)
             
             logging.info(f"Generated OTP: {otp_value} for server time: {server_time}")
             
-            # Updated parameters based on the GitHub solution
+            # Build parameters
             params = {
-                "reason": "transport",
-                "productType": "web_player",
+                "reason": mode,
+                "productType": "web-player",
                 "totp": otp_value,
-                "totpVer": 5,
+                "totpServer": otp_value,
+                "totpVer": 8,
                 "sTime": server_time,
                 "cTime": client_time,
                 "buildDate": time.strftime("%Y-%m-%d", time.gmtime(server_time)),
-                "buildVer": f"web-player_{time.strftime('%Y-%m-%d', time.gmtime(server_time))}_{server_time * 1000}_{secrets.token_hex(4)}",
+                "buildVer": f"web-player_{time.strftime('%Y-%m-%d', time.gmtime(server_time))}_{server_time * 1000}_{self.generate_random_hex(8)}",
             }
             
-            # Updated headers based on the GitHub solution
+            # Headers
             headers = {
                 "User-Agent": self.spotify_user_agent,
                 "Accept": "application/json",
                 "Referer": "https://open.spotify.com/",
                 "App-Platform": "WebPlayer",
+                "Origin": "https://open.spotify.com",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
             }
             
-            # Try the updated token URL first
-            token_urls = [
-                "https://open.spotify.com/api/token",  # New URL from GitHub solution
-                "https://open.spotify.com/get_access_token"  # Fallback to old URL
-            ]
+            # Try the updated token URL
+            response = self.session.get(
+                "https://open.spotify.com/api/token",
+                params=params,
+                headers=headers,
+                timeout=15
+            )
             
-            for token_url in token_urls:
-                try:
-                    logging.info(f"Attempting to get token from: {token_url}")
+            if response.status_code == 200:
+                data = response.json()
+                
+                if 'accessToken' in data:
+                    token_data = {
+                        'access_token': data['accessToken'],
+                        'expires_at': data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000,
+                        'client_id': data.get('clientId', ''),
+                    }
                     
-                    response = session.get(
-                        token_url,
-                        params=params,
-                        headers=headers,
-                        timeout=15
-                    )
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        
-                        if 'accessToken' in data:
-                            self.access_token = data['accessToken']
-                            self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
-                            self.client_id = data.get('clientId')
-                            
-                            logging.info(f"Successfully obtained token from {token_url}")
-                            return self.access_token
-                        elif 'access_token' in data:
-                            # Handle different response format
-                            self.access_token = data['access_token']
-                            expires_in = data.get('expires_in', 3600)
-                            self.token_expiration = time.time() + expires_in
-                            self.client_id = data.get('client_id')
-                            
-                            logging.info(f"Successfully obtained token from {token_url} (alt format)")
-                            return self.access_token
-                    else:
-                        logging.warning(f"Failed to get token from {token_url}: HTTP {response.status_code}")
-                        
-                except Exception as e:
-                    logging.warning(f"Error with {token_url}: {str(e)}")
-                    continue
+                    logging.info(f"Successfully obtained token from {mode} mode")
+                    return token_data
             
-            # If the updated method fails, try fallback methods
-            return self._try_fallback_methods(session)
+            raise Exception(f"Failed to get token in {mode} mode: HTTP {response.status_code}")
             
         except Exception as e:
-            logging.error(f"Error in main token method: {str(e)}")
-            # Try fallback methods
+            logging.error(f"Error in refresh_access_token ({mode}): {str(e)}")
+            raise
+
+    def get_token(self):
+        """
+        Get Spotify token using the updated authentication method with fallbacks
+        """
+        # Return cached token if still valid
+        if self.access_token and time.time() < self.token_expiration:
+            if self.validate_token(self.access_token, self.client_id):
+                logging.info("✅ Using cached valid token")
+                return self.access_token
+            else:
+                logging.info("❌ Cached token is invalid, refreshing...")
+                self.access_token = None
+
+        max_retries = 3
+        last_error = None
+
+        # Try transport mode first
+        logging.info("🚀 Trying transport mode...")
+        for attempt in range(1, max_retries + 1):
+            try:
+                logging.info(f"📡 Transport mode attempt {attempt}/{max_retries}...")
+                
+                token_data = self.refresh_access_token('transport')
+                
+                # Validate token
+                logging.info("🔐 Validating token...")
+                if self.validate_token(token_data['access_token'], token_data.get('client_id')):
+                    logging.info("✅ Transport mode token validated successfully!")
+                    
+                    # Cache the successful token
+                    self.access_token = token_data['access_token']
+                    self.token_expiration = token_data['expires_at']
+                    self.client_id = token_data.get('client_id')
+                    
+                    return self.access_token
+                else:
+                    logging.warning("⚠️ Token validation failed, but proceeding anyway")
+                    # Accept token even if validation fails (for anonymous tokens)
+                    self.access_token = token_data['access_token']
+                    self.token_expiration = token_data['expires_at']
+                    self.client_id = token_data.get('client_id')
+                    
+                    return self.access_token
+                    
+            except Exception as e:
+                last_error = e
+                logging.warning(f"❌ Transport mode attempt {attempt} failed: {str(e)}")
+                
+                if attempt < max_retries:
+                    delay = 2 ** (attempt - 1)  # Exponential backoff
+                    logging.info(f"⏳ Waiting {delay}s before retry...")
+                    time.sleep(delay)
+
+        # If transport mode failed, try init mode
+        logging.info("🔄 Transport mode failed, trying init mode...")
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                logging.info(f"📡 Init mode attempt {attempt}/{max_retries}...")
+                
+                token_data = self.refresh_access_token('init')
+                
+                # Validate token
+                logging.info("🔐 Validating token...")
+                if self.validate_token(token_data['access_token'], token_data.get('client_id')):
+                    logging.info("✅ Init mode token validated successfully!")
+                else:
+                    logging.warning("⚠️ Token validation failed, but proceeding anyway")
+                
+                # Accept token regardless of validation result
+                self.access_token = token_data['access_token']
+                self.token_expiration = token_data['expires_at']
+                self.client_id = token_data.get('client_id')
+                
+                logging.info("✅ Token set successfully!")
+                return self.access_token
+                
+            except Exception as e:
+                last_error = e
+                logging.warning(f"❌ Init mode attempt {attempt} failed: {str(e)}")
+                
+                if attempt < max_retries:
+                    delay = 2 ** (attempt - 1)
+                    logging.info(f"⏳ Waiting {delay}s before retry...")
+                    time.sleep(delay)
+
+        # If all methods failed, try fallback methods
+        logging.info("🔄 All primary methods failed, trying fallbacks...")
+        try:
             return self._try_fallback_methods()
-        
-    def fetch_server_time(self, session=None):
-       """
-       Fetch server time from Spotify using Date header instead of dedicated endpoint
-       """
-       if session is None:
-           session = requests.Session()
-           
-       headers = {
-           "Host": "open.spotify.com",
-           "User-Agent": self.spotify_user_agent,
-           "Accept": "*/*",
-       }
-       
-       try:
-           response = session.head("https://open.spotify.com/", headers=headers, timeout=10)
-           response.raise_for_status()
-           
-           # Extract server time from Date header
-           date_header = response.headers.get("Date")
-           if date_header:
-               server_time = int(parsedate_to_datetime(date_header).timestamp())
-               logging.info(f"Successfully obtained server time from Date header: {server_time}")
-               return server_time
-           else:
-               raise Exception("No Date header found in response")
-               
-       except Exception as e:
-           logging.warning(f"Failed to get server time from Date header: {str(e)}")
-           # Fallback to local time
-           return int(time.time())       
-        
-    def _try_fallback_methods(self, session=None):
-       """
-       Try fallback authentication methods
-       """
-       if session is None:
-           session = requests.Session()
-           
-       fallback_methods = [
-           self._try_without_totp,
-           self._try_embed_method,
-           self._try_web_player_method
-       ]
-       
-       for method in fallback_methods:
-           try:
-               token = method(session)
-               if token:
-                   return token
-           except Exception as e:
-               logging.warning(f"Fallback method {method.__name__} failed: {str(e)}")
-               continue
-               
-       raise ValueError("Failed to obtain Spotify access token through any available method")       
-     
-    def _try_web_player_method(self, session):
-        """Try alternative web player method"""
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://open.spotify.com/',
-        }
-        
-        # Try different parameter combinations
-        param_sets = [
-            {"reason": "transport", "productType": "web_player"},
-            {"reason": "init", "productType": "web_player"},
-            {"productType": "web_player"},
+        except Exception as fallback_error:
+            logging.error(f"❌ All fallback methods failed: {str(fallback_error)}")
+
+        # Final failure
+        error_msg = f"Failed to obtain valid Spotify token after all attempts. Last error: {str(last_error)}"
+        logging.error(error_msg)
+        raise Exception(error_msg)
+
+    def _try_fallback_methods(self):
+        """
+        Try fallback authentication methods
+        """
+        fallback_methods = [
+            self._try_without_totp,
+            self._try_embed_method,
+            self._try_web_player_method
         ]
         
-        for params in param_sets:
+        for method in fallback_methods:
             try:
-                response = session.get(
-                    "https://open.spotify.com/get_access_token",
-                    params=params,
-                    headers=headers,
-                    timeout=10
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if 'accessToken' in data:
-                        self.access_token = data['accessToken']
-                        self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
-                        self.client_id = data.get('clientId')
-                        
-                        logging.info(f"Successfully obtained token with params: {params}")
-                        return self.access_token
+                logging.info(f"Trying fallback method: {method.__name__}")
+                token = method()
+                if token:
+                    return token
             except Exception as e:
+                logging.warning(f"Fallback method {method.__name__} failed: {str(e)}")
                 continue
                 
-        raise Exception("Web player method failed")     
-       
-    def is_token_valid(self):
-        """Check if current token is still valid"""
-        return self.access_token and time.time() < self.token_expiration
-    
-    def refresh_token_if_needed(self):
-        """Refresh token if it's about to expire"""
-        if not self.is_token_valid():
-            self.access_token = None
-            self.token_expiration = 0
-            return self.get_token()
-        return self.access_token       
-            
-    def _try_without_totp(self, session):
+        raise Exception("All fallback methods failed")
+
+    def _try_without_totp(self):
         """Try to get token without TOTP"""
         headers = {
             "User-Agent": self.spotify_user_agent,
@@ -2134,8 +2209,8 @@ class SpotifyAnonymousAuth:
             "productType": "web_player"
         }
         
-        response = session.get(
-            "https://open.spotify.com/get_access_token",
+        response = self.session.get(
+            "https://open.spotify.com/api/token",
             params=params,
             headers=headers,
             timeout=10
@@ -2153,8 +2228,8 @@ class SpotifyAnonymousAuth:
                 return self.access_token
         
         raise Exception("No-TOTP method failed")
-    
-    def _try_embed_method(self, session):
+
+    def _try_embed_method(self):
         """Try embed method"""
         headers = {
             "User-Agent": self.spotify_user_agent,
@@ -2166,8 +2241,8 @@ class SpotifyAnonymousAuth:
             "productType": "embed"
         }
         
-        response = session.get(
-            "https://open.spotify.com/get_access_token",
+        response = self.session.get(
+            "https://open.spotify.com/api/token",
             params=params,
             headers=headers,
             timeout=10
@@ -2185,6 +2260,58 @@ class SpotifyAnonymousAuth:
                 return self.access_token
         
         raise Exception("Embed method failed")
+
+    def _try_web_player_method(self):
+        """Try alternative web player method"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://open.spotify.com/',
+        }
+        
+        # Try different parameter combinations
+        param_sets = [
+            {"reason": "transport", "productType": "web_player"},
+            {"reason": "init", "productType": "web_player"},
+            {"productType": "web_player"},
+        ]
+        
+        for params in param_sets:
+            try:
+                response = self.session.get(
+                    "https://open.spotify.com/get_access_token",  # Alternative URL
+                    params=params,
+                    headers=headers,
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'accessToken' in data:
+                        self.access_token = data['accessToken']
+                        self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
+                        self.client_id = data.get('clientId')
+                        
+                        logging.info(f"Successfully obtained token with params: {params}")
+                        return self.access_token
+            except Exception as e:
+                continue
+                
+        raise Exception("Web player method failed")
+
+    def is_token_valid(self):
+        """Check if current token is still valid"""
+        return self.access_token and time.time() < self.token_expiration
+
+    def refresh_token_if_needed(self):
+        """Refresh token if it's about to expire"""
+        if not self.is_token_valid():
+            self.access_token = None
+            self.token_expiration = 0
+            return self.get_token()
+        return self.access_token
+
 
 class TidalClient:
     BASE_URL = 'https://api.tidal.com/v1/'
