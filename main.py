@@ -8,6 +8,10 @@ import struct
 import logging
 import pyotp
 import tempfile
+import platform
+import signal
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -25,13 +29,18 @@ from PyQt5.QtSvg import QSvgWidget, QSvgRenderer
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import random
+import webbrowser
+import urllib.parse
 from urllib.parse import quote
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import deezer
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
 import re
 from fuzzywuzzy import fuzz
 from datetime import datetime, timedelta
+from time import time_ns
 import threading
 from email.utils import parsedate_to_datetime
 import secrets
@@ -39,7 +48,10 @@ import secrets
 CONFIG_FILE = "app_config.json"
 SYNC_CONFIG_FILE = "sync_config.json"
 CACHE_FILE = "playlist_cache.json"
-
+SPOTIFY_LOGGED_IN = False
+SPOTIFY_USER_INFO = {}
+OAUTH_SERVER = None
+OAUTH_RESULT = {}
 # PLAYLIST CACHE CLASS - DEFINED FIRST!
 class PlaylistCache:
     def __init__(self):
@@ -348,7 +360,6 @@ class LoadPlaylistTracksThread(QThread):
             logging.error(f"Error loading tracks: {str(e)}")
             self.error.emit(str(e))
 
-# NEW: Background thread for backup
 class BackupThread(QThread):
     progress_update = pyqtSignal(str, int)  # message, percentage
     backup_complete = pyqtSignal(int, str)  # backed_up_count, backup_folder
@@ -1890,24 +1901,1065 @@ class PlaylistSortingThread(QThread):
         
         return cleaned.strip()
 
+class TimeoutException(Exception):
+    pass
+
+def timeout_handler(sig, frame):
+    raise TimeoutException
+
+class TrackMatchConfirmationDialog(QDialog):
+    def __init__(self, source_track, plex_track, match_score, parent=None):
+        super().__init__(parent)
+        self.source_track = source_track
+        self.plex_track = plex_track
+        self.match_score = match_score
+        self.user_choice = None
+        self.setup_ui()
+        
+    def setup_ui(self):
+        self.setWindowTitle("Confirm Track Match")
+        self.setModal(True)
+        
+        # Set minimum size but allow resizing
+        self.setMinimumSize(750, 650)
+        self.resize(800, 700)
+        
+        # Remove maximize button but keep resize ability
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        
+        # Main dark theme matching the app
+        self.setStyleSheet("""
+            QDialog { 
+                background-color: #2b2b2b; 
+                color: #ffffff; 
+            }
+            QLabel { 
+                color: #ffffff; 
+                background-color: transparent;
+            }
+            QFrame {
+                background-color: #2b2b2b;
+            }
+        """)
+        
+        # Create main layout
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(30, 30, 30, 30)
+        
+        # Create scrollable area for content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: #2b2b2b;
+            }
+            QScrollBar:vertical {
+                background-color: #3a3a3a;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #555555;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #666666;
+            }
+        """)
+        
+        # Content widget inside scroll area
+        content_widget = QWidget()
+        content_widget.setStyleSheet("background-color: #2b2b2b;")
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(25)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Header section
+        header_frame = self.create_header_section()
+        content_layout.addWidget(header_frame)
+        
+        # Source track section
+        source_frame = self.create_source_section()
+        content_layout.addWidget(source_frame)
+        
+        # Plex track section
+        plex_frame = self.create_plex_section()
+        content_layout.addWidget(plex_frame)
+        
+        # Instructions
+        instructions_frame = self.create_instructions_section()
+        content_layout.addWidget(instructions_frame)
+        
+        # Add stretch to push content to top
+        content_layout.addStretch()
+        
+        # Set up scroll area
+        scroll_area.setWidget(content_widget)
+        main_layout.addWidget(scroll_area)
+        
+        # Button section (fixed at bottom)
+        button_frame = self.create_button_section()
+        main_layout.addWidget(button_frame)
+        
+        # Set focus
+        self.use_btn.setFocus()
+        
+    def create_header_section(self):
+        """Create the header with title and score"""
+        frame = QFrame()
+        frame.setStyleSheet("background-color: #2b2b2b;")
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(15)
+        
+        # Title
+        title = QLabel("🎵 Track Match Confirmation")
+        title.setFont(QFont("Arial", 24, QFont.Bold))
+        title.setStyleSheet("color: #00bcd4;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Score with dynamic color
+        score_color = self.get_score_color()
+        score = QLabel(f"Match Confidence: {self.match_score:.1f}%")
+        score.setFont(QFont("Arial", 20, QFont.Bold))
+        score.setStyleSheet(f"color: {score_color};")
+        score.setAlignment(Qt.AlignCenter)
+        layout.addWidget(score)
+        
+        # Warning
+        warning = QLabel("⚠️ Please review this track match carefully")
+        warning.setFont(QFont("Arial", 16, QFont.Bold))
+        warning.setStyleSheet("color: #ffa726;")
+        warning.setAlignment(Qt.AlignCenter)
+        layout.addWidget(warning)
+        
+        return frame
+        
+    def create_source_section(self):
+        """Create the source track section"""
+        frame = QFrame()
+        frame.setStyleSheet("background-color: #2b2b2b;")
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(10)
+        
+        # Header
+        header = QLabel("📱 SOURCE TRACK (From Streaming Service)")
+        header.setFont(QFont("Arial", 16, QFont.Bold))
+        header.setStyleSheet("color: #00bcd4; padding: 5px;")
+        layout.addWidget(header)
+        
+        # Content box
+        content_box = QLabel(str(self.source_track))
+        content_box.setWordWrap(True)
+        content_box.setAlignment(Qt.AlignTop)
+        content_box.setMinimumHeight(80)
+        content_box.setStyleSheet("""
+            QLabel {
+                background-color: #3a3a3a;
+                border: 2px solid #00bcd4;
+                border-radius: 8px;
+                padding: 20px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #ffffff;
+                line-height: 1.4;
+            }
+        """)
+        layout.addWidget(content_box)
+        
+        return frame
+        
+    def create_plex_section(self):
+        """Create the Plex track section"""
+        frame = QFrame()
+        frame.setStyleSheet("background-color: #2b2b2b;")
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(10)
+        
+        # Header
+        header = QLabel("🎬 PLEX LIBRARY MATCH")
+        header.setFont(QFont("Arial", 16, QFont.Bold))
+        header.setStyleSheet("color: #888888; padding: 5px;")
+        layout.addWidget(header)
+        
+        # Content box
+        plex_info = self.get_plex_info()
+        content_box = QLabel(plex_info)
+        content_box.setWordWrap(True)
+        content_box.setAlignment(Qt.AlignTop)
+        content_box.setMinimumHeight(80)
+        content_box.setStyleSheet("""
+            QLabel {
+                background-color: #404040;
+                border: 2px solid #666666;
+                border-radius: 8px;
+                padding: 20px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #ffffff;
+                line-height: 1.4;
+            }
+        """)
+        layout.addWidget(content_box)
+        
+        return frame
+        
+    def create_instructions_section(self):
+        """Create the instructions section"""
+        frame = QFrame()
+        frame.setStyleSheet("background-color: #2b2b2b;")
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(10)
+        
+        instructions = QLabel("Choose what to do with this track match:")
+        instructions.setFont(QFont("Arial", 16, QFont.Bold))
+        instructions.setStyleSheet("color: #ffffff; padding: 10px;")
+        instructions.setAlignment(Qt.AlignCenter)
+        layout.addWidget(instructions)
+        
+        return frame
+        
+    def create_button_section(self):
+        """Create the button section"""
+        frame = QFrame()
+        frame.setStyleSheet("""
+            QFrame {
+                background-color: #353535;
+                border-top: 2px solid #555555;
+                border-radius: 0px;
+            }
+        """)
+        
+        layout = QHBoxLayout(frame)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Create buttons
+        self.use_btn = self.create_button(
+            "✅ Use This Match", 
+            "#00bcd4", 
+            "#00acc1",
+            self.use_match
+        )
+        
+        self.skip_btn = self.create_button(
+            "❌ Skip This Track", 
+            "#666666", 
+            "#777777",
+            self.skip_track
+        )
+        
+        self.skip_all_btn = self.create_button(
+            "⏭️ Skip All Low Matches", 
+            "#888888", 
+            "#999999",
+            self.skip_all_low_matches
+        )
+        
+        # Add buttons to layout
+        layout.addWidget(self.use_btn)
+        layout.addWidget(self.skip_btn)
+        layout.addWidget(self.skip_all_btn)
+        
+        return frame
+        
+    def create_button(self, text, bg_color, hover_color, click_handler):
+        """Create a styled button"""
+        button = QPushButton(text)
+        button.clicked.connect(click_handler)
+        button.setFont(QFont("Arial", 12, QFont.Bold))
+        button.setMinimumHeight(50)
+        button.setMinimumWidth(180)
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg_color};
+                color: white;
+                font-weight: bold;
+                padding: 15px 20px;
+                border-radius: 6px;
+                border: none;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_color};
+            }}
+            QPushButton:pressed {{
+                background-color: {hover_color};
+            }}
+        """)
+        return button
+        
+    def get_score_color(self):
+        """Get color based on match score"""
+        if self.match_score < 70:
+            return "#ff6b6b"  # Soft red
+        elif self.match_score < 80:
+            return "#ffa726"  # Soft orange
+        else:
+            return "#00bcd4"  # App's teal color
+            
+    def get_plex_info(self):
+        """Get Plex track info with better formatting"""
+        try:
+            if not self.plex_track:
+                return "❌ No Plex track found"
+            
+            title = getattr(self.plex_track, 'title', 'Unknown Title')
+            
+            # Get artist info
+            artist = 'Unknown Artist'
+            if hasattr(self.plex_track, 'originalTitle') and self.plex_track.originalTitle:
+                artist = self.plex_track.originalTitle
+            elif hasattr(self.plex_track, 'artist'):
+                try:
+                    artist_obj = self.plex_track.artist()
+                    if artist_obj and hasattr(artist_obj, 'title'):
+                        artist = artist_obj.title
+                except:
+                    pass
+            
+            # Get album info
+            album_info = ''
+            if hasattr(self.plex_track, 'album'):
+                try:
+                    album_obj = self.plex_track.album()
+                    if album_obj and hasattr(album_obj, 'title'):
+                        album_info = f"\n🎵 Album: {album_obj.title}"
+                except:
+                    pass
+            
+            # Get track number if available
+            track_info = ''
+            if hasattr(self.plex_track, 'index') and self.plex_track.index:
+                track_info = f"\n🔢 Track: #{self.plex_track.index}"
+            
+            # Get duration if available
+            duration_info = ''
+            if hasattr(self.plex_track, 'duration') and self.plex_track.duration:
+                duration_ms = self.plex_track.duration
+                duration_sec = duration_ms // 1000
+                minutes = duration_sec // 60
+                seconds = duration_sec % 60
+                duration_info = f"\n⏱️ Duration: {minutes}:{seconds:02d}"
+            
+            return f"🎵 {title}\n👤 Artist: {artist}{album_info}{track_info}{duration_info}"
+            
+        except Exception as e:
+            return f"❌ Error loading track info: {str(e)}"
+    
+    def use_match(self):
+        """User accepts the match"""
+        self.user_choice = "use"
+        self.accept()
+    
+    def skip_track(self):
+        """User skips this track"""
+        self.user_choice = "skip"
+        self.accept()
+    
+    def skip_all_low_matches(self):
+        """User skips all low confidence matches"""
+        self.user_choice = "skip_all"
+        self.accept()
+        
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts"""
+        if event.key() == Qt.Key_Enter or event.key() == Qt.Key_Return:
+            self.use_match()
+        elif event.key() == Qt.Key_Escape:
+            self.skip_track()
+        else:
+            super().keyPressEvent(event)
+
+class SpotifyLoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Login to Spotify")
+        self.setModal(True)
+        self.setFixedSize(450, 400)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Header
+        header = QLabel("<h2>🎵 Connect to Spotify</h2>")
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+        
+        # Instructions
+        instructions = QLabel("""
+        <div style='text-align: left; padding: 20px; line-height: 1.5;'>
+        <p><b>Simple Cookie-Based Login:</b></p>
+        
+        <p><b>Step 1:</b> Open <a href="https://open.spotify.com">https://open.spotify.com</a> and login</p>
+        <p><b>Step 2:</b> Press <b>F12</b> → <b>Application</b> tab → <b>Cookies</b></p>
+        <p><b>Step 3:</b> Find <b>sp_dc</b> cookie and copy its value</p>
+        <p><b>Step 4:</b> Paste the value below</p>
+        </div>
+        """)
+        instructions.setWordWrap(True)
+        instructions.setOpenExternalLinks(True)
+        layout.addWidget(instructions)
+        
+        # Cookie input
+        cookie_group = QGroupBox("Cookie Value")
+        cookie_layout = QVBoxLayout(cookie_group)
+        
+        self.cookie_input = QTextEdit()
+        self.cookie_input.setPlaceholderText("Paste your sp_dc cookie value here...")
+        self.cookie_input.setMaximumHeight(80)
+        self.cookie_input.textChanged.connect(self.validate_cookie)
+        cookie_layout.addWidget(self.cookie_input)
+        
+        layout.addWidget(cookie_group)
+        
+        # Status
+        self.status_label = QLabel("Paste your cookie and it will be validated automatically")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet("color: #888888; padding: 10px;")
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.ok_button = QPushButton("✅ Save & Login")
+        self.ok_button.clicked.connect(self.accept)
+        self.ok_button.setEnabled(False)
+        self.ok_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1DB954;
+                color: white;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #1ed760;
+            }
+            QPushButton:disabled {
+                background-color: #666666;
+            }
+        """)
+        button_layout.addWidget(self.ok_button)
+        
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+        
+        # Initialize result
+        self.login_successful = False
+        self.sp_dc_cookie = ""
+    
+    def validate_cookie(self):
+        """Validate cookie as user types"""
+        cookie_text = self.cookie_input.toPlainText().strip()
+        
+        if len(cookie_text) < 10:
+            self.status_label.setText("Paste your sp_dc cookie value above")
+            self.status_label.setStyleSheet("color: #888;")
+            self.ok_button.setEnabled(False)
+        elif len(cookie_text) < 50:
+            self.status_label.setText("❌ Value seems too short - make sure you copied the full value")
+            self.status_label.setStyleSheet("color: #f44336;")
+            self.ok_button.setEnabled(False)
+        else:
+            self.status_label.setText("✅ Cookie looks valid! Click 'Save & Login' to continue")
+            self.status_label.setStyleSheet("color: #1DB954; font-weight: bold;")
+            self.sp_dc_cookie = cookie_text
+            self.login_successful = True
+            self.ok_button.setEnabled(True)
+
+class SpotifyUserPlaylistsDialog(QDialog):
+    def __init__(self, spotify_auth, parent=None):
+        super().__init__(parent)
+        self.spotify_auth = spotify_auth
+        self.setWindowTitle("Import Your Spotify Playlists")
+        self.setModal(True)
+        self.resize(600, 500)
+        self.selected_playlists = []
+        self.setup_ui()
+        self.load_user_playlists()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Header
+        header = QLabel("<h3>Select Playlists to Import</h3>")
+        layout.addWidget(header)
+        
+        # Loading label
+        self.loading_label = QLabel("Loading your playlists...")
+        self.loading_label.setAlignment(Qt.AlignCenter)
+        self.loading_label.setStyleSheet("color: #888888; padding: 20px;")
+        layout.addWidget(self.loading_label)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        
+        # Playlists list
+        self.playlists_widget = QListWidget()
+        self.playlists_widget.setVisible(False)
+        layout.addWidget(self.playlists_widget)
+        
+        # Selection controls
+        selection_layout = QHBoxLayout()
+        
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self.select_all_playlists)
+        self.select_all_btn.setVisible(False)
+        selection_layout.addWidget(self.select_all_btn)
+        
+        self.select_none_btn = QPushButton("Select None")
+        self.select_none_btn.clicked.connect(self.select_no_playlists)
+        self.select_none_btn.setVisible(False)
+        selection_layout.addWidget(self.select_none_btn)
+        
+        selection_layout.addStretch()
+        layout.addLayout(selection_layout)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.import_button = QPushButton("Import Selected Playlists")
+        self.import_button.clicked.connect(self.accept)
+        self.import_button.setEnabled(False)
+        self.import_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1DB954;
+                color: white;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #1ed760;
+            }
+            QPushButton:disabled {
+                background-color: #666666;
+            }
+        """)
+        button_layout.addWidget(self.import_button)
+        
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+    
+    def load_user_playlists(self):
+        """Load user's playlists in background thread"""
+        self.load_thread = LoadUserPlaylistsThread(self.spotify_auth, self)
+        self.load_thread.playlists_loaded.connect(self.on_playlists_loaded)
+        self.load_thread.error.connect(self.on_load_error)
+        self.load_thread.start()
+    
+    def on_playlists_loaded(self, playlists):
+        """Handle playlists loaded"""
+        self.loading_label.setVisible(False)
+        self.playlists_widget.setVisible(True)
+        self.select_all_btn.setVisible(True)
+        self.select_none_btn.setVisible(True)
+        
+        for playlist in playlists:
+            item = QListWidgetItem()
+            item.setText(f"{playlist['name']} ({playlist['tracks']['total']} tracks)")
+            item.setData(Qt.UserRole, playlist)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.playlists_widget.addItem(item)
+        
+        self.import_button.setEnabled(True)
+        self.loading_label.setText(f"✅ Found {len(playlists)} playlists in your account")
+        self.loading_label.setVisible(True)
+    
+    def on_load_error(self, error_message):
+        """Handle loading error"""
+        self.loading_label.setText(f"❌ Error loading playlists: {error_message}")
+        QMessageBox.warning(self, "Error", f"Failed to load playlists: {error_message}")
+    
+    def select_all_playlists(self):
+        """Select all playlists"""
+        for i in range(self.playlists_widget.count()):
+            item = self.playlists_widget.item(i)
+            item.setCheckState(Qt.Checked)
+    
+    def select_no_playlists(self):
+        """Deselect all playlists"""
+        for i in range(self.playlists_widget.count()):
+            item = self.playlists_widget.item(i)
+            item.setCheckState(Qt.Unchecked)
+    
+    def get_selected_playlists(self):
+        """Get list of selected playlists"""
+        selected = []
+        for i in range(self.playlists_widget.count()):
+            item = self.playlists_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                selected.append(item.data(Qt.UserRole))
+        return selected
+
+class ManualCookieDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manual Cookie Entry")
+        self.setModal(True)
+        self.setFixedSize(500, 400)
+        self.cookie_value = ""
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Instructions
+        instructions = QLabel("""
+        <h3>📋 Manual Cookie Entry</h3>
+        <p><b>Step 1:</b> Open <a href="https://open.spotify.com">https://open.spotify.com</a> in your browser</p>
+        <p><b>Step 2:</b> Login to your Spotify account</p>
+        <p><b>Step 3:</b> Press <b>F12</b> → <b>Application</b> tab → <b>Cookies</b> → <b>https://open.spotify.com</b></p>
+        <p><b>Step 4:</b> Find cookie named <b>sp_dc</b> and copy its value</p>
+        <p><b>Step 5:</b> Paste the value below</p>
+        """)
+        instructions.setWordWrap(True)
+        instructions.setOpenExternalLinks(True)
+        layout.addWidget(instructions)
+        
+        # Cookie input
+        cookie_group = QGroupBox("Cookie Value")
+        cookie_layout = QVBoxLayout(cookie_group)
+        
+        self.cookie_input = QTextEdit()
+        self.cookie_input.setPlaceholderText("Paste your sp_dc cookie value here...")
+        self.cookie_input.setMaximumHeight(80)
+        cookie_layout.addWidget(self.cookie_input)
+        
+        # Validation button
+        validate_button = QPushButton("🔍 Validate Cookie")
+        validate_button.clicked.connect(self.validate_cookie)
+        cookie_layout.addWidget(validate_button)
+        
+        layout.addWidget(cookie_group)
+        
+        # Status
+        self.status_label = QLabel("Paste your cookie and click validate")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet("color: #888888; padding: 10px;")
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.ok_button = QPushButton("✅ Use Cookie")
+        self.ok_button.clicked.connect(self.accept)
+        self.ok_button.setEnabled(False)
+        self.ok_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1DB954;
+                color: white;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #1ed760;
+            }
+            QPushButton:disabled {
+                background-color: #666666;
+            }
+        """)
+        button_layout.addWidget(self.ok_button)
+        
+        cancel_button = QPushButton("❌ Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+    
+    def validate_cookie(self):
+        """Validate the entered cookie"""
+        cookie_text = self.cookie_input.toPlainText().strip()
+        
+        if not cookie_text:
+            self.status_label.setText("❌ Please enter a cookie value")
+            return
+        
+        if len(cookie_text) < 50:
+            self.status_label.setText("❌ Cookie value seems too short")
+            return
+        
+        # Test the cookie
+        try:
+            self.status_label.setText("🔄 Testing cookie...")
+            QApplication.processEvents()
+            
+            # Create a test auth instance
+            global SP_DC_COOKIE
+            original_cookie = SP_DC_COOKIE
+            SP_DC_COOKIE = cookie_text
+            
+            auth = SpotifyAnonymousAuth()
+            token = auth.get_token()
+            
+            if token:
+                self.status_label.setText("✅ Cookie is valid!")
+                self.cookie_value = cookie_text
+                self.ok_button.setEnabled(True)
+            else:
+                self.status_label.setText("❌ Cookie validation failed")
+                SP_DC_COOKIE = original_cookie
+                
+        except Exception as e:
+            self.status_label.setText(f"❌ Cookie test failed: {str(e)}")
+            SP_DC_COOKIE = original_cookie
+
+class OAuthCallbackServer:
+    def __init__(self, dialog):
+        self.dialog = dialog
+        self.port = self.get_free_port()
+        self.running = False
+        self.httpd = None
+    
+    def get_free_port(self):
+        """Get a fixed port for the callback server"""
+        # Use a fixed port instead of random
+        FIXED_PORT = 8888  # This should be registered with your Spotify app
+        
+        # Check if port is available
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', FIXED_PORT))
+                return FIXED_PORT
+        except OSError:
+            # If 8888 is busy, try a few alternatives (all should be registered)
+            for port in [8889, 8890, 8891, 8892]:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.bind(('127.0.0.1', port))
+                        return port
+                except OSError:
+                    continue
+            
+            # Fallback to original method if all fixed ports are busy
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', 0))
+                s.listen(1)
+                port = s.getsockname()[1]
+            return port
+
+    
+    def run(self):
+        """Run the OAuth callback server"""
+        try:
+            class CallbackHandler(BaseHTTPRequestHandler):
+                def __init__(self, server_instance, *args, **kwargs):
+                    self.server_instance = server_instance
+                    super().__init__(*args, **kwargs)
+                
+                def do_GET(self):
+                    """Handle GET request (OAuth callback)"""
+                    try:
+                        # Parse the callback URL
+                        parsed_url = urllib.parse.urlparse(self.path)
+                        query_params = urllib.parse.parse_qs(parsed_url.query)
+                        
+                        if 'code' in query_params:
+                            # Success - we got the authorization code
+                            self.send_response(200)
+                            self.send_header('Content-type', 'text/html')
+                            self.end_headers()
+                            
+                            success_html = """
+                            <html>
+                            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                                <h1>✅ Login Successful!</h1>
+                                <p>You can now close this browser tab and return to the application.</p>
+                                <script>
+                                    setTimeout(function() {
+                                        window.close();
+                                    }, 3000);
+                                </script>
+                            </body>
+                            </html>
+                            """
+                            self.wfile.write(success_html.encode())
+                            
+                            # Try to extract cookie (this is a simplified approach)
+                            # In a real implementation, you'd exchange the code for tokens
+                            self.server_instance.handle_success()
+                            
+                        elif 'error' in query_params:
+                            # Error in OAuth flow
+                            error = query_params['error'][0]
+                            self.send_response(400)
+                            self.send_header('Content-type', 'text/html')
+                            self.end_headers()
+                            
+                            error_html = f"""
+                            <html>
+                            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                                <h1>❌ Login Failed</h1>
+                                <p>Error: {error}</p>
+                                <p>You can close this tab and try again.</p>
+                            </body>
+                            </html>
+                            """
+                            self.wfile.write(error_html.encode())
+                            
+                            self.server_instance.handle_error(error)
+                        
+                        else:
+                            # Unknown callback
+                            self.send_response(400)
+                            self.send_header('Content-type', 'text/html')
+                            self.end_headers()
+                            self.wfile.write(b"Invalid callback")
+                    
+                    except Exception as e:
+                        logging.error(f"OAuth callback error: {e}")
+                        self.server_instance.handle_error(str(e))
+                
+                def log_message(self, format, *args):
+                    # Suppress server logs
+                    pass
+            
+            # Create server with custom handler
+            handler = lambda *args, **kwargs: CallbackHandler(self, *args, **kwargs)
+            self.httpd = HTTPServer(('localhost', self.port), handler)
+            self.running = True
+            
+            logging.info(f"OAuth callback server started on port {self.port}")
+            self.httpd.serve_forever()
+            
+        except Exception as e:
+            logging.error(f"OAuth server error: {e}")
+            self.handle_error(str(e))
+    
+    def handle_success(self):
+        """Handle successful OAuth callback"""
+        # Since we can't easily extract cookies from the OAuth flow,
+        # we'll prompt the user to get the cookie manually after login
+        QTimer.singleShot(100, self.prompt_for_cookie)
+    
+    def prompt_for_cookie(self):
+        """Prompt user to extract cookie after successful OAuth"""
+        # Show a dialog asking user to get the cookie
+        cookie_dialog = PostOAuthCookieDialog(self.dialog)
+        if cookie_dialog.exec_() == QDialog.Accepted:
+            self.dialog.oauth_success(cookie_dialog.cookie_value)
+        else:
+            self.dialog.oauth_error("Cookie extraction cancelled")
+    
+    def handle_error(self, error):
+        """Handle OAuth error"""
+        QTimer.singleShot(100, lambda: self.dialog.oauth_error(error))
+    
+    def stop(self):
+        """Stop the OAuth server"""
+        self.running = False
+        if self.httpd:
+            self.httpd.shutdown()
+
+class PostOAuthCookieDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Extract Cookie")
+        self.setModal(True)
+        self.setFixedSize(450, 300)
+        self.cookie_value = ""
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Instructions
+        instructions = QLabel("""
+        <h3>🔄 One More Step!</h3>
+        <p>Your browser should now be logged into Spotify.</p>
+        <p><b>To complete the setup:</b></p>
+        <ol>
+        <li>In your browser, press <b>F12</b></li>
+        <li>Go to <b>Application</b> tab → <b>Cookies</b> → <b>https://open.spotify.com</b></li>
+        <li>Find cookie named <b>sp_dc</b></li>
+        <li>Copy its value and paste below</li>
+        </ol>
+        """)
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # Cookie input
+        self.cookie_input = QLineEdit()
+        self.cookie_input.setPlaceholderText("Paste sp_dc cookie value here...")
+        layout.addWidget(self.cookie_input)
+        
+        # Auto-validate as user types
+        self.cookie_input.textChanged.connect(self.validate_cookie)
+        
+        # Status
+        self.status_label = QLabel("Paste the sp_dc cookie value")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet("color: #888888; padding: 10px;")
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.ok_button = QPushButton("✅ Complete Setup")
+        self.ok_button.clicked.connect(self.accept)
+        self.ok_button.setEnabled(False)
+        self.ok_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1DB954;
+                color: white;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #1ed760;
+            }
+            QPushButton:disabled {
+                background-color: #666666;
+            }
+        """)
+        button_layout.addWidget(self.ok_button)
+        
+        manual_button = QPushButton("📋 Manual Method")
+        manual_button.clicked.connect(self.show_manual_method)
+        button_layout.addWidget(manual_button)
+        
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+    
+    def validate_cookie(self):
+        """Validate cookie as user types"""
+        cookie_text = self.cookie_input.text().strip()
+        
+        if len(cookie_text) < 10:
+            self.status_label.setText("Enter the sp_dc cookie value...")
+            self.ok_button.setEnabled(False)
+        elif len(cookie_text) < 50:
+            self.status_label.setText("Cookie value seems too short...")
+            self.ok_button.setEnabled(False)
+        else:
+            self.status_label.setText("✅ Cookie looks valid!")
+            self.cookie_value = cookie_text
+            self.ok_button.setEnabled(True)
+    
+    def show_manual_method(self):
+        """Show detailed manual instructions"""
+        QMessageBox.information(self, "Manual Cookie Extraction", 
+            "1. Go to https://open.spotify.com in your browser\n"
+            "2. Make sure you're logged in\n"
+            "3. Press F12 to open Developer Tools\n"
+            "4. Click 'Application' tab (Chrome) or 'Storage' tab (Firefox)\n"
+            "5. Expand 'Cookies' → click 'https://open.spotify.com'\n"
+            "6. Find cookie named 'sp_dc'\n"
+            "7. Copy the 'Value' (it's a long string)\n"
+            "8. Paste it in the input field above")
+        
+class LoadUserPlaylistsThread(QThread):
+    playlists_loaded = pyqtSignal(list)
+    error = pyqtSignal(str)
+    
+    def __init__(self, spotify_auth, parent=None):
+        super().__init__(parent)
+        self.spotify_auth = spotify_auth
+    
+    def run(self):
+        try:
+            # Use the saved sp_dc cookie directly instead of the token
+            global SP_DC_COOKIE
+            
+            if not SP_DC_COOKIE:
+                raise Exception("No sp_dc cookie available. Please login first.")
+            
+            # Headers with cookie authentication
+            headers = {
+                'Cookie': f'sp_dc={SP_DC_COOKIE}',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'application/json',
+                'Referer': 'https://open.spotify.com/',
+            }
+            
+            # Get playlists using Spotify Web API with cookie auth
+            playlists = []
+            url = 'https://api.spotify.com/v1/me/playlists?limit=50'
+            
+            while url:
+                response = requests.get(url, headers=headers, timeout=30)
+                
+                print(f"Playlist request: {response.status_code} - {url}")
+                print(f"Response headers: {dict(response.headers)}")
+                
+                if response.status_code == 401:
+                    raise Exception("Cookie expired or invalid. Please login again.")
+                elif response.status_code == 404:
+                    raise Exception("Playlists not accessible. Your account may have restricted privacy settings.")
+                elif response.status_code != 200:
+                    raise Exception(f"Failed to get playlists: {response.status_code} - {response.text}")
+                
+                data = response.json()
+                playlists.extend(data['items'])
+                url = data.get('next')
+            
+            # Filter for playlists with tracks
+            user_playlists = []
+            for playlist in playlists:
+                if playlist['tracks']['total'] > 0:
+                    user_playlists.append(playlist)
+            
+            self.playlists_loaded.emit(user_playlists)
+            
+        except Exception as e:
+            logging.error(f"Error loading user playlists: {str(e)}")
+            self.error.emit(str(e))
+
 class SpotifyAnonymousAuth:
     def __init__(self):
         self.access_token = None
         self.token_expiration = 0
         self.client_id = None
-        # Use a modern browser user agent for better compatibility
-        self.spotify_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        self.user_agent = self.spotify_user_agent  # For compatibility
-        self.session = requests.Session()
+        self.user_agent = self.get_random_user_agent()
+        self.session = self._setup_session()
         
-        # Configure session with retries
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
+        # TOTP Configuration from friend's working code
+        self.secret_cipher_dict = {
+            "12": [107, 81, 49, 57, 67, 93, 87, 81, 69, 67, 40, 93, 48, 50, 46, 91, 94, 113, 41, 108, 77, 107, 34],
+            "11": [111, 45, 40, 73, 95, 74, 35, 85, 105, 107, 60, 110, 55, 72, 69, 70, 114, 83, 63, 88, 91],
+            "10": [61, 110, 58, 98, 35, 79, 117, 69, 102, 72, 92, 102, 69, 93, 41, 101, 42, 75],
+            "9": [109, 101, 90, 99, 66, 92, 116, 108, 85, 70, 86, 49, 68, 54, 87, 50, 72, 121, 52, 64, 57, 43, 36, 81, 97, 72, 53, 41, 78, 56],
+            "8": [37, 84, 32, 76, 87, 90, 87, 47, 13, 75, 48, 54, 44, 28, 19, 21, 22],
+            "7": [59, 91, 66, 74, 30, 66, 74, 38, 46, 50, 72, 61, 44, 71, 86, 39, 89],
+            "6": [21, 24, 85, 46, 48, 35, 33, 8, 11, 63, 76, 12, 55, 77, 14, 7, 54],
+            "5": [12, 56, 76, 33, 88, 44, 88, 33, 78, 78, 11, 66, 22, 22, 55, 69, 54],
+        }
+        self.totp_ver = 0  # Auto-select highest
+        self.token_url = "https://open.spotify.com/api/token"
+        self.server_time_url = "https://open.spotify.com/"
+        
+        # Cache variables
+        self.cached_access_token = None
+        self.cached_client_id = ""
+        self.access_token_expires_at = 0
+        
+    def _setup_session(self):
+        """Setup session with proper retry strategy"""
+        session = requests.Session()
         
         retry_strategy = Retry(
-            total=3,
-            connect=2,
-            read=2,
+            total=5,
+            connect=3,
+            read=3,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "HEAD", "OPTIONS"],
@@ -1915,404 +2967,396 @@ class SpotifyAnonymousAuth:
             respect_retry_after_header=True
         )
         
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        
+        return session
+
+    def get_random_user_agent(self) -> str:
+        """Generate a random realistic browser user agent"""
+        browser = random.choice(['chrome', 'firefox', 'edge', 'safari'])
+
+        if browser == 'chrome':
+            os_choice = random.choice(['mac', 'windows'])
+            if os_choice == 'mac':
+                return (
+                    f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_{random.randrange(11, 15)}_{random.randrange(4, 9)}) "
+                    f"AppleWebKit/{random.randrange(530, 537)}.{random.randrange(30, 37)} (KHTML, like Gecko) "
+                    f"Chrome/{random.randrange(80, 105)}.0.{random.randrange(3000, 4500)}.{random.randrange(60, 125)} "
+                    f"Safari/{random.randrange(530, 537)}.{random.randrange(30, 36)}"
+                )
+            else:
+                chrome_version = random.randint(80, 105)
+                build = random.randint(3000, 4500)
+                patch = random.randint(60, 125)
+                return (
+                    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    f"AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{chrome_version}.0.{build}.{patch} Safari/537.36"
+                )
+
+        elif browser == 'firefox':
+            os_choice = random.choice(['windows', 'mac', 'linux'])
+            version = random.randint(90, 110)
+            if os_choice == 'windows':
+                return (
+                    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{version}.0) "
+                    f"Gecko/20100101 Firefox/{version}.0"
+                )
+            elif os_choice == 'mac':
+                return (
+                    f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_{random.randrange(11, 15)}_{random.randrange(0, 10)}; rv:{version}.0) "
+                    f"Gecko/20100101 Firefox/{version}.0"
+                )
+            else:
+                return (
+                    f"Mozilla/5.0 (X11; Linux x86_64; rv:{version}.0) "
+                    f"Gecko/20100101 Firefox/{version}.0"
+                )
+
+        elif browser == 'edge':
+            chrome_version = random.randint(80, 105)
+            build = random.randint(3000, 4500)
+            patch = random.randint(60, 125)
+            version_str = f"{chrome_version}.0.{build}.{patch}"
+            return (
+                f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                f"AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{version_str} Safari/537.36 Edg/{version_str}"
+            )
+
+        elif browser == 'safari':
+            mac_major = random.randrange(11, 16)
+            mac_minor = random.randrange(0, 10)
+            webkit_major = random.randint(600, 610)
+            webkit_minor = random.randint(1, 20)
+            webkit_patch = random.randint(1, 20)
+            safari_version = random.randint(13, 16)
+            return (
+                f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_{mac_major}_{mac_minor}) "
+                f"AppleWebKit/{webkit_major}.{webkit_minor}.{webkit_patch} (KHTML, like Gecko) "
+                f"Version/{safari_version}.0 Safari/{webkit_major}.{webkit_minor}.{webkit_patch}"
+            )
+        
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    def fetch_server_time(self) -> int:
+        """Fetch server time from Spotify using Date header"""
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "*/*",
+        }
+
+        try:
+            if platform.system() != 'Windows':
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(17)  # 15 + 2 second timeout
+            response = self.session.head(self.server_time_url, headers=headers, timeout=15, verify=True)
+            response.raise_for_status()
+        except TimeoutException as e:
+            raise Exception(f"fetch_server_time() timeout after 17s: {e}")
+        except Exception as e:
+            raise Exception(f"fetch_server_time() error: {e}")
+        finally:
+            if platform.system() != 'Windows':
+                signal.alarm(0)
+
+        date_hdr = response.headers.get("Date")
+        if not date_hdr:
+            raise Exception("fetch_server_time() missing 'Date' header")
+
+        return int(parsedate_to_datetime(date_hdr).timestamp())
 
     def generate_totp(self):
-        """
-        Generate TOTP using the exact same method as the working JavaScript version
-        """
-        try:
-            # cipher
-            secret_cipher_bytes = [37, 84, 32, 76, 87, 90, 87, 47, 13, 75, 48, 54, 44, 28, 19, 21, 22]
-            
-            # Apply transformation: e ^ ((t % 33) + 9)
-            transformed = [e ^ ((t % 33) + 9) for t, e in enumerate(secret_cipher_bytes)]
-            
-            # Join as string and encode
-            joined = "".join(str(num) for num in transformed)
-            secret_bytes = joined.encode('utf-8')
-            secret = base64.b32encode(secret_bytes).decode().rstrip("=")
-            
-            # Create TOTP object
-            totp_obj = pyotp.TOTP(secret, digits=6, interval=30)
-            
-            logging.info(f"Generated TOTP secret successfully")
-            return totp_obj
-            
-        except Exception as e:
-            logging.error(f"Error generating TOTP: {str(e)}")
-            raise
+        """Generate TOTP using the secret derivation method from friend's working code"""
+        if str((ver := self.totp_ver or max(map(int, self.secret_cipher_dict)))) not in self.secret_cipher_dict:
+            raise Exception(f"generate_totp(): Defined TOTP_VER ({ver}) is missing in SECRET_CIPHER_DICT")
 
-    def fetch_server_time(self):
-        """
-        Fetch server time from Spotify using Date header
-        """
+        secret_cipher_bytes = self.secret_cipher_dict[str(ver)]
+        transformed = [e ^ ((t % 33) + 9) for t, e in enumerate(secret_cipher_bytes)]
+        joined = "".join(str(num) for num in transformed)
+        hex_str = joined.encode().hex()
+        secret = base64.b32encode(bytes.fromhex(hex_str)).decode().rstrip("=")
+
+        return pyotp.TOTP(secret, digits=6, interval=30)
+
+    def fetch_and_update_secrets(self):
+        """Fetch updated secrets from remote URL"""
+        secret_url = "https://github.com/Thereallo1026/spotify-secrets/blob/main/secrets/secretDict.json?raw=true"
+        
+        try:
+            response = requests.get(secret_url, timeout=15, verify=True)
+            response.raise_for_status()
+            secrets_data = response.json()
+
+            if not isinstance(secrets_data, dict) or not secrets_data:
+                raise ValueError("Fetched payload not a non‑empty dict")
+
+            for key, value in secrets_data.items():
+                if not isinstance(key, str) or not key.isdigit():
+                    raise ValueError(f"Invalid key format: {key}")
+                if not isinstance(value, list) or not all(isinstance(x, int) for x in value):
+                    raise ValueError(f"Invalid value format for key {key}")
+
+            self.secret_cipher_dict = secrets_data
+            logging.info("✅ Updated secrets from remote source")
+            return True
+
+        except Exception as e:
+            logging.warning(f"Failed to get new secrets: {e}")
+            return False
+
+    def try_get_temporary_cookie(self):
+        """Try to get a temporary cookie by simulating a browser visit"""
         headers = {
-            "User-Agent": self.spotify_user_agent,
-            "Accept": "*/*",
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
         }
         
         try:
-            response = self.session.head("https://open.spotify.com/", headers=headers, timeout=10)
-            response.raise_for_status()
+            # Visit Spotify homepage to potentially get a session cookie
+            response = self.session.get("https://open.spotify.com/", headers=headers, timeout=10)
             
-            # Extract server time from Date header
-            date_header = response.headers.get("Date")
-            if date_header:
-                server_time = int(parsedate_to_datetime(date_header).timestamp())
-                logging.info(f"Successfully obtained server time: {server_time}")
-                return server_time
-            else:
-                raise Exception("No Date header found in response")
-                
+            # Extract any cookies that might be useful
+            cookies = self.session.cookies
+            for cookie in cookies:
+                if cookie.name == 'sp_dc' and cookie.value:
+                    logging.info("✅ Found temporary sp_dc cookie")
+                    return cookie.value
+                    
+            # Try to visit the Web Player to get a session
+            response = self.session.get("https://open.spotify.com/search", headers=headers, timeout=10)
+            
+            cookies = self.session.cookies
+            for cookie in cookies:
+                if cookie.name == 'sp_dc' and cookie.value:
+                    logging.info("✅ Found temporary sp_dc cookie from web player")
+                    return cookie.value
+                    
         except Exception as e:
-            logging.warning(f"Failed to get server time from Date header: {str(e)}")
-            # Fallback to local time
-            return int(time.time())
+            logging.debug(f"Could not get temporary cookie: {e}")
+        
+        return None
 
-    def generate_random_hex(self, length=8):
-        """Generate random hex string for unique requests"""
-        return secrets.token_hex(length // 2)
+    def refresh_access_token_with_totp(self, sp_dc: str = None) -> dict:
+        """Refresh access token using TOTP method from friend's working code"""
+        transport = True
+        init = True
+        session = self.session
+        data: dict = {}
+        token = ""
 
-    def validate_token(self, access_token, client_id=None):
-        """
-        Test if token is valid by making a lightweight API call
-        """
-        try:
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'User-Agent': self.spotify_user_agent,
-            }
-            
-            if client_id:
-                headers['Client-Id'] = client_id
+        server_time = self.fetch_server_time()
+        totp_obj = self.generate_totp()
+        client_time = int(time_ns() / 1000 / 1000)
+        otp_value = totp_obj.at(server_time)
 
-            # Try markets endpoint first (public data)
-            response = self.session.get('https://api.spotify.com/v1/markets', 
-                                      headers=headers, timeout=10)
-            
-            logging.info(f"Token validation response: {response.status_code}")
-            
-            if response.status_code == 200:
-                return True
-            
-            # Fallback: try a track endpoint
-            response = self.session.get('https://api.spotify.com/v1/tracks/4iV5W9uYEdYUVa79Axb7Rh', 
-                                      headers=headers, timeout=10)
-            
-            # Consider token valid if we don't get 401 Unauthorized
-            return response.status_code != 401
-            
-        except Exception as e:
-            logging.warning(f"Token validation failed: {str(e)}")
-            return False
+        params = {
+            "reason": "transport",
+            "productType": "web-player",
+            "totp": otp_value,
+            "totpServer": otp_value,
+            "totpVer": self.totp_ver,
+        }
 
-    def refresh_access_token(self, mode='transport'):
-        """
-        Refresh access token using the updated method
-        """
-        try:
-            server_time = self.fetch_server_time()
-            client_time = int(time.time() * 1000)  # milliseconds
-            
-            # Generate TOTP
-            totp_obj = self.generate_totp()
-            otp_value = totp_obj.at(server_time)
-            
-            logging.info(f"Generated OTP: {otp_value} for server time: {server_time}")
-            
-            # Build parameters
-            params = {
-                "reason": mode,
-                "productType": "web-player",
-                "totp": otp_value,
-                "totpServer": otp_value,
-                "totpVer": 8,
+        if self.totp_ver < 10:
+            params.update({
                 "sTime": server_time,
                 "cTime": client_time,
                 "buildDate": time.strftime("%Y-%m-%d", time.gmtime(server_time)),
-                "buildVer": f"web-player_{time.strftime('%Y-%m-%d', time.gmtime(server_time))}_{server_time * 1000}_{self.generate_random_hex(8)}",
-            }
-            
-            # Headers
-            headers = {
-                "User-Agent": self.spotify_user_agent,
-                "Accept": "application/json",
-                "Referer": "https://open.spotify.com/",
-                "App-Platform": "WebPlayer",
-                "Origin": "https://open.spotify.com",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin",
-            }
-            
-            # Try the updated token URL
-            response = self.session.get(
-                "https://open.spotify.com/api/token",
-                params=params,
-                headers=headers,
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if 'accessToken' in data:
-                    token_data = {
-                        'access_token': data['accessToken'],
-                        'expires_at': data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000,
-                        'client_id': data.get('clientId', ''),
-                    }
-                    
-                    logging.info(f"Successfully obtained token from {mode} mode")
-                    return token_data
-            
-            raise Exception(f"Failed to get token in {mode} mode: HTTP {response.status_code}")
-            
-        except Exception as e:
-            logging.error(f"Error in refresh_access_token ({mode}): {str(e)}")
-            raise
+                "buildVer": f"web-player_{time.strftime('%Y-%m-%d', time.gmtime(server_time))}_{server_time * 1000}_{secrets.token_hex(4)}",
+            })
 
-    def get_token(self):
-        """
-        Get Spotify token using the updated authentication method with fallbacks
-        """
-        # Return cached token if still valid
-        if self.access_token and time.time() < self.token_expiration:
-            if self.validate_token(self.access_token, self.client_id):
-                logging.info("✅ Using cached valid token")
-                return self.access_token
-            else:
-                logging.info("❌ Cached token is invalid, refreshing...")
-                self.access_token = None
-
-        max_retries = 3
-        last_error = None
-
-        # Try transport mode first
-        logging.info("🚀 Trying transport mode...")
-        for attempt in range(1, max_retries + 1):
-            try:
-                logging.info(f"📡 Transport mode attempt {attempt}/{max_retries}...")
-                
-                token_data = self.refresh_access_token('transport')
-                
-                # Validate token
-                logging.info("🔐 Validating token...")
-                if self.validate_token(token_data['access_token'], token_data.get('client_id')):
-                    logging.info("✅ Transport mode token validated successfully!")
-                    
-                    # Cache the successful token
-                    self.access_token = token_data['access_token']
-                    self.token_expiration = token_data['expires_at']
-                    self.client_id = token_data.get('client_id')
-                    
-                    return self.access_token
-                else:
-                    logging.warning("⚠️ Token validation failed, but proceeding anyway")
-                    # Accept token even if validation fails (for anonymous tokens)
-                    self.access_token = token_data['access_token']
-                    self.token_expiration = token_data['expires_at']
-                    self.client_id = token_data.get('client_id')
-                    
-                    return self.access_token
-                    
-            except Exception as e:
-                last_error = e
-                logging.warning(f"❌ Transport mode attempt {attempt} failed: {str(e)}")
-                
-                if attempt < max_retries:
-                    delay = 2 ** (attempt - 1)  # Exponential backoff
-                    logging.info(f"⏳ Waiting {delay}s before retry...")
-                    time.sleep(delay)
-
-        # If transport mode failed, try init mode
-        logging.info("🔄 Transport mode failed, trying init mode...")
-        
-        for attempt in range(1, max_retries + 1):
-            try:
-                logging.info(f"📡 Init mode attempt {attempt}/{max_retries}...")
-                
-                token_data = self.refresh_access_token('init')
-                
-                # Validate token
-                logging.info("🔐 Validating token...")
-                if self.validate_token(token_data['access_token'], token_data.get('client_id')):
-                    logging.info("✅ Init mode token validated successfully!")
-                else:
-                    logging.warning("⚠️ Token validation failed, but proceeding anyway")
-                
-                # Accept token regardless of validation result
-                self.access_token = token_data['access_token']
-                self.token_expiration = token_data['expires_at']
-                self.client_id = token_data.get('client_id')
-                
-                logging.info("✅ Token set successfully!")
-                return self.access_token
-                
-            except Exception as e:
-                last_error = e
-                logging.warning(f"❌ Init mode attempt {attempt} failed: {str(e)}")
-                
-                if attempt < max_retries:
-                    delay = 2 ** (attempt - 1)
-                    logging.info(f"⏳ Waiting {delay}s before retry...")
-                    time.sleep(delay)
-
-        # If all methods failed, try fallback methods
-        logging.info("🔄 All primary methods failed, trying fallbacks...")
-        try:
-            return self._try_fallback_methods()
-        except Exception as fallback_error:
-            logging.error(f"❌ All fallback methods failed: {str(fallback_error)}")
-
-        # Final failure
-        error_msg = f"Failed to obtain valid Spotify token after all attempts. Last error: {str(last_error)}"
-        logging.error(error_msg)
-        raise Exception(error_msg)
-
-    def _try_fallback_methods(self):
-        """
-        Try fallback authentication methods
-        """
-        fallback_methods = [
-            self._try_without_totp,
-            self._try_embed_method,
-            self._try_web_player_method
-        ]
-        
-        for method in fallback_methods:
-            try:
-                logging.info(f"Trying fallback method: {method.__name__}")
-                token = method()
-                if token:
-                    return token
-            except Exception as e:
-                logging.warning(f"Fallback method {method.__name__} failed: {str(e)}")
-                continue
-                
-        raise Exception("All fallback methods failed")
-
-    def _try_without_totp(self):
-        """Try to get token without TOTP"""
         headers = {
-            "User-Agent": self.spotify_user_agent,
+            "User-Agent": self.user_agent,
             "Accept": "application/json",
             "Referer": "https://open.spotify.com/",
             "App-Platform": "WebPlayer",
+            "Origin": "https://open.spotify.com",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
         
-        params = {
-            "reason": "transport",
-            "productType": "web_player"
-        }
-        
-        response = self.session.get(
-            "https://open.spotify.com/api/token",
-            params=params,
-            headers=headers,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            if 'accessToken' in data:
-                self.access_token = data['accessToken']
-                self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
-                self.client_id = data.get('clientId')
-                
-                logging.info("Successfully obtained token without TOTP")
-                return self.access_token
-        
-        raise Exception("No-TOTP method failed")
+        # Add cookie if available
+        if sp_dc:
+            headers["Cookie"] = f"sp_dc={sp_dc}"
 
-    def _try_embed_method(self):
-        """Try embed method"""
-        headers = {
-            "User-Agent": self.spotify_user_agent,
-            "Accept": "application/json",
-        }
-        
-        params = {
-            "reason": "transport",
-            "productType": "embed"
-        }
-        
-        response = self.session.get(
-            "https://open.spotify.com/api/token",
-            params=params,
-            headers=headers,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            if 'accessToken' in data:
-                self.access_token = data['accessToken']
-                self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
-                self.client_id = data.get('clientId')
-                
-                logging.info("Successfully obtained token using embed method")
-                return self.access_token
-        
-        raise Exception("Embed method failed")
+        last_err = ""
 
-    def _try_web_player_method(self):
-        """Try alternative web player method"""
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://open.spotify.com/',
-        }
-        
-        # Try different parameter combinations
-        param_sets = [
-            {"reason": "transport", "productType": "web_player"},
-            {"reason": "init", "productType": "web_player"},
-            {"productType": "web_player"},
-        ]
-        
-        for params in param_sets:
+        # Try transport mode first
+        try:
+            if platform.system() != "Windows":
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(17)
+
+            response = session.get(self.token_url, params=params, headers=headers, timeout=15, verify=True)
+            response.raise_for_status()
+            data = response.json()
+            token = data.get("accessToken", "")
+
+        except (requests.RequestException, TimeoutException, requests.HTTPError, ValueError) as e:
+            transport = False
+            last_err = str(e)
+        finally:
+            if platform.system() != "Windows":
+                signal.alarm(0)
+
+        # If transport failed or token is invalid, try init mode
+        if not transport or (transport and not self.validate_token(token, data.get("clientId", ""))):
+            params["reason"] = "init"
+
             try:
-                response = self.session.get(
-                    "https://open.spotify.com/get_access_token",  # Alternative URL
-                    params=params,
-                    headers=headers,
-                    timeout=10
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if 'accessToken' in data:
-                        self.access_token = data['accessToken']
-                        self.token_expiration = data.get('accessTokenExpirationTimestampMs', time.time() * 1000 + 3600000) / 1000
-                        self.client_id = data.get('clientId')
-                        
-                        logging.info(f"Successfully obtained token with params: {params}")
-                        return self.access_token
+                if platform.system() != "Windows":
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(17)
+
+                response = session.get(self.token_url, params=params, headers=headers, timeout=15, verify=True)
+                response.raise_for_status()
+                data = response.json()
+                token = data.get("accessToken", "")
+
+            except (requests.RequestException, TimeoutException, requests.HTTPError, ValueError) as e:
+                init = False
+                last_err = str(e)
+            finally:
+                if platform.system() != "Windows":
+                    signal.alarm(0)
+
+        if not init or not data or "accessToken" not in data:
+            raise Exception(f"refresh_access_token_with_totp(): Unsuccessful token request{': ' + last_err if last_err else ''}")
+
+        return {
+            "access_token": token,
+            "expires_at": data["accessTokenExpirationTimestampMs"] // 1000,
+            "client_id": data.get("clientId", ""),
+            "length": len(token)
+        }
+
+    def validate_token(self, access_token: str, client_id: str = None) -> bool:
+        """Test if token is valid by making a lightweight API call"""
+        url = "https://api.spotify.com/v1/me"
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        if self.user_agent:
+            headers.update({"User-Agent": self.user_agent})
+
+        if client_id:
+            headers.update({"Client-Id": client_id})
+
+        if platform.system() != 'Windows':
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(17)
+        try:
+            response = requests.get(url, headers=headers, timeout=15, verify=True)
+            valid = response.status_code == 200
+        except Exception:
+            valid = False
+        finally:
+            if platform.system() != 'Windows':
+                signal.alarm(0)
+        return valid
+
+    def get_token_with_working_method(self):
+        """Get Spotify access token using the working TOTP method"""
+        now = time.time()
+    
+        # Return cached token if still valid
+        if self.cached_access_token and now < self.access_token_expires_at and self.validate_token(self.cached_access_token, self.cached_client_id):
+            logging.debug("✅ Using cached valid token")
+            return self.cached_access_token
+    
+        max_retries = 3
+        retry = 0
+        last_error = ""
+    
+        # OPTION 1: Use the cookie defined at the top of the file
+        sp_dc_to_use = SP_DC_COOKIE if SP_DC_COOKIE and SP_DC_COOKIE != "your_sp_dc_cookie_value_here" else None
+        
+        # Also check environment variable as backup
+        env_cookie = os.getenv('SP_DC_COOKIE', '')
+        if env_cookie and env_cookie != "your_sp_dc_cookie_value_here":
+            sp_dc_to_use = env_cookie
+        
+        # Try to get temporary cookie if none provided
+        if not sp_dc_to_use:
+            sp_dc_to_use = self.try_get_temporary_cookie()
+    
+        while retry < max_retries:
+            try:
+                token_data = self.refresh_access_token_with_totp(sp_dc_to_use)
+                token = token_data["access_token"]
+                client_id = token_data.get("client_id", "")
+    
+                self.cached_access_token = token
+                self.access_token_expires_at = token_data["expires_at"]
+                self.cached_client_id = client_id
+    
+                if self.cached_access_token is None or not self.validate_token(self.cached_access_token, self.cached_client_id):
+                    retry += 1
+                    time.sleep(0.5)
+                else:
+                    logging.info(f"✅ Successfully obtained Spotify token (attempt {retry + 1})")
+                    break
             except Exception as e:
-                continue
-                
-        raise Exception("Web player method failed")
+                last_error = str(e)
+                retry += 1
+                if retry < max_retries:
+                    logging.warning(f"Token attempt {retry} failed: {str(e)}, retrying...")
+                    time.sleep(0.5)
+    
+        if retry == max_retries:
+            # Try to fetch updated secrets and retry once more
+            if self.fetch_and_update_secrets():
+                try:
+                    token_data = self.refresh_access_token_with_totp(sp_dc_to_use)
+                    token = token_data["access_token"]
+                    client_id = token_data.get("client_id", "")
+    
+                    self.cached_access_token = token
+                    self.access_token_expires_at = token_data["expires_at"]
+                    self.cached_client_id = client_id
+    
+                    if self.cached_access_token and self.validate_token(self.cached_access_token, self.cached_client_id):
+                        logging.info("✅ Successfully obtained Spotify token with updated secrets")
+                        return self.cached_access_token
+                except Exception as e:
+                    last_error = str(e)
+    
+            error_msg = (
+                f"Failed to obtain valid Spotify access token after {max_retries} attempts. "
+                f"Last error: {last_error}\n\n"
+                f"🔑 Please set your sp_dc cookie value in the SP_DC_COOKIE variable at the top of main.py"
+            )
+            raise RuntimeError(error_msg)
+    
+        return self.cached_access_token
+
+    def get_token(self):
+        """Main method to get Spotify token"""
+        return self.get_token_with_working_method()
 
     def is_token_valid(self):
         """Check if current token is still valid"""
-        return self.access_token and time.time() < self.token_expiration
+        return self.cached_access_token and time.time() < self.access_token_expires_at and self.validate_token(self.cached_access_token, self.cached_client_id)
 
     def refresh_token_if_needed(self):
         """Refresh token if it's about to expire"""
         if not self.is_token_valid():
-            self.access_token = None
-            self.token_expiration = 0
+            self.cached_access_token = None
+            self.access_token_expires_at = 0
             return self.get_token()
-        return self.access_token
-
-
+        return self.cached_access_token
+    
 class TidalClient:
     BASE_URL = 'https://api.tidal.com/v1/'
     
@@ -2337,6 +3381,8 @@ class PlaylistConverterThread(QThread):
     progress_update = pyqtSignal(int)
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    # NEW: Signal for track match confirmation
+    track_match_confirmation_needed = pyqtSignal(str, object, float)  # source_track, plex_track, score
 
     def __init__(self, playlist_source, plex_server, library_section):
         super().__init__()
@@ -2346,6 +3392,11 @@ class PlaylistConverterThread(QThread):
         self.spotify_auth = SpotifyAnonymousAuth()
         self.deezer_client = deezer.Client()
         self.tidal_client = TidalClient()
+        
+        # NEW: Track confirmation state
+        self.skip_all_low_matches = False
+        self.user_response = None
+        self.response_received = threading.Event()
 
     def run(self):
         try:
@@ -2363,6 +3414,17 @@ class PlaylistConverterThread(QThread):
         except Exception as e:
             logging.error(f"Error in PlaylistConverterThread: {str(e)}", exc_info=True)
             self.error.emit(str(e))
+
+    def wait_for_user_response(self):
+        """Wait for user response from main thread"""
+        self.response_received.wait()
+        self.response_received.clear()
+        return self.user_response
+
+    def set_user_response(self, response):
+        """Set user response and signal that response was received"""
+        self.user_response = response
+        self.response_received.set()
 
     def get_tidal_playlist_info(self):
         try:
@@ -2413,7 +3475,7 @@ class PlaylistConverterThread(QThread):
                 headers = {
                     'Authorization': f'Bearer {token}',
                     'Content-Type': 'application/json',
-                    'User-Agent': self.spotify_auth.spotify_user_agent,
+                    'User-Agent': self.spotify_auth.user_agent,
                     'Accept': 'application/json',
                     'Referer': 'https://open.spotify.com/',
                 }
@@ -2550,6 +3612,16 @@ class PlaylistConverterThread(QThread):
 
     def create_plex_playlist(self, tracks, playlist_name, playlist_image_url):
         try:
+            # Use the target name and action decided on the main thread
+            final_name = getattr(self, 'target_playlist_name', playlist_name)
+            action = getattr(self, 'conflict_action', 'create')
+            existing_playlist = getattr(self, 'existing_playlist', None)
+            
+            # Handle the pre-decided action
+            if action == "overwrite" and existing_playlist:
+                existing_playlist.delete()
+                logging.info(f"Deleted existing playlist: {playlist_name}")
+            
             library_section = self.plex_server.library.sectionByID(self.library_section)
             
             plex_tracks = []
@@ -2562,8 +3634,10 @@ class PlaylistConverterThread(QThread):
                 else:
                     not_found_tracks.append(track)
                 self.progress_update.emit(50 + int((i + 1) / total_tracks * 50))
+            
             if plex_tracks:
-                plex_playlist = self.plex_server.createPlaylist(playlist_name, items=plex_tracks)
+                # Use the final_name (which might be renamed) instead of original playlist_name
+                plex_playlist = self.plex_server.createPlaylist(final_name, items=plex_tracks)
                 
                 # Set the playlist image if available
                 if playlist_image_url:
@@ -2587,7 +3661,7 @@ class PlaylistConverterThread(QThread):
                         
                         # Upload the local file to Plex
                         plex_playlist.uploadPoster(filepath=temp_file)
-                        logging.info(f"Successfully set thumbnail for playlist '{playlist_name}' using local file")
+                        logging.info(f"Successfully set thumbnail for playlist '{final_name}' using local file")
                         
                         # Clean up the temporary file
                         try:
@@ -2610,15 +3684,17 @@ class PlaylistConverterThread(QThread):
                             }
                             response = requests.post(poster_url, params=params, headers=headers)
                             response.raise_for_status()
-                            logging.info(f"Successfully set thumbnail for playlist '{playlist_name}'")
+                            logging.info(f"Successfully set thumbnail for playlist '{final_name}'")
                         except Exception as url_thumb_error:
                             logging.error(f"Failed to set thumbnail: {str(url_thumb_error)}")
                 
-                logging.info(f"Successfully created playlist '{playlist_name}' with {len(plex_tracks)} tracks")
+                logging.info(f"Successfully created playlist '{final_name}' with {len(plex_tracks)} tracks")
                 if not_found_tracks:
                     logging.warning(f"Could not find matches for {len(not_found_tracks)} tracks in your Plex library")
                     for track in not_found_tracks:
                         logging.warning(f"Not found: {track}")
+
+                self.final_playlist_name = final_name
             else:
                 raise ValueError("No matching tracks found in your Plex library")
         except Exception as e:
@@ -2626,6 +3702,7 @@ class PlaylistConverterThread(QThread):
             raise ValueError(f"Error creating Plex playlist: {e}")
 
     def find_best_match(self, library_section, track):
+        """Enhanced find_best_match with user confirmation for low scores"""
         title, artist = self.parse_track_info(track)
         all_tracks = library_section.searchTracks(title=title)
         
@@ -2651,11 +3728,38 @@ class PlaylistConverterThread(QThread):
                 best_score = combined_score
                 best_match = plex_track
         
-        if best_score >= 70:  # Lowered threshold for more matches
-            logging.info(f"Matched '{track}' to '{best_match.title} - {best_match.originalTitle or best_match.artist().title}' (score: {best_score})")
+        # NEW: Handle different score ranges
+        if best_score >= 80:
+            # High confidence - auto accept
+            logging.info(f"High confidence match for '{track}' to '{best_match.title}' (score: {best_score})")
             return best_match
+        elif best_score >= 60 and not self.skip_all_low_matches:
+            # Medium confidence - ask user
+            logging.info(f"Medium confidence match for '{track}' to '{best_match.title}' (score: {best_score}) - asking user")
+            
+            # Emit signal to main thread for user confirmation
+            self.track_match_confirmation_needed.emit(track, best_match, best_score)
+            
+            # Wait for user response
+            user_choice = self.wait_for_user_response()
+            
+            if user_choice == "use":
+                logging.info(f"User approved match for '{track}' to '{best_match.title}'")
+                return best_match
+            elif user_choice == "skip":
+                logging.info(f"User skipped match for '{track}'")
+                return None
+            elif user_choice == "skip_all":
+                logging.info(f"User chose to skip all remaining low matches")
+                self.skip_all_low_matches = True
+                return None
+        elif best_score >= 60 and self.skip_all_low_matches:
+            # User previously chose to skip all low matches
+            logging.info(f"Skipping low confidence match for '{track}' (score: {best_score}) - user chose skip all")
+            return None
         else:
-            logging.warning(f"No good match found for '{track}' (best score: {best_score})")
+            # Very low confidence - auto skip
+            logging.warning(f"Very low confidence match for '{track}' (best score: {best_score}) - auto skipping")
             return None
 
     def parse_track_info(self, track):
@@ -3063,6 +4167,203 @@ class PlexPlaylistManager(QMainWindow):
         layout.addWidget(playlist_group)
     
         self.content_stack.addWidget(page)
+
+    def spotify_login(self):
+        """Handle Spotify login with improved system"""
+        dialog = SpotifyLoginDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            if dialog.login_successful and dialog.sp_dc_cookie:
+                # Save cookie to global variable and config
+                global SP_DC_COOKIE, SPOTIFY_LOGGED_IN
+                SP_DC_COOKIE = dialog.sp_dc_cookie
+                SPOTIFY_LOGGED_IN = True
+                
+                # Save to config file
+                self.save_spotify_config(dialog.sp_dc_cookie)
+                
+                # Update UI
+                self.update_spotify_login_status(True)
+                
+                # Get user info
+                try:
+                    self.get_spotify_user_info()
+                    QMessageBox.information(self, "Login Successful", 
+                                          "✅ Successfully logged in to Spotify!\n\n"
+                                          "Your authentication has been saved and you can now:\n"
+                                          "• Import your own playlists\n"
+                                          "• Import any public Spotify playlist")
+                except Exception as e:
+                    logging.warning(f"Could not get user info: {e}")
+                    QMessageBox.information(self, "Login Successful", 
+                                          "✅ Successfully logged in to Spotify!")
+
+    def spotify_logout(self):
+        """Handle Spotify logout"""
+        global SP_DC_COOKIE, SPOTIFY_LOGGED_IN, SPOTIFY_USER_INFO
+        
+        reply = QMessageBox.question(self, "Logout", 
+                                    "Are you sure you want to logout from Spotify?",
+                                    QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            SP_DC_COOKIE = ""
+            SPOTIFY_LOGGED_IN = False
+            SPOTIFY_USER_INFO = {}
+            
+            # Remove from config
+            self.save_spotify_config("")
+            
+            # Update UI
+            self.update_spotify_login_status(False)
+            
+            QMessageBox.information(self, "Logout Successful", "✅ Successfully logged out from Spotify.")
+    
+    def update_spotify_login_status(self, logged_in):
+        """Update the UI based on login status"""
+        if logged_in:
+            user_name = SPOTIFY_USER_INFO.get('display_name', 'Spotify User')
+            self.spotify_status_label.setText(f"✅ Logged in as: {user_name}")
+            self.spotify_status_label.setStyleSheet("color: #1DB954; font-weight: bold;")
+            self.spotify_login_btn.setEnabled(False)
+            self.spotify_logout_btn.setEnabled(True)
+        else:
+            self.spotify_status_label.setText("❌ Not logged in")
+            self.spotify_status_label.setStyleSheet("color: #888888; font-weight: bold;")
+            self.spotify_login_btn.setEnabled(True)
+            self.spotify_logout_btn.setEnabled(False)
+    
+    def get_spotify_user_info(self):
+        """Get current user info from Spotify"""
+        global SPOTIFY_USER_INFO
+        try:
+            auth = SpotifyAnonymousAuth()
+            token = auth.get_token()
+            
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'User-Agent': auth.user_agent,
+            }
+            
+            if hasattr(auth, 'cached_client_id') and auth.cached_client_id:
+                headers['Client-Id'] = auth.cached_client_id
+            
+            response = requests.get('https://api.spotify.com/v1/me', headers=headers, timeout=30)
+            if response.status_code == 200:
+                SPOTIFY_USER_INFO = response.json()
+                return SPOTIFY_USER_INFO
+        except Exception as e:
+            logging.error(f"Error getting user info: {e}")
+        return {}
+    
+    def import_multiple_spotify_playlists(self, playlists):
+        """Import multiple Spotify playlists"""
+        self.streaming_progress.setVisible(True)
+        self.streaming_progress.setValue(0)
+        
+        # Start import thread
+        self.multi_import_thread = MultiplePlaylistImportThread(playlists, self.plex_server, 
+                                                               self.section_combo.currentData(), self)
+        self.multi_import_thread.progress_update.connect(self.update_multi_import_progress)
+        self.multi_import_thread.playlist_imported.connect(self.on_playlist_imported)
+        self.multi_import_thread.finished.connect(self.on_multi_import_finished)
+        self.multi_import_thread.error.connect(self.on_multi_import_error)
+        self.multi_import_thread.start()
+    
+    def handle_track_match_confirmation(self, source_track, plex_track, match_score):
+        """Handle track match confirmation dialog on main thread"""
+        try:
+            dialog = TrackMatchConfirmationDialog(source_track, plex_track, match_score, self)
+            
+            if dialog.exec_() == QDialog.Accepted:
+                # Send response back to the converter thread
+                if hasattr(self, 'converter_thread') and self.converter_thread:
+                    self.converter_thread.set_user_response(dialog.user_choice)
+            else:
+                # Dialog was cancelled - treat as skip
+                if hasattr(self, 'converter_thread') and self.converter_thread:
+                    self.converter_thread.set_user_response("skip")
+                    
+        except Exception as e:
+            logging.error(f"Error handling track match confirmation: {str(e)}")
+            # Fallback - skip the track
+            if hasattr(self, 'converter_thread') and self.converter_thread:
+                self.converter_thread.set_user_response("skip")
+
+    def update_multi_import_progress(self, current, total, playlist_name):
+        """Update progress for multiple playlist import"""
+        progress = int((current / total) * 100)
+        self.streaming_progress.setValue(progress)
+        self.statusBar().showMessage(f"Importing {playlist_name}... ({current}/{total})")
+    
+    def on_playlist_imported(self, playlist_name, track_count):
+        """Handle individual playlist import completion"""
+        logging.info(f"Imported playlist: {playlist_name} with {track_count} tracks")
+    
+    def on_multi_import_finished(self, imported_count, total_count):
+        """Handle multiple import completion"""
+        self.streaming_progress.setVisible(False)
+        self.statusBar().showMessage(f"Import completed: {imported_count}/{total_count} playlists")
+        
+        message = f"✅ Import completed!\n\nSuccessfully imported {imported_count} out of {total_count} playlists."
+        if imported_count < total_count:
+            message += f"\n\n{total_count - imported_count} playlists failed - check logs for details."
+        
+        QMessageBox.information(self, "Import Complete", message)
+        self.fetch_playlists()  # Refresh playlist list
+    
+    def on_multi_import_error(self, error_message):
+        """Handle multiple import error"""
+        self.streaming_progress.setVisible(False)
+        QMessageBox.critical(self, "Import Error", f"Import failed: {error_message}")
+    
+    def save_spotify_config(self, sp_dc_cookie):
+        """Save Spotify configuration including cookie"""
+        try:
+            # Load existing config
+            config = {}
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+            
+            # Update with Spotify info
+            config['sp_dc_cookie'] = sp_dc_cookie  # Make sure this line exists
+            config['spotify_logged_in'] = bool(sp_dc_cookie)
+            config['spotify_user_info'] = SPOTIFY_USER_INFO
+            
+            # Save config
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=4)
+            
+            # ALSO update the global variable immediately
+            global SP_DC_COOKIE, SPOTIFY_LOGGED_IN
+            SP_DC_COOKIE = sp_dc_cookie
+            SPOTIFY_LOGGED_IN = bool(sp_dc_cookie)
+            
+            logging.info("Spotify configuration saved successfully")
+        except Exception as e:
+            logging.error(f"Error saving Spotify config: {e}")
+    
+    def load_spotify_config(self):
+        """Load Spotify configuration"""
+        global SP_DC_COOKIE, SPOTIFY_LOGGED_IN, SPOTIFY_USER_INFO
+        
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                
+                SP_DC_COOKIE = config.get('sp_dc_cookie', '')
+                SPOTIFY_LOGGED_IN = config.get('spotify_logged_in', False)
+                SPOTIFY_USER_INFO = config.get('spotify_user_info', {})
+                
+                # Update UI if logged in
+                if SPOTIFY_LOGGED_IN and SP_DC_COOKIE:
+                    self.update_spotify_login_status(True)
+                else:
+                    SPOTIFY_LOGGED_IN = False
+                    SP_DC_COOKIE = ''
+        except Exception as e:
+            logging.error(f"Error loading Spotify config: {e}")        
     
     def show_playlist_context_menu(self, position):
         """Show context menu for main playlist list"""
@@ -3492,27 +4793,158 @@ class PlexPlaylistManager(QMainWindow):
     def create_streaming_services_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-
+    
+        # Spotify Login Section (your existing code)
+        spotify_login_group = QGroupBox("Spotify Account Login")
+        spotify_login_layout = QVBoxLayout(spotify_login_group)
+        
+        # Login status
+        self.spotify_status_label = QLabel("Not logged in")
+        self.spotify_status_label.setStyleSheet("color: #888888; font-weight: bold;")
+        spotify_login_layout.addWidget(self.spotify_status_label)
+        
+        # Login buttons (your existing code)
+        login_buttons_layout = QHBoxLayout()
+        
+        self.spotify_login_btn = QPushButton("🔑 Login to Spotify")
+        self.spotify_login_btn.clicked.connect(self.spotify_login)
+        self.spotify_login_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1DB954;
+                color: white;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #1ed760;
+            }
+        """)
+        login_buttons_layout.addWidget(self.spotify_login_btn)
+        
+        self.spotify_logout_btn = QPushButton("🚪 Logout")
+        self.spotify_logout_btn.clicked.connect(self.spotify_logout)
+        self.spotify_logout_btn.setEnabled(False)
+        login_buttons_layout.addWidget(self.spotify_logout_btn)
+        
+        login_buttons_layout.addStretch()
+        spotify_login_layout.addLayout(login_buttons_layout)
+        
+        layout.addWidget(spotify_login_group)
+        
+        # Import from URL section
         streaming_group = QGroupBox("Import from Streaming Services")
         streaming_layout = QVBoxLayout()
-
-        self.playlist_url_input = ModernLineEdit()
+    
+        self.playlist_url_input = QLineEdit()
         self.playlist_url_input.setPlaceholderText("Enter Spotify, Deezer, or Tidal Playlist URL")
         streaming_layout.addWidget(self.playlist_url_input)
-
-        self.import_playlist_button = ModernButton("Import Playlist to Plex")
+    
+        # ADD THE NEW CHECKBOX HERE
+        self.add_to_sync_checkbox = QCheckBox("🔄 Add to sync manager after import")
+        self.add_to_sync_checkbox.setToolTip("Automatically add this playlist to sync manager to keep it updated")
+        self.add_to_sync_checkbox.setStyleSheet("""
+            QCheckBox {
+                font-weight: bold;
+                color: #4CAF50;
+                padding: 5px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 2px solid #4CAF50;
+                background-color: transparent;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                border: 2px solid #4CAF50;
+                background-color: #4CAF50;
+                border-radius: 3px;
+            }
+        """)
+        streaming_layout.addWidget(self.add_to_sync_checkbox)
+    
+        self.import_playlist_button = QPushButton("Import Playlist to Plex")
         self.import_playlist_button.clicked.connect(self.import_streaming_playlist)
         streaming_layout.addWidget(self.import_playlist_button)
-
+    
         streaming_group.setLayout(streaming_layout)
         layout.addWidget(streaming_group)
-
+    
         self.streaming_progress = QProgressBar()
         self.streaming_progress.setVisible(False)
         layout.addWidget(self.streaming_progress)
-
+    
         layout.addStretch()
         self.content_stack.addWidget(page)
+
+    def add_playlist_to_sync_manager(self, playlist_name, source_url):
+        """Add a playlist to the sync manager automatically"""
+        try:
+            # Get the current library section ID
+            library_section_id = self.section_combo.currentData()
+            if not library_section_id:
+                raise Exception("No library section selected")
+            
+            # Check if this sync config already exists
+            for row in range(self.sync_configs_table.rowCount()):
+                existing_playlist = self.sync_configs_table.item(row, 0).text()
+                existing_source = self.sync_configs_table.item(row, 1).text()
+                
+                if existing_playlist.lower() == playlist_name.lower():
+                    # Update existing entry with new source URL
+                    logging.info(f"Updating existing sync config for '{playlist_name}'")
+                    source_item = QTableWidgetItem(source_url)
+                    source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+                    self.sync_configs_table.setItem(row, 1, source_item)
+                    
+                    # Update last sync time
+                    sync_item = QTableWidgetItem("Never")
+                    sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
+                    self.sync_configs_table.setItem(row, 2, sync_item)
+                    
+                    # Refresh action buttons for this row
+                    self.create_action_buttons_for_row(row)
+                    
+                    # Save config
+                    self.save_sync_config()
+                    return
+            
+            # Add new sync configuration
+            row = self.sync_configs_table.rowCount()
+            self.sync_configs_table.insertRow(row)
+            
+            # Create read-only items
+            playlist_item = QTableWidgetItem(playlist_name)
+            playlist_item.setFlags(playlist_item.flags() & ~Qt.ItemIsEditable)
+            self.sync_configs_table.setItem(row, 0, playlist_item)
+            
+            source_item = QTableWidgetItem(source_url)
+            source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+            self.sync_configs_table.setItem(row, 1, source_item)
+            
+            sync_item = QTableWidgetItem("Never")
+            sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
+            self.sync_configs_table.setItem(row, 2, sync_item)
+            
+            # Create action buttons for the new row
+            self.create_action_buttons_for_row(row)
+            
+            # Save the sync configuration
+            self.save_sync_config()
+            
+            logging.info(f"✅ Added '{playlist_name}' to sync manager with source: {source_url}")
+            
+            # Update the sync manager UI if it's visible
+            if hasattr(self, 'sync_log'):
+                current_time = datetime.now().strftime('%H:%M:%S')
+                self.sync_log.append(f"[{current_time}] Added '{playlist_name}' to sync manager")
+            
+        except Exception as e:
+            logging.error(f"Error adding playlist to sync manager: {str(e)}")
+            raise
 
     # Enhanced playlist management methods
     def edit_playlist_item(self, item):
@@ -4745,8 +6177,52 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self._perform_upload(path)
     
     def _perform_upload(self, path, custom_name=None):
-        """Perform the actual playlist upload"""
+        """Perform the actual playlist upload with conflict checking"""
         try:
+            # Get playlist name
+            playlist_name = custom_name or os.path.splitext(os.path.basename(path))[0]
+            
+            # Check for existing playlist BEFORE uploading
+            existing_playlist = self.check_playlist_exists(playlist_name)
+            
+            if existing_playlist:
+                # Show conflict resolution dialog
+                dialog = QMessageBox(self)
+                dialog.setWindowTitle("Playlist Already Exists")
+                dialog.setText(f"A playlist named '{playlist_name}' already exists in your Plex server.")
+                dialog.setInformativeText("What would you like to do?")
+                
+                overwrite_btn = dialog.addButton("🔄 Overwrite", QMessageBox.DestructiveRole)
+                rename_btn = dialog.addButton("📝 Rename New", QMessageBox.AcceptRole)
+                cancel_btn = dialog.addButton("❌ Cancel", QMessageBox.RejectRole)
+                
+                dialog.exec_()
+                
+                if dialog.clickedButton() == cancel_btn:
+                    self.statusBar().showMessage("Import cancelled by user")
+                    return
+                
+                elif dialog.clickedButton() == overwrite_btn:
+                    # Delete existing playlist
+                    existing_playlist.delete()
+                    logging.info(f"Deleted existing playlist: {playlist_name}")
+                    self.statusBar().showMessage(f"Overwriting existing playlist: {playlist_name}")
+                
+                elif dialog.clickedButton() == rename_btn:
+                    # Generate new name with timestamp
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+                    new_playlist_name = f"{playlist_name}_{timestamp}"
+                    
+                    # Double-check the new name doesn't exist
+                    counter = 1
+                    while self.check_playlist_exists(new_playlist_name):
+                        new_playlist_name = f"{playlist_name}_{timestamp}_{counter}"
+                        counter += 1
+                    
+                    playlist_name = new_playlist_name
+                    logging.info(f"Renamed playlist to: {playlist_name}")
+            
             # Rename .m3u8 to .m3u if necessary
             if path.endswith('.m3u8'):
                 new_path = path.rsplit('.', 1)[0] + '.m3u'
@@ -4765,19 +6241,17 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             url = f"http://{plex_server}:{plex_port}/playlists/upload"
             params = {'sectionID': library_section_id, 'path': path, 'X-Plex-Token': plex_token}
             
-            if custom_name:
-                # If custom name provided, we need to handle it differently
-                # For now, just proceed and rename after upload
-                pass
-            
             response = requests.post(url, params=params)
             response.raise_for_status()
             
-            filename = custom_name or os.path.basename(path)
-            self.statusBar().showMessage(f"{filename} imported successfully.")
+            self.statusBar().showMessage(f"'{playlist_name}' imported successfully.")
             
         except requests.RequestException as e:
             error_message = f"Failed to import {os.path.basename(path)}. Error: {str(e)}"
+            self.statusBar().showMessage(error_message)
+            QMessageBox.critical(self, "Import Error", error_message)
+        except Exception as e:
+            error_message = f"Error during import: {str(e)}"
             self.statusBar().showMessage(error_message)
             QMessageBox.critical(self, "Import Error", error_message)
         
@@ -4972,25 +6446,192 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         self.start_playlist_conversion(playlist_url)
 
     def start_playlist_conversion(self, playlist_url):
-        self.converter_thread = PlaylistConverterThread(
-            playlist_url, 
-            self.plex_server, 
-            self.section_combo.currentData()
-        )
-        self.converter_thread.progress_update.connect(self.update_streaming_progress)
-        self.converter_thread.finished.connect(self.conversion_finished)
-        self.converter_thread.error.connect(self.conversion_error)
-
+        """Start playlist conversion with conflict checking done on main thread"""
+        if not self.plex_server:
+            QMessageBox.warning(self, "Not Connected", "Please connect to Plex server first.")
+            return
+        
+        # Show loading indicator while we get the playlist name
         self.streaming_progress.setVisible(True)
-        self.streaming_progress.setValue(0)
-        self.converter_thread.start()
+        self.streaming_progress.setValue(10)
+        self.statusBar().showMessage("Getting playlist information...")
+        
+        # Start a quick thread just to get the playlist name first
+        self.name_fetch_thread = PlaylistNameFetchThread(playlist_url, self)
+        self.name_fetch_thread.name_fetched.connect(self.handle_playlist_name_fetched)
+        self.name_fetch_thread.error.connect(self.conversion_error)
+        self.name_fetch_thread.start()
+    
+    def handle_playlist_name_fetched(self, playlist_url, playlist_name):
+        """Handle playlist name fetched, check for conflicts on main thread"""
+        try:
+            # Check for existing playlist (on main thread - safe for dialogs)
+            existing_playlist = self.check_playlist_exists(playlist_name)
+            
+            action = "create"  # Default action
+            final_name = playlist_name
+            
+            if existing_playlist:
+                # Show conflict resolution dialog (safe - we're on main thread)
+                dialog = QMessageBox(self)
+                dialog.setWindowTitle("Playlist Already Exists")
+                dialog.setText(f"A playlist named '{playlist_name}' already exists in your Plex server.")
+                dialog.setInformativeText("What would you like to do?")
+                
+                overwrite_btn = dialog.addButton("🔄 Overwrite", QMessageBox.DestructiveRole)
+                rename_btn = dialog.addButton("📝 Rename New", QMessageBox.AcceptRole)
+                cancel_btn = dialog.addButton("❌ Cancel", QMessageBox.RejectRole)
+                
+                result = dialog.exec_()
+                
+                if dialog.clickedButton() == cancel_btn:
+                    self.streaming_progress.setVisible(False)
+                    self.statusBar().showMessage("Import cancelled by user")
+                    return
+                
+                elif dialog.clickedButton() == overwrite_btn:
+                    action = "overwrite"
+                    self.statusBar().showMessage(f"Will overwrite existing playlist: {playlist_name}")
+                
+                elif dialog.clickedButton() == rename_btn:
+                    action = "rename"
+                    # Generate new name with timestamp
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+                    final_name = f"{playlist_name}_{timestamp}"
+                    
+                    # Double-check the new name doesn't exist
+                    counter = 1
+                    while self.check_playlist_exists(final_name):
+                        final_name = f"{playlist_name}_{timestamp}_{counter}"
+                        counter += 1
+                    
+                    self.statusBar().showMessage(f"Will create playlist as: {final_name}")
+            
+            # Now start the actual conversion with the decision made
+            self.streaming_progress.setValue(20)
+            self.start_actual_conversion(playlist_url, final_name, action, existing_playlist)
+            
+        except Exception as e:
+            logging.error(f"Error in conflict checking: {str(e)}")
+            self.conversion_error(str(e))
+    
+    def start_actual_conversion(self, playlist_url, final_name, action, existing_playlist):
+        """Start the actual conversion after conflict resolution"""
+        try:
+            self.converter_thread = PlaylistConverterThread(
+                playlist_url, 
+                self.plex_server, 
+                self.section_combo.currentData()
+            )
+            
+            # Store the decision for the converter thread
+            self.converter_thread.target_playlist_name = final_name
+            self.converter_thread.conflict_action = action
+            self.converter_thread.existing_playlist = existing_playlist
+            
+            # STORE THE SYNC MANAGER INFO
+            self.converter_thread.original_url = playlist_url
+            self.converter_thread.add_to_sync = self.add_to_sync_checkbox.isChecked()
+            
+            # NEW: Connect the track match confirmation signal
+            self.converter_thread.track_match_confirmation_needed.connect(self.handle_track_match_confirmation)
+            
+            self.converter_thread.progress_update.connect(self.update_streaming_progress)
+            self.converter_thread.finished.connect(self.conversion_finished)
+            self.converter_thread.error.connect(self.conversion_error)
+            
+            self.converter_thread.start()
+            
+        except Exception as e:
+            logging.error(f"Error starting conversion: {str(e)}")
+            self.conversion_error(str(e))
+    
+    def create_plex_playlist_with_conflict_check(self, tracks, playlist_name, playlist_image_url, original_create_method):
+        """Create playlist with conflict checking"""
+        try:
+            # Check for existing playlist
+            existing_playlist = self.check_playlist_exists(playlist_name)
+            
+            if existing_playlist:
+                # Show conflict resolution dialog
+                dialog = QMessageBox(self)
+                dialog.setWindowTitle("Playlist Already Exists")
+                dialog.setText(f"A playlist named '{playlist_name}' already exists in your Plex server.")
+                dialog.setInformativeText("What would you like to do?")
+                
+                overwrite_btn = dialog.addButton("🔄 Overwrite", QMessageBox.DestructiveRole)
+                rename_btn = dialog.addButton("📝 Rename New", QMessageBox.AcceptRole)
+                cancel_btn = dialog.addButton("❌ Cancel", QMessageBox.RejectRole)
+                
+                dialog.exec_()
+                
+                if dialog.clickedButton() == cancel_btn:
+                    raise ValueError("Import cancelled by user")
+                
+                elif dialog.clickedButton() == overwrite_btn:
+                    # Delete existing playlist
+                    existing_playlist.delete()
+                    logging.info(f"Deleted existing playlist: {playlist_name}")
+                    # Proceed with original creation
+                    original_create_method(tracks, playlist_name, playlist_image_url)
+                
+                elif dialog.clickedButton() == rename_btn:
+                    # Generate new name with timestamp
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+                    new_name = f"{playlist_name}_{timestamp}"
+                    
+                    # Double-check the new name doesn't exist
+                    counter = 1
+                    while self.check_playlist_exists(new_name):
+                        new_name = f"{playlist_name}_{timestamp}_{counter}"
+                        counter += 1
+                    
+                    logging.info(f"Renamed playlist from '{playlist_name}' to '{new_name}'")
+                    # Create with new name
+                    original_create_method(tracks, new_name, playlist_image_url)
+            else:
+                # No conflict, proceed normally
+                original_create_method(tracks, playlist_name, playlist_image_url)
+                
+        except Exception as e:
+            logging.error(f"Error in playlist creation with conflict check: {str(e)}")
+            raise
 
     def update_streaming_progress(self, value):
         self.streaming_progress.setValue(value)
 
     def conversion_finished(self):
+        """Handle conversion completion and add to sync manager if requested"""
         self.streaming_progress.setVisible(False)
         self.statusBar().showMessage("Playlist conversion completed successfully.")
+        
+        # Check if we should add to sync manager
+        if hasattr(self.converter_thread, 'add_to_sync') and self.converter_thread.add_to_sync:
+            try:
+                playlist_name = getattr(self.converter_thread, 'target_playlist_name', 'Unknown')
+                source_url = getattr(self.converter_thread, 'original_url', '')
+                
+                if playlist_name and source_url:
+                    # Add to sync manager
+                    self.add_playlist_to_sync_manager(playlist_name, source_url)
+                    
+                    # Update status message
+                    self.statusBar().showMessage(f"✅ Playlist imported and added to sync manager!")
+                    
+                    # Show success notification
+                    QMessageBox.information(self, "Import Complete", 
+                                          f"🎉 Successfully imported '{playlist_name}' and added to sync manager!\n\n"
+                                          f"The playlist will now automatically sync with updates from the source.")
+                
+            except Exception as e:
+                logging.error(f"Error adding to sync manager: {str(e)}")
+                # Don't fail the whole process, just show warning
+                QMessageBox.warning(self, "Sync Manager Warning", 
+                                  f"Playlist imported successfully, but failed to add to sync manager:\n{str(e)}")
+        
+        # Refresh playlist list
         self.fetch_playlists()
 
     def conversion_error(self, error_msg):
@@ -5013,27 +6654,86 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 index = self.section_combo.findData(self.last_section_id)
                 if index >= 0:
                     self.section_combo.setCurrentIndex(index)
+            
+            # AUTO-CONNECT TO PLEX if we have connection info
+            saved_token = config.get("token", "")
+            saved_ip = config.get("server_ip", "")
+            saved_port = config.get("server_port", "")
+            
+            if saved_token and saved_ip and saved_port:
+                logging.info("Found saved Plex connection info, attempting auto-connect...")
+                self.statusBar().showMessage("Auto-connecting to Plex...")
+                
+                # Use QTimer to delay auto-connect until UI is fully loaded
+                QTimer.singleShot(1000, self.auto_connect_to_plex)
+            else:
+                self.statusBar().showMessage("Ready - Please connect to Plex")
                     
             # Load sync configurations
             self.load_sync_config()
+    
+            # Load Spotify configuration
+            self.load_spotify_config()
             
         except Exception as e:
             logging.error(f"Error loading configuration: {str(e)}")
+    
+    def auto_connect_to_plex(self):
+        """Automatically connect to Plex using saved credentials"""
+        try:
+            logging.info("Attempting auto-connect to Plex...")
+            self.connect_to_plex()
+            
+        except Exception as e:
+            logging.warning(f"Auto-connect to Plex failed: {str(e)}")
+            self.statusBar().showMessage(f"Auto-connect failed: {str(e)}")
+            
+            # Show a non-blocking notification that clears after 5 seconds
+            QTimer.singleShot(5000, lambda: self.statusBar().showMessage(
+                "Auto-connect failed. Please check your Plex connection settings."
+            ))
 
     def save_config(self):
-        config = {
-            "plex_username": self.plex_username_input.text(),
-            "server_ip": self.server_ip_input.text(),
-            "server_port": self.server_port_input.text(),
-            "token": self.token_input.text(),
-            "last_section": self.section_combo.currentData()
-        }
+        """Save configuration while preserving existing settings"""
         try:
+            # Load existing config first to preserve Spotify settings
+            existing_config = {}
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r') as f:
+                    existing_config = json.load(f)
+            
+            # Update only Plex-related settings, preserve everything else
+            config = existing_config.copy()  # Start with existing config
+            
+            # Update Plex settings
+            config.update({
+                "plex_username": self.plex_username_input.text(),
+                "server_ip": self.server_ip_input.text(),
+                "server_port": self.server_port_input.text(),
+                "token": self.token_input.text(),
+                "last_section": self.section_combo.currentData()
+            })
+            
+            # Save merged config
             with open(CONFIG_FILE, 'w') as config_file:
                 json.dump(config, config_file, indent=4)
-            logging.info("Configuration saved successfully.")
+            logging.info("Configuration saved successfully (Spotify settings preserved).")
         except Exception as e:
             logging.error(f"Error saving configuration: {str(e)}")
+
+    def check_playlist_exists(self, playlist_name):
+       """Check if a playlist with the given name already exists in Plex"""
+       try:
+           if not self.plex_server:
+               return False
+           
+           for playlist in self.plex_server.playlists():
+               if playlist.title.lower() == playlist_name.lower():
+                   return playlist
+           return False
+       except Exception as e:
+           logging.error(f"Error checking playlist existence: {str(e)}")
+           return False           
 
     def get_stylesheet(self):
         return """
@@ -5257,6 +6957,123 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         except Exception as e:
             logging.error(f"Error during application close: {str(e)}")
             event.accept()  # Close anyway
+
+class PlaylistNameFetchThread(QThread):
+    name_fetched = pyqtSignal(str, str)  # playlist_url, playlist_name
+    error = pyqtSignal(str)
+    
+    def __init__(self, playlist_url, parent=None):
+        super().__init__(parent)
+        self.playlist_url = playlist_url
+        self.spotify_auth = SpotifyAnonymousAuth()
+    
+    def run(self):
+        try:
+            if "open.spotify.com" in self.playlist_url:
+                playlist_name = self.get_spotify_playlist_name()
+            elif "deezer.com" in self.playlist_url:
+                playlist_name = self.get_deezer_playlist_name()
+            elif "tidal.com" in self.playlist_url:
+                playlist_name = self.get_tidal_playlist_name()
+            else:
+                raise ValueError("Unsupported playlist source")
+            
+            self.name_fetched.emit(self.playlist_url, playlist_name)
+            
+        except Exception as e:
+            logging.error(f"Error fetching playlist name: {str(e)}")
+            self.error.emit(str(e))
+    
+    def get_spotify_playlist_name(self):
+        """Get just the Spotify playlist name"""
+        try:
+            token = self.spotify_auth.refresh_token_if_needed()
+            playlist_id = self.playlist_url.split('/')[-1].split('?')[0]
+            
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+                'User-Agent': self.spotify_auth.user_agent,
+            }
+            
+            response = requests.get(f'https://api.spotify.com/v1/playlists/{playlist_id}', headers=headers, timeout=30)
+            response.raise_for_status()
+            playlist_data = response.json()
+            
+            return playlist_data['name']
+            
+        except Exception as e:
+            logging.error(f"Error getting Spotify playlist name: {str(e)}")
+            raise
+    
+    def get_deezer_playlist_name(self):
+        """Get Deezer playlist name"""
+        try:
+            import deezer
+            client = deezer.Client()
+            playlist_id = self.playlist_url.split('/')[-1]
+            playlist = client.get_playlist(playlist_id)
+            return playlist.title
+        except Exception as e:
+            logging.error(f"Error getting Deezer playlist name: {str(e)}")
+            raise
+    
+    def get_tidal_playlist_name(self):
+        """Get Tidal playlist name"""
+        try:
+            from main import TidalClient  # Import your existing client
+            client = TidalClient()
+            playlist_uuid = self.playlist_url.split('/')[-1]
+            playlist_data = client.get_playlist(playlist_uuid)
+            return playlist_data['title']
+        except Exception as e:
+            logging.error(f"Error getting Tidal playlist name: {str(e)}")
+            raise
+class MultiplePlaylistImportThread(QThread):
+    progress_update = pyqtSignal(int, int, str)  # current, total, playlist_name
+    playlist_imported = pyqtSignal(str, int)  # playlist_name, track_count
+    finished = pyqtSignal(int, int)  # imported_count, total_count
+    error = pyqtSignal(str)
+    
+    def __init__(self, playlists, plex_server, library_section, parent=None):
+        super().__init__(parent)
+        self.playlists = playlists
+        self.plex_server = plex_server
+        self.library_section = library_section
+        self.spotify_auth = SpotifyAnonymousAuth()
+    
+    def run(self):
+        imported_count = 0
+        total_count = len(self.playlists)
+        
+        for i, playlist in enumerate(self.playlists):
+            try:
+                playlist_name = playlist['name']
+                playlist_id = playlist['id']
+                
+                self.progress_update.emit(i + 1, total_count, playlist_name)
+                
+                # Create playlist URL
+                playlist_url = f"https://open.spotify.com/playlist/{playlist_id}"
+                
+                # Use existing converter
+                converter = PlaylistConverterThread(playlist_url, self.plex_server, self.library_section)
+                converter.spotify_auth = self.spotify_auth
+                
+                # Get playlist info and tracks
+                tracks, name, image_url = converter.get_spotify_playlist_info()
+                
+                # Create Plex playlist
+                converter.create_plex_playlist(tracks, name, image_url)
+                
+                imported_count += 1
+                self.playlist_imported.emit(playlist_name, len(tracks))
+                
+            except Exception as e:
+                logging.error(f"Error importing playlist {playlist.get('name', 'Unknown')}: {e}")
+                continue
+        
+        self.finished.emit(imported_count, total_count)
 
 def main():
     setup_logging()
