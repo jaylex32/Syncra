@@ -58,16 +58,6 @@ Get the latest version for your platform from the [Releases](https://github.com/
 4. Set **sync interval** (hourly, daily, etc.)
 5. **Enable auto-sync** and let Syncra keep your playlists updated!
 
-## 🚀 Download
-
-**Latest Version: [v2.0.1](https://github.com/jaylex32/Syncra/releases/latest)**
-
-| Platform | Download | Notes |
-|----------|----------|-------|
-| 🪟 **Windows** | [Syncra-Windows](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-Windows.zip) | Ready to run |
-| 🍎 **macOS** | [Syncra-macOS](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-macOS.zip) | Untested |
-| 🐧 **Linux** | [Syncra-Linux](https://github.com/jaylex32/Syncra/releases/download/v2.0.1/Syncra-Linux.zip) | Untested |
-
 ### 📋 System Requirements
 - **Windows**: Windows 10/11 (64-bit)
 - **macOS**: macOS 10.14+ (Mojave or later)  
