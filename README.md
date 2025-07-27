@@ -81,14 +81,6 @@ Get the latest version for your platform from the [Releases](https://github.com/
 - 🎧 **Tidal** (playlists, albums, tracks)
 - 📁 **M3U/M3U8 files** (local and remote)
 
-## 🎉 What's New in v2.0.1
-
-- 🔍 **Search & Filter** in playlist editor
-- 🎯 **Set Position** feature - move tracks precisely
-- 🔄 **Sort by Streaming Service** - match external playlist order
-- 🐛 **Enhanced M3U support** with better file path handling
-- ✨ **Improved track matching** with featured artist detection
-
 ## 🏗️ Development
 
 Built with:
