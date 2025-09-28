@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QSplitter, QTabWidget, QSpinBox, QDateTimeEdit, QSlider,
                              QFormLayout, QGridLayout, QScrollArea, QFrame, QInputDialog, QMenu)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QSettings
-from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette
+from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QDrag
 #from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtSvg import QSvgWidget, QSvgRenderer
 import requests
@@ -435,6 +435,7 @@ class BatchTrackCountThread(QThread):
         self.max_concurrent = max_concurrent
         self.stop_requested = False
 
+
     def run(self):
         try:
             total_playlists = len(self.playlists)
@@ -629,6 +630,79 @@ class FindDuplicatesThread(QThread):
             logging.error(f"Error in duplicate finding thread: {str(e)}")
             self.error.emit(str(e))
 
+class PlaylistTrackTable(QTableWidget):
+    """Table widget that supports safe drag-and-drop row reordering."""
+
+    rows_reordered = pyqtSignal(int, int)  # from_row, to_row
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_row = -1
+        self._drag_track_id = None
+        self._drag_row_items = []
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+
+    def startDrag(self, supportedActions):
+        self._drag_row = self.currentRow()
+        if self._drag_row < 0:
+            return
+
+        self._drag_row_items = []
+        for col in range(self.columnCount()):
+            item = self.item(self._drag_row, col)
+            self._drag_row_items.append(item.clone() if item else None)
+
+        title_item = self.item(self._drag_row, 0)
+        self._drag_track_id = title_item.data(Qt.UserRole) if title_item else None
+
+        drag = QDrag(self)
+        mime_data = self.mimeData(self.selectedItems())
+        drag.setMimeData(mime_data)
+        drag.exec_(Qt.MoveAction)
+
+    def dropEvent(self, event):
+        if self._drag_row < 0 or not self._drag_row_items:
+            event.ignore()
+            return
+
+        drop_row = self.rowAt(event.pos().y())
+        if drop_row == -1:
+            drop_row = self.rowCount() - 1
+        drop_row = max(0, min(drop_row, self.rowCount() - 1))
+
+        row_data = self._drag_row_items
+        from_row = self._drag_row
+
+        self.removeRow(from_row)
+        if drop_row > from_row:
+            drop_row -= 1
+        drop_row = max(0, min(drop_row, self.rowCount()))
+
+        self.insertRow(drop_row)
+        for col, item in enumerate(row_data):
+            if item is not None:
+                new_item = item.clone()
+                if col == 0 and self._drag_track_id is not None:
+                    new_item.setData(Qt.UserRole, self._drag_track_id)
+                self.setItem(drop_row, col, new_item)
+            else:
+                self.setItem(drop_row, col, QTableWidgetItem(''))
+
+        event.accept()
+
+        if from_row != drop_row:
+            self.rows_reordered.emit(from_row, drop_row)
+
+        self.selectRow(drop_row)
+
+        self._drag_row = -1
+        self._drag_track_id = None
+        self._drag_row_items = []
+
+
 class LoadingDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -667,6 +741,7 @@ class PlaylistEditorDialog(QDialog):
         self.plex_server = plex_server
         self.tracks_loaded = False
         self.tracks = []
+        self.track_lookup = {}  # Maps identifiers to Plex track objects
         self.load_tracks_thread = None
         self.setWindowTitle(f"Edit Playlist: {playlist.title}")
         self.setModal(True)
@@ -736,6 +811,8 @@ class PlaylistEditorDialog(QDialog):
 
         # Search/Filter section
         search_layout = QHBoxLayout()
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(8)
         search_label = QLabel("🔍 Search:")
         search_layout.addWidget(search_label)
         
@@ -754,16 +831,31 @@ class PlaylistEditorDialog(QDialog):
         search_layout.addWidget(self.search_input)
         
         clear_search_btn = QPushButton("✖")
-        clear_search_btn.setFixedSize(30, 30)
+        clear_search_btn.setCursor(Qt.PointingHandCursor)
+        clear_search_btn.setFixedWidth(32)
+        clear_search_btn.setFixedHeight(self.search_input.sizeHint().height())
         clear_search_btn.clicked.connect(lambda: self.search_input.clear())
         clear_search_btn.setToolTip("Clear search")
+        clear_search_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3a3a3a;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                color: #ffffff;
+                padding: 0px 6px;
+            }
+            QPushButton:hover {
+                background-color: #4CAF50;
+            }
+        """)
         search_layout.addWidget(clear_search_btn)
         
         editor_layout.addLayout(search_layout)
         
         # Tracks table
-        self.tracks_table = QTableWidget()
-        self.tracks_table.setColumnCount(4)  # 4 columns total
+        self.tracks_table = PlaylistTrackTable()
+        self.tracks_table.setColumnCount(5)  # 4 columns total
+        self.tracks_table.rows_reordered.connect(self.handle_row_reorder)
         self.tracks_table.setHorizontalHeaderLabels(["Title", "Artist", "Album", "Duration"])
         self.tracks_table.horizontalHeader().setStretchLastSection(True)
         self.tracks_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -869,6 +961,45 @@ class PlaylistEditorDialog(QDialog):
         
         layout.addLayout(button_layout)
     
+    def _register_track(self, track):
+        """Store the track reference and return a safe identifier for UI usage."""
+        identifier = getattr(track, 'ratingKey', None)
+        if identifier is None:
+            identifier = getattr(track, 'key', None)
+        if identifier is None:
+            identifier = getattr(track, 'guid', None)
+        if identifier is None:
+            identifier = f'track-{id(track)}'
+        identifier = str(identifier)
+        self.track_lookup[identifier] = track
+        return identifier
+
+    def _resolve_track(self, track_id):
+        """Return the registered track object for a given identifier."""
+        return self.track_lookup.get(track_id)
+
+    def _render_tracks(self, tracks):
+        """Render the provided track list into the table."""
+        for row, track in enumerate(tracks):
+            title_item = QTableWidgetItem(track.title or 'Unknown')
+            artist = track.originalTitle or (track.artist().title if hasattr(track, 'artist') and track.artist() else 'Unknown')
+            artist_item = QTableWidgetItem(artist)
+            album = track.album().title if hasattr(track, 'album') and track.album() else 'Unknown'
+            album_item = QTableWidgetItem(album)
+            duration = f"{track.duration // 60000}:{(track.duration % 60000) // 1000:02d}" if getattr(track, 'duration', None) else 'Unknown'
+            duration_item = QTableWidgetItem(duration)
+
+            for item in (title_item, artist_item, album_item, duration_item):
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+
+            self.tracks_table.setItem(row, 0, title_item)
+            self.tracks_table.setItem(row, 1, artist_item)
+            self.tracks_table.setItem(row, 2, album_item)
+            self.tracks_table.setItem(row, 3, duration_item)
+
+            track_id = self._register_track(track)
+            self.tracks_table.item(row, 0).setData(Qt.UserRole, track_id)
+
     def start_background_loading(self):
         """Start loading tracks in background thread immediately"""
         self.loading_progress.setValue(10)
@@ -902,8 +1033,8 @@ class PlaylistEditorDialog(QDialog):
             self.loading_detail.setText("Processing tracks...")
             QApplication.processEvents()
             
-            self.tracks = tracks
-            self.populate_tracks_table(tracks)
+            self.tracks = list(tracks)
+            self.populate_tracks_table(self.tracks)
             
             # Smooth transition to editor
             self.loading_progress.setValue(100)
@@ -921,43 +1052,18 @@ class PlaylistEditorDialog(QDialog):
         """Populate tracks table efficiently with row numbers"""
         self.tracks_table.setRowCount(len(tracks))
         self.track_count_label.setText(f"🎵 Tracks: {len(tracks)}")
-        
-        # Batch processing for better performance
-        batch_size = 50
-        for i in range(0, len(tracks), batch_size):
-            batch = tracks[i:i + batch_size]
-            for j, track in enumerate(batch):
-                row = i + j
-                
-                # Create items for each column
-                title_item = QTableWidgetItem(track.title or "Unknown")
-                artist = track.originalTitle or (track.artist().title if hasattr(track, 'artist') and track.artist() else "Unknown")
-                artist_item = QTableWidgetItem(artist)
-                album = track.album().title if hasattr(track, 'album') and track.album() else "Unknown"
-                album_item = QTableWidgetItem(album)
-                duration = f"{track.duration // 60000}:{(track.duration % 60000) // 1000:02d}" if track.duration else "Unknown"
-                duration_item = QTableWidgetItem(duration)
-                
-                # Make all items read-only
-                title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
-                artist_item.setFlags(artist_item.flags() & ~Qt.ItemIsEditable)
-                album_item.setFlags(album_item.flags() & ~Qt.ItemIsEditable)
-                duration_item.setFlags(duration_item.flags() & ~Qt.ItemIsEditable)
-                
-                # Set items in table
-                self.tracks_table.setItem(row, 0, title_item)
-                self.tracks_table.setItem(row, 1, artist_item)
-                self.tracks_table.setItem(row, 2, album_item)
-                self.tracks_table.setItem(row, 3, duration_item)
-                
-                # Store track object for later use (in the title column)
-                self.tracks_table.item(row, 0).setData(Qt.UserRole, track)
-            
-            # Update progress during batch processing
-            progress = int(((i + len(batch)) / len(tracks)) * 10) + 90  # 90-100 range
-            self.loading_progress.setValue(progress)
-            QApplication.processEvents()  # Keep UI responsive during processing
-    
+
+        # Reset lookup so identifiers reflect current dataset
+        self.track_lookup.clear()
+
+        # Render the tracks into the table
+        self._render_tracks(tracks)
+
+        # Keep UI responsive during any lengthy fills
+        QApplication.processEvents()
+
+        self._refresh_internal_track_list()
+
     def show_editor(self):
         """Show the editor interface with smooth transition"""
         # Hide loading section
@@ -1050,6 +1156,29 @@ class PlaylistEditorDialog(QDialog):
         elif action == delete_action:
             self.delete_track_at_row(row)
     
+    def handle_row_reorder(self, from_row, to_row):
+        """Handle internal drag-and-drop row reordering."""
+        if from_row == to_row:
+            return
+
+        row_count = self.tracks_table.rowCount()
+        if not self.tracks or len(self.tracks) != row_count:
+            self._refresh_internal_track_list()
+
+        if self.tracks and len(self.tracks) == row_count:
+            track_obj = self.tracks.pop(from_row)
+            insert_index = max(0, min(to_row, len(self.tracks)))
+            self.tracks.insert(insert_index, track_obj)
+        else:
+            self._refresh_internal_track_list()
+
+        self._refresh_internal_track_list()
+
+        self.tracks_table.selectRow(to_row)
+        target_item = self.tracks_table.item(to_row, 0)
+        if target_item:
+            self.tracks_table.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
+
     def set_track_position(self, current_row):
         """Allow user to set specific position for a track"""
         track_title = self.tracks_table.item(current_row, 0).text()
@@ -1070,60 +1199,68 @@ class PlaylistEditorDialog(QDialog):
             target_row = new_position - 1  # Convert to 0-based index
             self.move_track_to_position(current_row, target_row)
     
-    def move_track_to_position(self, from_row, to_row):
-        """Move track from one position to another - robust approach"""
+    def move_track_to_position(self, from_row, to_row, show_feedback=True):
+        """Move track from one position to another using the same logic as arrow buttons."""
         try:
-            target_position = to_row + 1  # Store 1-based position for user
-            
-            # Get all tracks data first
-            all_tracks_data = []
-            for row in range(self.tracks_table.rowCount()):
-                track_data = {
-                    'title': self.tracks_table.item(row, 0).text(),
-                    'artist': self.tracks_table.item(row, 1).text(),
-                    'album': self.tracks_table.item(row, 2).text(),
-                    'duration': self.tracks_table.item(row, 3).text(),
-                    'track_object': self.tracks_table.item(row, 0).data(Qt.UserRole)
-                }
-                all_tracks_data.append(track_data)
-            
-            # Move the track in our data list
-            track_to_move = all_tracks_data.pop(from_row)  # Remove from current position
-            all_tracks_data.insert(to_row, track_to_move)  # Insert at target position
-            
-            # Repopulate the entire table with correct order
-            for row, track_data in enumerate(all_tracks_data):
-                # Create and set title item
-                title_item = QTableWidgetItem(track_data['title'])
-                title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
-                title_item.setData(Qt.UserRole, track_data['track_object'])
-                self.tracks_table.setItem(row, 0, title_item)
-                
-                # Create and set artist item
-                artist_item = QTableWidgetItem(track_data['artist'])
-                artist_item.setFlags(artist_item.flags() & ~Qt.ItemIsEditable)
-                self.tracks_table.setItem(row, 1, artist_item)
-                
-                # Create and set album item
-                album_item = QTableWidgetItem(track_data['album'])
-                album_item.setFlags(album_item.flags() & ~Qt.ItemIsEditable)
-                self.tracks_table.setItem(row, 2, album_item)
-                
-                # Create and set duration item
-                duration_item = QTableWidgetItem(track_data['duration'])
-                duration_item.setFlags(duration_item.flags() & ~Qt.ItemIsEditable)
-                self.tracks_table.setItem(row, 3, duration_item)
-            
-            # Select the moved track at its new position
-            self.tracks_table.selectRow(to_row)
-            
-            # Show success message
-            QMessageBox.information(self, "Success", f"Track moved to position {target_position}")
-            
+            final_row = self._move_row(from_row, to_row)
+            if final_row is not None and show_feedback:
+                QMessageBox.information(self, "Success", f"Track moved to position {final_row + 1}")
         except Exception as e:
             logging.error(f"Error moving track: {str(e)}")
-            QMessageBox.warning(self, "Move Error", f"Failed to move track: {str(e)}")
-    
+            if show_feedback:
+                QMessageBox.warning(self, "Move Error", f"Failed to move track: {str(e)}")
+
+
+    def _move_row(self, from_row, to_row):
+        """Core row-move helper shared by drag, arrows, and context actions."""
+        row_count = self.tracks_table.rowCount()
+        if row_count == 0:
+            return None
+
+        from_row = max(0, min(from_row, row_count - 1))
+        to_row = max(0, min(to_row, row_count - 1))
+
+        if from_row == to_row:
+            return None
+
+        if not self.tracks or len(self.tracks) != row_count:
+            self._refresh_internal_track_list()
+
+        if from_row < to_row:
+            for row in range(from_row, to_row):
+                self.swap_rows(row, row + 1)
+                if len(self.tracks) > row + 1:
+                    self.tracks[row], self.tracks[row + 1] = self.tracks[row + 1], self.tracks[row]
+        else:
+            for row in range(from_row, to_row, -1):
+                self.swap_rows(row, row - 1)
+                if len(self.tracks) > row:
+                    self.tracks[row], self.tracks[row - 1] = self.tracks[row - 1], self.tracks[row]
+
+        self.tracks_table.selectRow(to_row)
+        target_item = self.tracks_table.item(to_row, 0)
+        if target_item:
+            self.tracks_table.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
+
+        return to_row
+
+    def _refresh_internal_track_list(self):
+        """Synchronize internal track list with current table order."""
+        ordered_tracks = []
+        for row in range(self.tracks_table.rowCount()):
+            item = self.tracks_table.item(row, 0)
+            if not item:
+                continue
+            track_id = item.data(Qt.UserRole)
+            if track_id is None:
+                continue
+            track_obj = self._resolve_track(track_id)
+            if track_obj:
+                ordered_tracks.append(track_obj)
+                # ensure the track_id stays on the row after operations
+                item.setData(Qt.UserRole, track_id)
+        self.tracks = ordered_tracks
+
     def delete_track_at_row(self, row):
         """Delete a specific track"""
         track_title = self.tracks_table.item(row, 0).text()
@@ -1202,15 +1339,15 @@ class PlaylistEditorDialog(QDialog):
                 
     def move_up(self):
         current_row = self.tracks_table.currentRow()
-        if current_row > 0:
-            self.swap_rows(current_row, current_row - 1)
-            self.tracks_table.setCurrentCell(current_row - 1, 0)
+        final_row = self._move_row(current_row, current_row - 1)
+        if final_row is not None:
+            self.tracks_table.setCurrentCell(final_row, 0)
             
     def move_down(self):
         current_row = self.tracks_table.currentRow()
-        if current_row < self.tracks_table.rowCount() - 1:
-            self.swap_rows(current_row, current_row + 1)
-            self.tracks_table.setCurrentCell(current_row + 1, 0)  # Select title column
+        final_row = self._move_row(current_row, current_row + 1)
+        if final_row is not None:
+            self.tracks_table.setCurrentCell(final_row, 0)
             
     def swap_rows(self, row1, row2):
         # Handle all 4 columns
@@ -1235,8 +1372,18 @@ class PlaylistEditorDialog(QDialog):
             tracks = []
             for row in range(self.tracks_table.rowCount()):
                 item = self.tracks_table.item(row, 0)  # Title column now
-                if item and item.data(Qt.UserRole):
-                    tracks.append(item.data(Qt.UserRole))
+                if not item:
+                    continue
+
+                track_id = item.data(Qt.UserRole)
+                if track_id is None:
+                    continue
+
+                track_obj = self._resolve_track(track_id)
+                if track_obj:
+                    tracks.append(track_obj)
+                else:
+                    logging.warning(f"Unresolved track identifier during save: {track_id}")
                     
             if tracks:
                 # Update playlist with new track order
@@ -1429,43 +1576,53 @@ class SyncThread(QThread):
         self.tidal_client = TidalClient()
         self.stop_requested = False
 
+    def _ensure_not_cancelled(self):
+        if self.stop_requested:
+            raise SyncCancelled()
+
     def run(self):
         try:
             for playlist_name, config in self.sync_configs.items():
-                if self.stop_requested:
-                    break
-                    
+                self._ensure_not_cancelled()
+
                 self.progress_update.emit(f"Syncing {playlist_name}...", 0)
                 added_tracks = self.sync_playlist(playlist_name, config)
                 self.sync_complete.emit(playlist_name, added_tracks, len(config.get('tracks', [])))
-                
+
+        except SyncCancelled:
+            logging.info('Sync cancelled by user request.')
         except Exception as e:
             logging.error(f"Error in sync thread: {str(e)}")
             self.error.emit(str(e))
 
     def sync_playlist(self, playlist_name, config):
         try:
-            # Get Plex playlist
+            # Locate the Plex playlist by name
             plex_playlist = None
             for playlist in self.plex_server.playlists():
                 if playlist.title == playlist_name:
                     plex_playlist = playlist
                     break
-                    
+
             if not plex_playlist:
                 self.error.emit(f"Plex playlist '{playlist_name}' not found")
                 return 0
-                
-            # Get current tracks in Plex playlist
+
+            self._ensure_not_cancelled()
+            clear_before_sync = bool(config.get('clear_before_sync', False))
+
+            # Capture current playlist state for duplicate detection/clearing
+            current_items = list(plex_playlist.items())
             plex_tracks = set()
-            for track in plex_playlist.items():
-                signature = f"{track.title}_{track.originalTitle or (track.artist().title if hasattr(track, 'artist') and track.artist() else '')}"
-                plex_tracks.add(signature.lower())
-                
-            # Get source tracks
+            if not clear_before_sync:
+                for track in current_items:
+                    signature = f"{track.title}_{track.originalTitle or (track.artist().title if hasattr(track, 'artist') and track.artist() else '')}"
+                    plex_tracks.add(signature.lower())
+
+            # Resolve source tracks from the configured URL
             source_tracks = []
             source_url = config.get('source_url', '')
-            
+
             if "spotify.com" in source_url:
                 source_tracks = self.get_spotify_tracks(source_url)
             elif "deezer.com" in source_url:
@@ -1474,31 +1631,48 @@ class SyncThread(QThread):
                 source_tracks = self.get_tidal_tracks(source_url)
             elif source_url.endswith('.m3u') or source_url.endswith('.m3u8'):
                 source_tracks = self.get_m3u_tracks(source_url)
-                
-            # Find missing tracks
+
+            # Store for downstream reporting
+            config['tracks'] = source_tracks
+
             missing_tracks = []
+            seen_signatures = set()
             library_section = self.plex_server.library.sectionByID(config.get('library_section'))
-            
+            total_tracks = max(len(source_tracks), 1)
+
             for i, track_info in enumerate(source_tracks):
-                if self.stop_requested:
-                    break
-                    
+                self._ensure_not_cancelled()
+
                 track_signature = track_info.lower()
-                if track_signature not in plex_tracks:
-                    # Try to find track in Plex library
-                    plex_track = self.find_best_match(library_section, track_info)
-                    if plex_track:
-                        missing_tracks.append(plex_track)
-                        
-                progress = int((i + 1) / len(source_tracks) * 100)
+                if track_signature in seen_signatures:
+                    continue
+                seen_signatures.add(track_signature)
+
+                if not clear_before_sync and track_signature in plex_tracks:
+                    continue
+
+                plex_track = self.find_best_match(library_section, track_info)
+                if plex_track:
+                    missing_tracks.append(plex_track)
+
+                progress = int((i + 1) / total_tracks * 100)
                 self.progress_update.emit(f"Checking {playlist_name}... ({i+1}/{len(source_tracks)})", progress)
-                
-            # Add missing tracks to playlist
-            if missing_tracks:
+
+            if clear_before_sync and current_items:
+                self._ensure_not_cancelled()
+                try:
+                    plex_playlist.removeItems(current_items)
+                except Exception as removal_error:
+                    logging.warning(f"Failed to clear playlist '{playlist_name}': {removal_error}")
+
+            if missing_tracks and (not self.stop_requested or not clear_before_sync):
+                self._ensure_not_cancelled()
                 plex_playlist.addItems(missing_tracks)
-                
+
             return len(missing_tracks)
-            
+
+        except SyncCancelled:
+            raise
         except Exception as e:
             logging.error(f"Error syncing playlist {playlist_name}: {str(e)}")
             self.error.emit(f"Error syncing {playlist_name}: {str(e)}")
@@ -1508,28 +1682,28 @@ class SyncThread(QThread):
         try:
             token = self.spotify_auth.get_token()
             playlist_id = url.split('/')[-1].split('?')[0]
-            
+
             headers = {
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json',
             }
-            
+
             tracks = []
             tracks_url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks'
-            
+
             while tracks_url:
                 response = requests.get(tracks_url, headers=headers)
                 response.raise_for_status()
                 tracks_data = response.json()
-                
+
                 for item in tracks_data['items']:
                     if item['track']:
                         track = item['track']
                         artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
                         tracks.append(f"{track['name']} - {artist_name}")
-                
+
                 tracks_url = tracks_data.get('next')
-                
+
             return tracks
         except Exception as e:
             logging.error(f"Error getting Spotify tracks: {str(e)}")
@@ -1579,6 +1753,9 @@ class SyncThread(QThread):
         except Exception as e:
             logging.error(f"Error getting M3U tracks: {str(e)}")
             return []
+
+    def stop(self):
+        self.stop_requested = True
 
     def parse_track_info_smart(self, track_line):
         """Smart parser that handles multiple M3U formats"""
@@ -1640,35 +1817,39 @@ class SyncThread(QThread):
 
     def find_best_match(self, library_section, track):
         try:
+            self._ensure_not_cancelled()
             title, artist = self.parse_track_info(track)
             all_tracks = library_section.searchTracks(title=title)
-            
+
             best_match = None
             best_score = 0
-            
+
             for plex_track in all_tracks:
-                plex_title = plex_track.title if plex_track.title else ""
+                self._ensure_not_cancelled()
+                plex_title = plex_track.title if plex_track.title else ''
                 title_score = fuzz.token_set_ratio(title.lower(), plex_title.lower())
-                
+
                 artist_score = 0
                 if artist and plex_track.originalTitle:
                     artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.originalTitle.lower())
                 elif plex_track.artist():
                     artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.artist().title.lower())
-                
+
                 combined_score = (title_score * 0.7) + (artist_score * 0.3)
-                
+
                 if combined_score > best_score:
                     best_score = combined_score
                     best_match = plex_track
-            
+
             if best_score >= 70:
                 return best_match
             else:
                 return None
-                
+
+        except SyncCancelled:
+            raise
         except Exception as e:
-            logging.error(f"Error finding match for track: {str(e)}")
+            logging.error(f'Error finding match for track: {str(e)}')
             return None
 
     def parse_track_info(self, track):
@@ -3377,10 +3558,19 @@ class TidalClient:
         response.raise_for_status()
         return response.json()
 
+class PlaylistConversionCancelled(Exception):
+    """Raised when the user cancels streaming playlist conversion."""
+
+class SyncCancelled(Exception):
+    """Raised when a sync operation is cancelled mid-run."""
+    pass
+
 class PlaylistConverterThread(QThread):
     progress_update = pyqtSignal(int)
+    progress_message = pyqtSignal(str)
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    cancelled = pyqtSignal()
     # NEW: Signal for track match confirmation
     track_match_confirmation_needed = pyqtSignal(str, object, float)  # source_track, plex_track, score
 
@@ -3398,19 +3588,36 @@ class PlaylistConverterThread(QThread):
         self.user_response = None
         self.response_received = threading.Event()
 
+        # Cancellation support
+        self._cancel_requested = False
+
     def run(self):
         try:
+            self._ensure_not_cancelled()
+            self.progress_message.emit('Fetching playlist details...')
+
             if "open.spotify.com" in self.playlist_source:
                 tracks, playlist_name, playlist_image_url = self.get_spotify_playlist_info()
             elif "deezer.com" in self.playlist_source:
                 tracks, playlist_name, playlist_image_url = self.get_deezer_playlist_info()
             elif "tidal.com" in self.playlist_source:
-                tracks, playlist_name, playlist_image_url = self.get_tidal_playlist_info()    
+                tracks, playlist_name, playlist_image_url = self.get_tidal_playlist_info()
             else:
                 raise ValueError("Unsupported playlist source")
 
+            self._ensure_not_cancelled()
+            self.progress_message.emit(f"Matching tracks for '{playlist_name}' ({len(tracks)} items)...")
+
             self.create_plex_playlist(tracks, playlist_name, playlist_image_url)
+
+            if self._cancel_requested:
+                self.cancelled.emit()
+                return
+
             self.finished.emit()
+        except PlaylistConversionCancelled:
+            logging.info('Playlist conversion cancelled by user')
+            self.cancelled.emit()
         except Exception as e:
             logging.error(f"Error in PlaylistConverterThread: {str(e)}", exc_info=True)
             self.error.emit(str(e))
@@ -3426,29 +3633,38 @@ class PlaylistConverterThread(QThread):
         self.user_response = response
         self.response_received.set()
 
+    def request_cancel(self):
+        self._cancel_requested = True
+        self.progress_message.emit('Cancelling...')
+
+    def _ensure_not_cancelled(self):
+        if self._cancel_requested:
+            raise PlaylistConversionCancelled()
+
     def get_tidal_playlist_info(self):
-        try:
-            playlist_uuid = self.playlist_source.split('/')[-1]
-            playlist_data = self.tidal_client.get_playlist(playlist_uuid)
-            tracks_data = self.tidal_client.get_playlist_tracks(playlist_uuid)
+        self._ensure_not_cancelled()
+        playlist_uuid = self.playlist_source.split('/')[-1]
+        self.progress_message.emit('Fetching Tidal playlist metadata...')
+        playlist_data = self.tidal_client.get_playlist(playlist_uuid)
+        tracks_data = self.tidal_client.get_playlist_tracks(playlist_uuid)
 
-            playlist_name = playlist_data['title']
-            playlist_image_url = playlist_data['image']
+        playlist_name = playlist_data['title']
+        playlist_image_url = playlist_data['image']
 
-            tracks = []
-            with ThreadPoolExecutor(max_workers=25) as executor:
-                future_to_track = {executor.submit(self.process_tidal_track, item): item for item in tracks_data['items']}
-                for future in as_completed(future_to_track):
-                    track = future.result()
-                    if track:
-                        tracks.append(track)
-                    self.progress_update.emit(int(len(tracks) / tracks_data['totalNumberOfItems'] * 50))
+        tracks = []
+        total = tracks_data.get('totalNumberOfItems', len(tracks_data.get('items', [])) or 1)
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            future_to_track = {executor.submit(self.process_tidal_track, item): item for item in tracks_data['items']}
+            for future in as_completed(future_to_track):
+                self._ensure_not_cancelled()
+                track = future.result()
+                if track:
+                    tracks.append(track)
+                self.progress_update.emit(int(len(tracks) / total * 50))
+                self.progress_message.emit(f"Processing Tidal track {len(tracks)}/{total}")
 
-            logging.info(f"Fetched {len(tracks)} tracks from Tidal playlist '{playlist_name}'")
-            return tracks, playlist_name, playlist_image_url
-        except Exception as e:
-            logging.error(f"Error fetching Tidal playlist: {str(e)}")
-            raise
+        logging.info(f"Fetched {len(tracks)} tracks from Tidal playlist '{playlist_name}'")
+        return tracks, playlist_name, playlist_image_url
 
     def process_tidal_track(self, item):
         try:
@@ -3465,6 +3681,8 @@ class PlaylistConverterThread(QThread):
         retry_count = 0
         
         while retry_count < max_retries:
+            self._ensure_not_cancelled()
+            self.progress_message.emit(f'Fetching Spotify playlist (attempt {retry_count + 1})...')
             try:
                 # Use the new authentication method
                 token = self.spotify_auth.refresh_token_if_needed()
@@ -3596,13 +3814,18 @@ class PlaylistConverterThread(QThread):
         raise ValueError("Failed to fetch Spotify playlist after all retry attempts")
 
     def get_deezer_playlist_info(self):
+        self._ensure_not_cancelled()
         playlist_id = self.playlist_source.split('/')[-1]
+        self.progress_message.emit('Fetching Deezer playlist metadata...')
         playlist = self.deezer_client.get_playlist(playlist_id)
-        
+
         tracks = []
+        total = getattr(playlist, 'nb_tracks', None) or len(getattr(playlist, 'tracks', [])) or 1
         for track in playlist.tracks:
+            self._ensure_not_cancelled()
             tracks.append(f"{track.title} - {track.artist.name}")
-            self.progress_update.emit(int(len(tracks) / playlist.nb_tracks * 50))
+            self.progress_update.emit(int(len(tracks) / total * 50))
+            self.progress_message.emit(f"Processing Deezer track {len(tracks)}/{total}")
 
         playlist_name = playlist.title
         playlist_image_url = playlist.picture_xl
@@ -3617,6 +3840,8 @@ class PlaylistConverterThread(QThread):
             action = getattr(self, 'conflict_action', 'create')
             existing_playlist = getattr(self, 'existing_playlist', None)
             
+            self._ensure_not_cancelled()
+
             # Handle the pre-decided action
             if action == "overwrite" and existing_playlist:
                 existing_playlist.delete()
@@ -3628,6 +3853,8 @@ class PlaylistConverterThread(QThread):
             not_found_tracks = []
             total_tracks = len(tracks)
             for i, track in enumerate(tracks):
+                self._ensure_not_cancelled()
+                self.progress_message.emit(f"Matching track {i + 1}/{total_tracks}: {track}")
                 plex_track = self.find_best_match(library_section, track)
                 if plex_track:
                     plex_tracks.append(plex_track)
@@ -3635,6 +3862,9 @@ class PlaylistConverterThread(QThread):
                     not_found_tracks.append(track)
                 self.progress_update.emit(50 + int((i + 1) / total_tracks * 50))
             
+            self._ensure_not_cancelled()
+            self.progress_message.emit(f"Creating Plex playlist '{final_name}'...")
+
             if plex_tracks:
                 # Use the final_name (which might be renamed) instead of original playlist_name
                 plex_playlist = self.plex_server.createPlaylist(final_name, items=plex_tracks)
@@ -3697,12 +3927,15 @@ class PlaylistConverterThread(QThread):
                 self.final_playlist_name = final_name
             else:
                 raise ValueError("No matching tracks found in your Plex library")
+        except PlaylistConversionCancelled:
+            raise
         except Exception as e:
             logging.error(f"Error creating Plex playlist: {str(e)}", exc_info=True)
             raise ValueError(f"Error creating Plex playlist: {e}")
 
     def find_best_match(self, library_section, track):
         """Enhanced find_best_match with user confirmation for low scores"""
+        self._ensure_not_cancelled()
         title, artist = self.parse_track_info(track)
         all_tracks = library_section.searchTracks(title=title)
         
@@ -3710,6 +3943,7 @@ class PlaylistConverterThread(QThread):
         best_score = 0
         
         for plex_track in all_tracks:
+            self._ensure_not_cancelled()
             # Calculate similarity score for title
             plex_title = plex_track.title if plex_track.title else ""
             title_score = fuzz.token_set_ratio(title.lower(), plex_title.lower())
@@ -3796,6 +4030,7 @@ class PlexPlaylistManager(QMainWindow):
         self.loading_dialog = None
         self.playlist_cache = PlaylistCache()  # Initialize cache system
         self.track_count_threads = {}  # Keep track of background track count loading
+        self.last_section_id = None  # Remember the last selected Plex library section
         self.auto_sync_timer = QTimer()
         self.auto_sync_timer.timeout.connect(self.perform_auto_sync)
         self.initUI()
@@ -3963,8 +4198,8 @@ class PlexPlaylistManager(QMainWindow):
         
         # Sync configurations table
         self.sync_configs_table = QTableWidget()
-        self.sync_configs_table.setColumnCount(4)
-        self.sync_configs_table.setHorizontalHeaderLabels(["Playlist", "Source", "Last Sync", "Actions"])
+        self.sync_configs_table.setColumnCount(5)
+        self.sync_configs_table.setHorizontalHeaderLabels(["Playlist", "Source", "Last Sync", "Clear on Sync", "Actions"])
         self.sync_configs_table.horizontalHeader().setStretchLastSection(True)
         
         # HIDE THE VERTICAL HEADER (row numbers) - this removes the white bar
@@ -3974,7 +4209,8 @@ class PlexPlaylistManager(QMainWindow):
         self.sync_configs_table.setColumnWidth(0, 200)  # Playlist
         self.sync_configs_table.setColumnWidth(1, 300)  # Source
         self.sync_configs_table.setColumnWidth(2, 150)  # Last Sync
-        self.sync_configs_table.setColumnWidth(3, 180)  # Actions - wider for buttons
+        self.sync_configs_table.setColumnWidth(3, 140)  # Clear before sync
+        self.sync_configs_table.setColumnWidth(4, 180)  # Actions - wider for buttons
         sync_layout.addWidget(self.sync_configs_table)
         
         layout.addWidget(sync_group)
@@ -4257,8 +4493,10 @@ class PlexPlaylistManager(QMainWindow):
     
     def import_multiple_spotify_playlists(self, playlists):
         """Import multiple Spotify playlists"""
-        self.streaming_progress.setVisible(True)
+        self._show_streaming_feedback("Importing Spotify playlists...")
         self.streaming_progress.setValue(0)
+        self.cancel_streaming_button.setVisible(False)
+        self.cancel_streaming_button.setEnabled(False)
         
         # Start import thread
         self.multi_import_thread = MultiplePlaylistImportThread(playlists, self.plex_server, 
@@ -4293,7 +4531,7 @@ class PlexPlaylistManager(QMainWindow):
         """Update progress for multiple playlist import"""
         progress = int((current / total) * 100)
         self.streaming_progress.setValue(progress)
-        self.statusBar().showMessage(f"Importing {playlist_name}... ({current}/{total})")
+        self.update_streaming_status(f"Importing {playlist_name}... ({current}/{total})")
     
     def on_playlist_imported(self, playlist_name, track_count):
         """Handle individual playlist import completion"""
@@ -4301,7 +4539,7 @@ class PlexPlaylistManager(QMainWindow):
     
     def on_multi_import_finished(self, imported_count, total_count):
         """Handle multiple import completion"""
-        self.streaming_progress.setVisible(False)
+        self._hide_streaming_feedback()
         self.statusBar().showMessage(f"Import completed: {imported_count}/{total_count} playlists")
         
         message = f"✅ Import completed!\n\nSuccessfully imported {imported_count} out of {total_count} playlists."
@@ -4312,8 +4550,8 @@ class PlexPlaylistManager(QMainWindow):
         self.fetch_playlists()  # Refresh playlist list
     
     def on_multi_import_error(self, error_message):
-        """Handle multiple import error"""
-        self.streaming_progress.setVisible(False)
+        self._hide_streaming_feedback()
+        QMessageBox.critical(self, "Import Error", f"Import failed: {error_message}")
         QMessageBox.critical(self, "Import Error", f"Import failed: {error_message}")
     
     def save_spotify_config(self, sp_dc_cookie):
@@ -4835,6 +5073,7 @@ class PlexPlaylistManager(QMainWindow):
         # Import from URL section
         streaming_group = QGroupBox("Import from Streaming Services")
         streaming_layout = QVBoxLayout()
+        streaming_group.setLayout(streaming_layout)
     
         self.playlist_url_input = QLineEdit()
         self.playlist_url_input.setPlaceholderText("Enter Spotify, Deezer, or Tidal Playlist URL")
@@ -4870,13 +5109,29 @@ class PlexPlaylistManager(QMainWindow):
         self.import_playlist_button.clicked.connect(self.import_streaming_playlist)
         streaming_layout.addWidget(self.import_playlist_button)
     
-        streaming_group.setLayout(streaming_layout)
-        layout.addWidget(streaming_group)
-    
+        progress_layout = QHBoxLayout()
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setSpacing(8)
+
         self.streaming_progress = QProgressBar()
         self.streaming_progress.setVisible(False)
-        layout.addWidget(self.streaming_progress)
-    
+        progress_layout.addWidget(self.streaming_progress)
+
+        self.cancel_streaming_button = QPushButton('Cancel')
+        self.cancel_streaming_button.setVisible(False)
+        self.cancel_streaming_button.setEnabled(False)
+        self.cancel_streaming_button.clicked.connect(self.cancel_streaming_import)
+        progress_layout.addWidget(self.cancel_streaming_button)
+        progress_layout.addStretch()
+
+        streaming_layout.addLayout(progress_layout)
+
+        self.streaming_status_label = QLabel('')
+        self.streaming_status_label.setVisible(False)
+        self.streaming_status_label.setStyleSheet('color: #cccccc; padding: 4px 0;')
+        streaming_layout.addWidget(self.streaming_status_label)
+
+        layout.addWidget(streaming_group)
         layout.addStretch()
         self.content_stack.addWidget(page)
 
@@ -4929,6 +5184,8 @@ class PlexPlaylistManager(QMainWindow):
             sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
             self.sync_configs_table.setItem(row, 2, sync_item)
             
+            self._set_clear_on_sync_checkbox(row, False)
+
             # Create action buttons for the new row
             self.create_action_buttons_for_row(row)
             
@@ -5108,6 +5365,8 @@ class PlexPlaylistManager(QMainWindow):
         sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
         self.sync_configs_table.setItem(row, 2, sync_item)
         
+        self._set_clear_on_sync_checkbox(row, False)
+
         # Create better styled action buttons
         self.create_action_buttons_for_row(row)
         
@@ -5117,6 +5376,30 @@ class PlexPlaylistManager(QMainWindow):
         self.save_sync_config()
         self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Added sync config for '{playlist_name}'")
     
+    def _set_clear_on_sync_checkbox(self, row, checked=False):
+        """Add or update the clear-before-sync checkbox for a table row."""
+        checkbox = QCheckBox()
+        checkbox.setChecked(bool(checked))
+        checkbox.setToolTip("Clear the Plex playlist before adding new tracks during sync")
+        checkbox.stateChanged.connect(lambda _state: self.save_sync_config())
+
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignCenter)
+        layout.addWidget(checkbox)
+
+        self.sync_configs_table.setCellWidget(row, 3, container)
+        return checkbox
+
+    def _is_clear_before_sync_enabled(self, row):
+        """Read the clear-before-sync checkbox state for a table row."""
+        container = self.sync_configs_table.cellWidget(row, 3)
+        if not container:
+            return False
+        checkbox = container.findChild(QCheckBox)
+        return checkbox.isChecked() if checkbox else False
+
     def create_action_buttons_for_row(self, row):
         """Create properly sized and visible action buttons for sync config row"""
         actions_widget = QWidget()
@@ -5173,7 +5456,7 @@ class PlexPlaylistManager(QMainWindow):
         actions_layout.addWidget(delete_btn)
         
         # FIXED: Set the widget properly and ensure table row height accommodates buttons
-        self.sync_configs_table.setCellWidget(row, 3, actions_widget)
+        self.sync_configs_table.setCellWidget(row, 4, actions_widget)
         self.sync_configs_table.setRowHeight(row, 40)  # Ensure row is tall enough
     
     def sync_single_playlist(self, row):
@@ -5185,7 +5468,8 @@ class PlexPlaylistManager(QMainWindow):
             config = {
                 playlist_name: {
                     'source_url': source_url,
-                    'library_section': self.section_combo.currentData()
+                    'library_section': self.section_combo.currentData(),
+                    'clear_before_sync': self._is_clear_before_sync_enabled(row)
                 }
             }
             
@@ -5241,6 +5525,8 @@ class PlexPlaylistManager(QMainWindow):
                     sync_item = QTableWidgetItem(config.get('last_sync', 'Never'))
                     sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
                     self.sync_configs_table.setItem(row, 2, sync_item)
+
+                    self._set_clear_on_sync_checkbox(row, config.get('clear_before_sync', False))
                     
                     # Add styled action buttons
                     self.create_action_buttons_for_row(row)
@@ -5262,7 +5548,8 @@ class PlexPlaylistManager(QMainWindow):
                 source_url = self.sync_configs_table.item(row, 1).text()
                 selected_configs[playlist_name] = {
                     'source_url': source_url,
-                    'library_section': self.section_combo.currentData()
+                    'library_section': self.section_combo.currentData(),
+                    'clear_before_sync': self._is_clear_before_sync_enabled(row)
                 }
         
         if not selected_configs:
@@ -5280,7 +5567,8 @@ class PlexPlaylistManager(QMainWindow):
             source_url = self.sync_configs_table.item(row, 1).text()
             all_configs[playlist_name] = {
                 'source_url': source_url,
-                'library_section': self.section_combo.currentData()
+                'library_section': self.section_combo.currentData(),
+                'clear_before_sync': self._is_clear_before_sync_enabled(row)
             }
         
         if not all_configs:
@@ -5361,7 +5649,8 @@ class PlexPlaylistManager(QMainWindow):
                 configs[playlist_name] = {
                     'source_url': source_url,
                     'last_sync': last_sync,
-                    'library_section': self.section_combo.currentData()
+                    'library_section': self.section_combo.currentData(),
+                    'clear_before_sync': self._is_clear_before_sync_enabled(row)
                 }
             
             sync_config = {
@@ -6037,10 +6326,20 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     self.section_combo.addItem(section.title, section.key)
             
             if music_sections:
-                # Automatically select the first music section
-                self.section_combo.setCurrentIndex(0)
-                self.last_section_id = music_sections[0].key
-                logging.info(f"Auto-selected music library: {music_sections[0].title}")
+                target_index = 0
+                saved_section = getattr(self, 'last_section_id', None)
+                if saved_section is not None:
+                    for idx in range(self.section_combo.count()):
+                        if self.section_combo.itemData(idx) == saved_section:
+                            target_index = idx
+                            break
+                self.section_combo.setCurrentIndex(target_index)
+                selected_section_id = self.section_combo.currentData()
+                self.last_section_id = selected_section_id
+                if saved_section is not None and selected_section_id == saved_section:
+                    logging.info(f"Restored previously selected music library: {self.section_combo.currentText()}")
+                else:
+                    logging.info(f"Auto-selected music library: {self.section_combo.currentText()}")
             elif self.section_combo.count() == 0:
                 QMessageBox.warning(self, "No Music Sections", "No music library sections found in your Plex server.")
         except Exception as e:
@@ -6176,6 +6475,38 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # No conflict, proceed with normal upload
             self._perform_upload(path)
     
+    def _prepare_playlist_for_upload(self, path):
+        """Normalize playlist file for Plex upload (handle Windows paths)."""
+        temp_path = None
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as original:
+                lines = original.readlines()
+        except UnicodeDecodeError:
+            with open(path, 'r', encoding='latin-1', errors='replace') as original:
+                lines = original.readlines()
+
+        modified = False
+        normalized_lines = []
+        for line in lines:
+            if not line.strip() or line.lstrip().startswith('#'):
+                normalized_lines.append(line)
+                continue
+
+            normalized_line = line.replace('\\', '/')
+            if normalized_line != line:
+                modified = True
+            normalized_lines.append(normalized_line)
+
+        if modified:
+            import tempfile
+            temp_file = tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8', newline='')
+            with temp_file as temp:
+                temp.writelines(normalized_lines)
+            logging.debug(f"Created normalized temporary playlist for upload: {temp_file.name}")
+            temp_path = temp_file.name
+
+        return temp_path
+
     def _perform_upload(self, path, custom_name=None):
         """Perform the actual playlist upload with conflict checking"""
         try:
@@ -6239,12 +6570,63 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 return
         
             url = f"http://{plex_server}:{plex_port}/playlists/upload"
-            params = {'sectionID': library_section_id, 'path': path, 'X-Plex-Token': plex_token}
-            
-            response = requests.post(url, params=params)
-            response.raise_for_status()
-            
-            self.statusBar().showMessage(f"'{playlist_name}' imported successfully.")
+            params = {'X-Plex-Token': plex_token}
+            data = {'sectionID': library_section_id}
+
+            upload_success = False
+            upload_errors = []
+
+            if os.path.isfile(path):
+                normalized_temp_path = None
+                try:
+                    normalized_temp_path = self._prepare_playlist_for_upload(path)
+                    upload_file_path = normalized_temp_path or path
+
+                    with open(upload_file_path, 'rb') as playlist_file:
+                        files = {
+                            'file': (
+                                os.path.basename(path),
+                                playlist_file,
+                                'audio/x-mpegurl'
+                            )
+                        }
+                        response = requests.post(
+                            url,
+                            params=params,
+                            data=data,
+                            files=files,
+                            timeout=30
+                        )
+                    response.raise_for_status()
+                    upload_success = True
+                    logging.info(f"Uploaded playlist '{playlist_name}' via direct file upload.")
+                except requests.RequestException as upload_error:
+                    upload_errors.append(f"Direct upload failed: {upload_error}")
+                    logging.warning(f"Direct playlist upload failed, will retry using server path: {upload_error}")
+                finally:
+                    if normalized_temp_path and os.path.exists(normalized_temp_path):
+                        try:
+                            os.remove(normalized_temp_path)
+                        except OSError:
+                            logging.debug(f"Failed to remove temp playlist file: {normalized_temp_path}")
+            else:
+                upload_errors.append('Playlist file is not accessible locally for direct upload.')
+
+            if not upload_success:
+                fallback_params = {'sectionID': library_section_id, 'path': path, 'X-Plex-Token': plex_token}
+                try:
+                    response = requests.post(url, params=fallback_params, timeout=30)
+                    response.raise_for_status()
+                    upload_success = True
+                    logging.info(f"Uploaded playlist '{playlist_name}' using server-side path fallback.")
+                except requests.RequestException as fallback_error:
+                    upload_errors.append(f"Server path upload failed: {fallback_error}")
+                    combined_error = '; '.join(upload_errors)
+                    logging.error(f"Playlist upload failed for '{playlist_name}': {combined_error}")
+                    raise requests.RequestException(combined_error) from fallback_error
+
+            if upload_success:
+                self.statusBar().showMessage(f"'{playlist_name}' imported successfully.")
             
         except requests.RequestException as e:
             error_message = f"Failed to import {os.path.basename(path)}. Error: {str(e)}"
@@ -6310,31 +6692,31 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         try:
             title, artist = self.parse_track_info(track)
             all_tracks = library_section.searchTracks(title=title)
-            
+
             best_match = None
             best_score = 0
-            
+
             for plex_track in all_tracks:
-                plex_title = plex_track.title if plex_track.title else ""
+                plex_title = plex_track.title if plex_track.title else ''
                 title_score = fuzz.token_set_ratio(title.lower(), plex_title.lower())
-                
+
                 artist_score = 0
                 if artist and plex_track.originalTitle:
                     artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.originalTitle.lower())
                 elif hasattr(plex_track, 'artist') and plex_track.artist():
                     artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.artist().title.lower())
-                
+
                 combined_score = (title_score * 0.7) + (artist_score * 0.3)
-                
+
                 if combined_score > best_score:
                     best_score = combined_score
                     best_match = plex_track
-            
+
             if best_score >= 70:
                 return best_match
             else:
                 return None
-                
+
         except Exception as e:
             logging.error(f"Error finding match for track: {str(e)}")
             return None
@@ -6452,9 +6834,10 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             return
         
         # Show loading indicator while we get the playlist name
-        self.streaming_progress.setVisible(True)
+        self._show_streaming_feedback('Getting playlist information...')
+        self.update_streaming_status('Getting playlist information...')
         self.streaming_progress.setValue(10)
-        self.statusBar().showMessage("Getting playlist information...")
+
         
         # Start a quick thread just to get the playlist name first
         self.name_fetch_thread = PlaylistNameFetchThread(playlist_url, self)
@@ -6485,7 +6868,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 result = dialog.exec_()
                 
                 if dialog.clickedButton() == cancel_btn:
-                    self.streaming_progress.setVisible(False)
+                    self._hide_streaming_feedback()
                     self.statusBar().showMessage("Import cancelled by user")
                     return
                 
@@ -6537,10 +6920,14 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # NEW: Connect the track match confirmation signal
             self.converter_thread.track_match_confirmation_needed.connect(self.handle_track_match_confirmation)
             
+            self.converter_thread.progress_message.connect(self.update_streaming_status)
+            self.converter_thread.cancelled.connect(self.on_streaming_cancelled)
             self.converter_thread.progress_update.connect(self.update_streaming_progress)
             self.converter_thread.finished.connect(self.conversion_finished)
             self.converter_thread.error.connect(self.conversion_error)
             
+            self.streaming_progress.setValue(20)
+            self.update_streaming_status(f"Preparing to import '{final_name}'...")
             self.converter_thread.start()
             
         except Exception as e:
@@ -6602,9 +6989,50 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     def update_streaming_progress(self, value):
         self.streaming_progress.setValue(value)
 
+    def update_streaming_status(self, message):
+        if message:
+            self.streaming_status_label.setVisible(True)
+            self.streaming_status_label.setText(message)
+            self.statusBar().showMessage(message)
+        else:
+            self.streaming_status_label.setVisible(False)
+            self.streaming_status_label.setText('')
+
+    def _show_streaming_feedback(self, status_text=''):
+        self.streaming_progress.setVisible(True)
+        self.streaming_progress.setValue(0)
+        self.streaming_status_label.setVisible(bool(status_text))
+        self.streaming_status_label.setText(status_text)
+        self.cancel_streaming_button.setVisible(True)
+        self.cancel_streaming_button.setEnabled(True)
+
+    def _hide_streaming_feedback(self):
+        self.streaming_progress.setVisible(False)
+        self.streaming_status_label.setVisible(False)
+        self.streaming_status_label.setText('')
+        self.cancel_streaming_button.setVisible(False)
+        self.cancel_streaming_button.setEnabled(False)
+
+    def cancel_streaming_import(self):
+        if hasattr(self, 'converter_thread') and self.converter_thread and self.converter_thread.isRunning():
+            self.cancel_streaming_button.setEnabled(False)
+            self.update_streaming_status('Cancelling...')
+            self.converter_thread.request_cancel()
+        elif hasattr(self, "name_fetch_thread") and self.name_fetch_thread and self.name_fetch_thread.isRunning():
+            self.name_fetch_thread.terminate()
+            self.name_fetch_thread.wait(1000)
+            self.on_streaming_cancelled()
+        else:
+            self._hide_streaming_feedback()
+    def on_streaming_cancelled(self):
+        self._hide_streaming_feedback()
+        self.statusBar().showMessage('Streaming import cancelled.')
+        self.converter_thread = None
+
+
     def conversion_finished(self):
         """Handle conversion completion and add to sync manager if requested"""
-        self.streaming_progress.setVisible(False)
+        self._hide_streaming_feedback()
         self.statusBar().showMessage("Playlist conversion completed successfully.")
         
         # Check if we should add to sync manager
@@ -6633,65 +7061,51 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         
         # Refresh playlist list
         self.fetch_playlists()
+        self.converter_thread = None
 
     def conversion_error(self, error_msg):
-        self.streaming_progress.setVisible(False)
+        self._hide_streaming_feedback()
         logging.error(f"Conversion error: {error_msg}")
+        self.statusBar().showMessage(f"Conversion error: {error_msg}")
         QMessageBox.warning(self, "Conversion Error", f"Error during playlist conversion: {error_msg}")
+        self.converter_thread = None
+
 
     def load_config(self):
+        '''Load saved configuration values and optionally auto-connect to Plex.'''
         try:
+            if not os.path.exists(CONFIG_FILE):
+                logging.info('Config file not found; using defaults.')
+                self.load_spotify_config()
+                return
+
             with open(CONFIG_FILE, 'r') as config_file:
                 config = json.load(config_file)
-                self.plex_username_input.setText(config.get("plex_username", ""))
-                self.server_ip_input.setText(config.get("server_ip", "127.0.0.1"))
-                self.server_port_input.setText(config.get("server_port", "32400"))
-                self.token_input.setText(config.get("token", ""))
-                self.last_section_id = config.get("last_section")
-            
-            # If we have a saved section, select it in the combo box
-            if self.last_section_id and self.section_combo.count() > 0:
-                index = self.section_combo.findData(self.last_section_id)
-                if index >= 0:
-                    self.section_combo.setCurrentIndex(index)
-            
-            # AUTO-CONNECT TO PLEX if we have connection info
-            saved_token = config.get("token", "")
-            saved_ip = config.get("server_ip", "")
-            saved_port = config.get("server_port", "")
-            
-            if saved_token and saved_ip and saved_port:
-                logging.info("Found saved Plex connection info, attempting auto-connect...")
-                self.statusBar().showMessage("Auto-connecting to Plex...")
-                
-                # Use QTimer to delay auto-connect until UI is fully loaded
-                QTimer.singleShot(1000, self.auto_connect_to_plex)
-            else:
-                self.statusBar().showMessage("Ready - Please connect to Plex")
-                    
-            # Load sync configurations
-            self.load_sync_config()
-    
-            # Load Spotify configuration
+        except Exception as e:
+            logging.error(f'Error loading configuration: {str(e)}')
             self.load_spotify_config()
-            
-        except Exception as e:
-            logging.error(f"Error loading configuration: {str(e)}")
-    
-    def auto_connect_to_plex(self):
-        """Automatically connect to Plex using saved credentials"""
-        try:
-            logging.info("Attempting auto-connect to Plex...")
-            self.connect_to_plex()
-            
-        except Exception as e:
-            logging.warning(f"Auto-connect to Plex failed: {str(e)}")
-            self.statusBar().showMessage(f"Auto-connect failed: {str(e)}")
-            
-            # Show a non-blocking notification that clears after 5 seconds
-            QTimer.singleShot(5000, lambda: self.statusBar().showMessage(
-                "Auto-connect failed. Please check your Plex connection settings."
-            ))
+            return
+
+        self.plex_username_input.setText(config.get('plex_username', ''))
+        self.server_ip_input.setText(config.get('server_ip', ''))
+        port_value = config.get('server_port', '')
+        if port_value is None:
+            port_value = ''
+        self.server_port_input.setText(str(port_value))
+
+        token_value = config.get('token', '') or ''
+        self.token_input.setText(token_value)
+
+        self.last_section_id = config.get('last_section') or None
+
+        # Refresh Spotify login state using the saved config
+        self.load_spotify_config()
+
+        if token_value and self.server_ip_input.text() and self.server_port_input.text():
+            logging.info('Auto-connecting to Plex using saved token.')
+            QTimer.singleShot(0, self.connect_to_plex)
+
+
 
     def save_config(self):
         """Save configuration while preserving existing settings"""
@@ -7086,3 +7500,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
