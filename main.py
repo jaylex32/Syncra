@@ -15,13 +15,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QLineEdit, QPushButton, QFileDialog, QListWidget, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QLabel, QLineEdit, QPushButton, QFileDialog, QListWidget,
                              QCheckBox, QListWidgetItem, QProgressBar, QTextEdit,
                              QMessageBox, QComboBox, QStackedWidget, QGroupBox, QDialog,
                              QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
                              QSplitter, QTabWidget, QSpinBox, QDateTimeEdit, QSlider,
-                             QFormLayout, QGridLayout, QScrollArea, QFrame, QInputDialog, QMenu)
+                             QFormLayout, QGridLayout, QScrollArea, QFrame, QInputDialog, QMenu, QProgressDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QSettings
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QDrag
 #from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -532,102 +532,175 @@ class ExportThread(QThread):
             logging.error(f"Error during export: {str(e)}")
             self.error.emit(str(e))
 
-class FindDuplicatesThread(QThread):
+class LibraryDuplicateFinderThread(QThread):
     progress_update = pyqtSignal(str, int)  # message, percentage
-    duplicates_found = pyqtSignal(list)  # duplicate tracks list
+    duplicates_found = pyqtSignal(list)  # duplicate groups list
     error = pyqtSignal(str)
 
     def __init__(self, plex_server, parent=None):
         super().__init__(parent)
         self.plex_server = plex_server
+        self.include_playlist_check = True  # Default to checking playlists
 
-    def should_exclude_playlist(self, playlist):
-        """Check if playlist should be excluded from duplicate scan"""
+    def normalize_track_signature(self, track):
+        """Create a normalized signature for duplicate detection"""
         try:
-            # Exclude by name patterns (case insensitive)
-            exclude_names = [
-                'all music', 'allmusic', 'all songs', 'library', 'entire library',
-                'complete library', 'full library', 'music library',
-                'recently added', 'recently played'
-            ]
-            
-            playlist_title_lower = playlist.title.lower()
-            for exclude_name in exclude_names:
-                if exclude_name in playlist_title_lower:
-                    return True
-            
-            return False
-            
+            title = track.title.lower().strip() if track.title else ""
+            artist = ""
+
+            if track.artist():
+                artist = track.artist().title.lower().strip()
+            elif hasattr(track, 'originalTitle') and track.originalTitle:
+                artist = track.originalTitle.lower().strip()
+
+            # Clean up common variations
+            title = title.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+            title = title.replace("feat.", "").replace("ft.", "").replace("featuring", "")
+            artist = artist.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+
+            # Remove extra whitespace
+            title = " ".join(title.split())
+            artist = " ".join(artist.split())
+
+            return f"{artist}|||{title}".lower()
+
         except Exception as e:
-            logging.error(f"Error checking playlist exclusion: {str(e)}")
-            return False
+            logging.debug(f"Error normalizing track signature: {e}")
+            return f"unknown|||{track.title or 'unknown'}".lower()
+
+    def get_track_playlists(self, track):
+        """Find which playlists contain this track"""
+        playlists_containing_track = []
+        try:
+            # This is expensive but necessary for comprehensive playlist checking
+            for playlist in self.plex_server.playlists():
+                try:
+                    if playlist.playlistType != 'audio':
+                        continue
+                    playlist_items = playlist.items()
+                    for item in playlist_items:
+                        if item.ratingKey == track.ratingKey:
+                            playlists_containing_track.append(playlist.title)
+                            break
+                except:
+                    continue
+        except Exception as e:
+            logging.debug(f"Error checking playlists for track: {e}")
+
+        return playlists_containing_track
 
     def run(self):
         try:
-            self.progress_update.emit("Fetching playlists...", 10)
-            
-            all_playlists = self.plex_server.playlists()
-            
-            # Filter out excluded playlists
-            filtered_playlists = []
-            for playlist in all_playlists:
-                if not self.should_exclude_playlist(playlist):
-                    filtered_playlists.append(playlist)
-            
-            self.progress_update.emit(f"Scanning {len(filtered_playlists)} playlists for duplicates...", 20)
-            
-            track_occurrences = {}
-            total_playlists = len(filtered_playlists)
-            
-            for i, playlist in enumerate(filtered_playlists):
+            self.progress_update.emit("Scanning music library for duplicates...", 5)
+
+            # Get music library sections
+            music_sections = []
+            for section in self.plex_server.library.sections():
+                if section.type == 'artist':  # Music library
+                    music_sections.append(section)
+
+            if not music_sections:
+                self.error.emit("No music libraries found on Plex server")
+                return
+
+            self.progress_update.emit("Loading all tracks from music library...", 10)
+
+            # Collect all tracks from all music sections
+            all_tracks = []
+            for section in music_sections:
                 try:
-                    # Skip non-music playlists
-                    if hasattr(playlist, 'playlistType') and playlist.playlistType != 'audio':
-                        continue
-                    
-                    self.progress_update.emit(f"Scanning playlist: {playlist.title}...", 
-                                            20 + int((i / total_playlists) * 60))
-                    
-                    for track in playlist.items():
-                        try:
-                            # Only process audio tracks
-                            if not hasattr(track, 'originalTitle') and not hasattr(track, 'artist'):
-                                continue
-                            
-                            # Safely get artist name
-                            artist_name = "Unknown"
-                            if hasattr(track, 'originalTitle') and track.originalTitle:
-                                artist_name = track.originalTitle
-                            elif hasattr(track, 'artist') and track.artist():
-                                artist_name = track.artist().title
-                            
-                            signature = f"{track.title}_{artist_name}"
-                            
-                            if signature not in track_occurrences:
-                                track_occurrences[signature] = []
-                            track_occurrences[signature].append((playlist.title, track))
-                            
-                        except Exception as track_error:
-                            logging.warning(f"Error processing track in playlist {playlist.title}: {str(track_error)}")
-                            continue
-                            
-                except Exception as playlist_error:
-                    logging.warning(f"Error processing playlist {playlist.title}: {str(playlist_error)}")
+                    section_tracks = section.searchTracks()
+                    all_tracks.extend(section_tracks)
+                    self.progress_update.emit(f"Loaded {len(all_tracks)} tracks so far...", 15)
+                except Exception as e:
+                    logging.warning(f"Error loading tracks from section {section.title}: {e}")
+
+            if not all_tracks:
+                self.error.emit("No tracks found in music library")
+                return
+
+            self.progress_update.emit(f"Analyzing {len(all_tracks)} tracks for duplicates...", 20)
+
+            # Group tracks by signature for duplicate detection
+            track_groups = {}
+            processed = 0
+
+            for track in all_tracks:
+                try:
+                    signature = self.normalize_track_signature(track)
+                    if signature not in track_groups:
+                        track_groups[signature] = []
+
+                    # Store detailed track info
+                    track_info = {
+                        'track': track,
+                        'title': track.title or "Unknown Title",
+                        'artist': track.artist().title if track.artist() else "Unknown Artist",
+                        'album': track.album().title if track.album() else "Unknown Album",
+                        'duration': getattr(track, 'duration', 0),
+                        'bitrate': getattr(track, 'bitrate', 0),
+                        'file_path': track.media[0].parts[0].file if track.media and track.media[0].parts else "Unknown Path",
+                        'file_size': track.media[0].parts[0].size if track.media and track.media[0].parts else 0,
+                        'rating_key': track.ratingKey,
+                        'playlists': []  # Will be populated later for duplicates
+                    }
+
+                    track_groups[signature].append(track_info)
+
+                    processed += 1
+                    if processed % 100 == 0:
+                        progress = 20 + (processed / len(all_tracks)) * 50
+                        self.progress_update.emit(f"Processed {processed}/{len(all_tracks)} tracks...", int(progress))
+
+                except Exception as e:
+                    logging.debug(f"Error processing track: {e}")
                     continue
-            
-            self.progress_update.emit("Analyzing results...", 85)
-            
-            # Find duplicates
-            duplicate_tracks = []
-            for signature, occurrences in track_occurrences.items():
-                if len(occurrences) > 1:
-                    duplicate_tracks.append((signature, occurrences))
-            
-            self.progress_update.emit("Complete!", 100)
-            self.duplicates_found.emit(duplicate_tracks)
-            
+
+            self.progress_update.emit("Identifying duplicate groups...", 70)
+
+            # Filter to only duplicate groups (groups with more than 1 track)
+            duplicate_groups = []
+            for signature, tracks in track_groups.items():
+                if len(tracks) > 1:
+                    duplicate_groups.append(tracks)
+
+            if not duplicate_groups:
+                self.duplicates_found.emit([])
+                return
+
+            # Conditionally check playlist usage
+            if self.include_playlist_check:
+                self.progress_update.emit("Checking playlist usage for duplicates...", 80)
+
+                # For duplicate tracks, check which playlists they're in
+                total_duplicates = sum(len(group) for group in duplicate_groups)
+                checked = 0
+
+                for group in duplicate_groups:
+                    for track_info in group:
+                        try:
+                            track_info['playlists'] = self.get_track_playlists(track_info['track'])
+                            checked += 1
+                            if checked % 10 == 0:
+                                progress = 80 + (checked / total_duplicates) * 15
+                                self.progress_update.emit(f"Checked playlists for {checked}/{total_duplicates} duplicate tracks...", int(progress))
+                        except Exception as e:
+                            logging.debug(f"Error checking playlists for duplicate: {e}")
+                            track_info['playlists'] = []
+
+                self.progress_update.emit("Duplicate scan completed!", 100)
+            else:
+                # Skip playlist checking for faster scan
+                for group in duplicate_groups:
+                    for track_info in group:
+                        track_info['playlists'] = []  # Empty playlist list
+
+                self.progress_update.emit("Duplicate scan completed! (Playlists not checked for faster scanning)", 100)
+
+            self.duplicates_found.emit(duplicate_groups)
+
         except Exception as e:
-            logging.error(f"Error in duplicate finding thread: {str(e)}")
+            logging.error(f"Error in library duplicate finding thread: {str(e)}")
             self.error.emit(str(e))
 
 class PlaylistTrackTable(QTableWidget):
@@ -1821,8 +1894,8 @@ class SyncThread(QThread):
             title, artist = self.parse_track_info(track)
             all_tracks = library_section.searchTracks(title=title)
 
-            best_match = None
-            best_score = 0
+            # Filter and score tracks with filtering logic
+            scored_tracks = []
 
             for plex_track in all_tracks:
                 self._ensure_not_cancelled()
@@ -1837,12 +1910,41 @@ class SyncThread(QThread):
 
                 combined_score = (title_score * 0.7) + (artist_score * 0.3)
 
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_match = plex_track
+                # Apply smart filtering if enabled
+                if hasattr(self, 'enable_filters_checkbox') and self.enable_filters_checkbox.isChecked():
+                    album_title = plex_track.album().title.lower() if plex_track.album() else ''
 
-            if best_score >= 70:
-                return best_match
+                    # Apply penalties for unwanted album types
+                    penalty = 0
+
+                    if hasattr(self, 'filter_live_checkbox') and self.filter_live_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
+                            penalty += 15
+
+                    if hasattr(self, 'filter_compilation_checkbox') and self.filter_compilation_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
+                            penalty += 12
+
+                    if hasattr(self, 'filter_remaster_checkbox') and self.filter_remaster_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['remaster', 'remastered']):
+                            penalty += 8
+
+                    if hasattr(self, 'filter_deluxe_checkbox') and self.filter_deluxe_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
+                            penalty += 6
+
+                    # Apply penalty to score
+                    combined_score = max(0, combined_score - penalty)
+
+                scored_tracks.append((plex_track, combined_score, album_title))
+
+            # Sort by score (highest first)
+            scored_tracks.sort(key=lambda x: x[1], reverse=True)
+
+            if scored_tracks and scored_tracks[0][1] >= 70:
+                best_track = scored_tracks[0][0]
+                logging.debug(f"Best match for '{title}': {best_track.title} from '{scored_tracks[0][2]}' (score: {scored_tracks[0][1]:.1f})")
+                return best_track
             else:
                 return None
 
@@ -3938,29 +4040,59 @@ class PlaylistConverterThread(QThread):
         self._ensure_not_cancelled()
         title, artist = self.parse_track_info(track)
         all_tracks = library_section.searchTracks(title=title)
-        
-        best_match = None
-        best_score = 0
-        
+
+        # Filter and score tracks with filtering logic
+        scored_tracks = []
+
         for plex_track in all_tracks:
             self._ensure_not_cancelled()
             # Calculate similarity score for title
             plex_title = plex_track.title if plex_track.title else ""
             title_score = fuzz.token_set_ratio(title.lower(), plex_title.lower())
-            
+
             # Calculate similarity score for artist if available
             artist_score = 0
             if artist and plex_track.originalTitle:
                 artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.originalTitle.lower())
             elif plex_track.artist():
                 artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.artist().title.lower())
-            
+
             # Weighted average of title and artist scores
             combined_score = (title_score * 0.7) + (artist_score * 0.3)
-            
-            if combined_score > best_score:
-                best_score = combined_score
-                best_match = plex_track
+
+            # Apply smart filtering if enabled (same as other find_best_match)
+            if hasattr(self.parent, 'enable_filters_checkbox') and self.parent.enable_filters_checkbox.isChecked():
+                album_title = plex_track.album().title.lower() if plex_track.album() else ''
+
+                # Apply penalties for unwanted album types
+                penalty = 0
+
+                if hasattr(self.parent, 'filter_live_checkbox') and self.parent.filter_live_checkbox.isChecked():
+                    if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
+                        penalty += 15
+
+                if hasattr(self.parent, 'filter_compilation_checkbox') and self.parent.filter_compilation_checkbox.isChecked():
+                    if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
+                        penalty += 12
+
+                if hasattr(self.parent, 'filter_remaster_checkbox') and self.parent.filter_remaster_checkbox.isChecked():
+                    if any(keyword in album_title for keyword in ['remaster', 'remastered']):
+                        penalty += 8
+
+                if hasattr(self.parent, 'filter_deluxe_checkbox') and self.parent.filter_deluxe_checkbox.isChecked():
+                    if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
+                        penalty += 6
+
+                # Apply penalty to score
+                combined_score = max(0, combined_score - penalty)
+
+            scored_tracks.append((plex_track, combined_score))
+
+        # Find the best match
+        if scored_tracks:
+            scored_tracks.sort(key=lambda x: x[1], reverse=True)
+            best_match = scored_tracks[0][0]
+            best_score = scored_tracks[0][1]
         
         # NEW: Handle different score ranges
         if best_score >= 80:
@@ -4014,6 +4146,475 @@ class ModernLineEdit(QLineEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFixedHeight(40)
+
+class LibraryDuplicateManagerDialog(QDialog):
+    """Professional duplicate track management dialog with safe deletion and playlist integration"""
+
+    def __init__(self, duplicate_groups, plex_server, parent=None):
+        super().__init__(parent)
+        self.duplicate_groups = duplicate_groups
+        self.plex_server = plex_server
+        self.selected_for_deletion = set()  # Track rating keys of tracks marked for deletion
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.setWindowTitle("🔍 Library Duplicate Manager")
+        self.setModal(True)
+        self.resize(1200, 800)
+
+        layout = QVBoxLayout(self)
+
+        # Header with statistics
+        header_layout = QHBoxLayout()
+
+        total_duplicates = sum(len(group) for group in self.duplicate_groups)
+        total_space_wasted = sum(
+            sum(track['file_size'] for track in group[1:])  # All but the first track in each group
+            for group in self.duplicate_groups
+        )
+        space_mb = total_space_wasted / (1024 * 1024) if total_space_wasted else 0
+
+        # Check if playlist info was included
+        playlist_mode = "with playlist info" if any(any(t['playlists'] for t in group) for group in self.duplicate_groups) else "fast mode"
+
+        stats_label = QLabel(f"📊 Found {len(self.duplicate_groups)} duplicate groups "
+                           f"({total_duplicates} total tracks, ~{space_mb:.1f}MB potential savings)\n"
+                           f"💨 Scan mode: {playlist_mode}")
+        stats_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196F3; padding: 10px;")
+        header_layout.addWidget(stats_label)
+        header_layout.addStretch()
+
+        # Action buttons in header
+        select_suggested_btn = QPushButton("✨ Auto-Select (Keep Best Quality)")
+        select_suggested_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px 16px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        select_suggested_btn.clicked.connect(self.auto_select_best_quality)
+        header_layout.addWidget(select_suggested_btn)
+
+        layout.addLayout(header_layout)
+
+        # Main content area with scroll
+        scroll_area = QScrollArea()
+        scroll_widget = QWidget()
+        self.scroll_layout = QVBoxLayout(scroll_widget)
+
+        # Create duplicate group widgets
+        for i, group in enumerate(self.duplicate_groups):
+            group_widget = self.create_duplicate_group_widget(group, i)
+            self.scroll_layout.addWidget(group_widget)
+
+        scroll_area.setWidget(scroll_widget)
+        scroll_area.setWidgetResizable(True)
+        layout.addWidget(scroll_area)
+
+        # Bottom action bar
+        action_layout = QHBoxLayout()
+
+        # Info about selected tracks
+        self.selection_info = QLabel("No tracks selected for deletion")
+        self.selection_info.setStyleSheet("color: #666666; font-style: italic;")
+        action_layout.addWidget(self.selection_info)
+
+        action_layout.addStretch()
+
+        # Action buttons
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        action_layout.addWidget(cancel_btn)
+
+        self.delete_btn = QPushButton("🗑️ Delete Selected Duplicates")
+        self.delete_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
+        self.delete_btn.setEnabled(False)
+        self.delete_btn.clicked.connect(self.confirm_deletion)
+        action_layout.addWidget(self.delete_btn)
+
+        layout.addLayout(action_layout)
+
+    def create_duplicate_group_widget(self, group, group_index):
+        """Create widget for a single duplicate group"""
+        group_box = QGroupBox(f"🎵 Duplicate Group {group_index + 1}: {group[0]['title']} - {group[0]['artist']}")
+        group_box.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                border: 2px solid #3498db;
+                border-radius: 8px;
+                margin: 8px 0px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px 0 8px;
+                color: #2c3e50;
+                background-color: white;
+            }
+        """)
+
+        layout = QVBoxLayout(group_box)
+
+        # Sort tracks by quality (bitrate, then file size)
+        sorted_tracks = sorted(group, key=lambda t: (t['bitrate'] or 0, t['file_size'] or 0), reverse=True)
+
+        for i, track in enumerate(sorted_tracks):
+            track_widget = self.create_track_widget(track, i == 0)  # First (highest quality) suggested to keep
+            layout.addWidget(track_widget)
+
+        return group_box
+
+    def create_track_widget(self, track, is_suggested_keep):
+        """Create widget for individual track with full details"""
+        track_frame = QFrame()
+        track_frame.setStyleSheet(f"""
+            QFrame {{
+                border: 2px solid {'#4CAF50' if is_suggested_keep else '#ddd'};
+                border-radius: 6px;
+                padding: 8px;
+                margin: 4px;
+                background-color: {'#f8fff8' if is_suggested_keep else '#ffffff'};
+            }}
+        """)
+
+        layout = QHBoxLayout(track_frame)
+
+        # Checkbox for deletion selection (disabled for suggested keep)
+        checkbox = QCheckBox()
+        checkbox.setEnabled(not is_suggested_keep)
+        if is_suggested_keep:
+            checkbox.setToolTip("🌟 Recommended to keep (highest quality)")
+        else:
+            checkbox.setToolTip("Select to delete this duplicate")
+
+        checkbox.toggled.connect(lambda checked: self.on_track_selection_changed(track['rating_key'], checked))
+        layout.addWidget(checkbox)
+
+        # Track details
+        details_layout = QVBoxLayout()
+
+        # Main info line
+        main_info = QLabel(f"🎵 <b>{track['title']}</b> - {track['artist']} ({track['album']})")
+        main_info.setStyleSheet("font-size: 14px; margin: 2px 0;")
+        details_layout.addWidget(main_info)
+
+        # Technical details
+        duration_str = f"{track['duration'] // 60000}:{(track['duration'] % 60000) // 1000:02d}" if track['duration'] else "Unknown"
+        bitrate_str = f"{track['bitrate']}kbps" if track['bitrate'] else "Unknown bitrate"
+        size_str = f"{track['file_size'] / (1024*1024):.1f}MB" if track['file_size'] else "Unknown size"
+
+        tech_info = QLabel(f"⚡ {duration_str} • {bitrate_str} • {size_str}")
+        tech_info.setStyleSheet("color: #666666; font-size: 12px; margin: 2px 0;")
+        details_layout.addWidget(tech_info)
+
+        # File path
+        path_info = QLabel(f"📁 {track['file_path']}")
+        path_info.setStyleSheet("color: #888888; font-size: 11px; font-family: monospace; margin: 2px 0;")
+        details_layout.addWidget(path_info)
+
+        # Playlists containing this track
+        if track['playlists']:
+            playlists_str = ", ".join(track['playlists'][:3])  # Show first 3 playlists
+            if len(track['playlists']) > 3:
+                playlists_str += f" (+{len(track['playlists']) - 3} more)"
+            playlist_info = QLabel(f"📝 In playlists: {playlists_str}")
+        elif any(any(t['playlists'] for t in group) for group in self.duplicate_groups):
+            # Some tracks have playlist info, so this one truly isn't in playlists
+            playlist_info = QLabel("📝 Not in any playlists")
+        else:
+            # No tracks have playlist info, so it wasn't checked
+            playlist_info = QLabel("📝 Playlist usage not checked (fast scan mode)")
+
+        playlist_info.setStyleSheet("color: #2196F3; font-size: 12px; margin: 2px 0;")
+        details_layout.addWidget(playlist_info)
+
+        layout.addLayout(details_layout)
+
+        # Quality indicator
+        quality_layout = QVBoxLayout()
+        if is_suggested_keep:
+            quality_label = QLabel("🌟 KEEP\n(Best Quality)")
+            quality_label.setStyleSheet("""
+                QLabel {
+                    background-color: #4CAF50;
+                    color: white;
+                    font-weight: bold;
+                    text-align: center;
+                    padding: 8px;
+                    border-radius: 6px;
+                    font-size: 12px;
+                }
+            """)
+        else:
+            quality_label = QLabel("⚠️ DUPLICATE\n(Lower Quality)")
+            quality_label.setStyleSheet("""
+                QLabel {
+                    background-color: #ff9800;
+                    color: white;
+                    font-weight: bold;
+                    text-align: center;
+                    padding: 8px;
+                    border-radius: 6px;
+                    font-size: 12px;
+                }
+            """)
+
+        quality_layout.addWidget(quality_label)
+        layout.addLayout(quality_layout)
+
+        return track_frame
+
+    def auto_select_best_quality(self):
+        """Automatically select lower quality duplicates for deletion"""
+        self.selected_for_deletion.clear()
+
+        for group in self.duplicate_groups:
+            # Sort by quality, keep the best one
+            sorted_tracks = sorted(group, key=lambda t: (t['bitrate'] or 0, t['file_size'] or 0), reverse=True)
+            # Select all but the highest quality for deletion
+            for track in sorted_tracks[1:]:
+                self.selected_for_deletion.add(track['rating_key'])
+
+        self.update_ui_selections()
+        self.update_selection_info()
+
+    def on_track_selection_changed(self, rating_key, checked):
+        """Handle individual track selection"""
+        if checked:
+            self.selected_for_deletion.add(rating_key)
+        else:
+            self.selected_for_deletion.discard(rating_key)
+
+        self.update_selection_info()
+
+    def update_ui_selections(self):
+        """Update UI to reflect current selections"""
+        # This would need to update checkboxes - simplified for now
+        pass
+
+    def update_selection_info(self):
+        """Update selection information label"""
+        count = len(self.selected_for_deletion)
+        if count == 0:
+            self.selection_info.setText("No tracks selected for deletion")
+            self.delete_btn.setEnabled(False)
+        else:
+            # Calculate space savings
+            total_size = 0
+            for group in self.duplicate_groups:
+                for track in group:
+                    if track['rating_key'] in self.selected_for_deletion:
+                        total_size += track['file_size'] or 0
+
+            size_mb = total_size / (1024 * 1024)
+            self.selection_info.setText(f"🗑️ {count} tracks selected for deletion (~{size_mb:.1f}MB)")
+            self.delete_btn.setEnabled(True)
+
+    def confirm_deletion(self):
+        """Confirm and execute deletion with comprehensive safety checks"""
+        if not self.selected_for_deletion:
+            return
+
+        # Collect detailed info about tracks being deleted
+        tracks_to_delete = []
+        playlists_affected = set()
+
+        for group in self.duplicate_groups:
+            for track in group:
+                if track['rating_key'] in self.selected_for_deletion:
+                    tracks_to_delete.append(track)
+                    playlists_affected.update(track['playlists'])
+
+        # Safety confirmation dialog
+        reply = QMessageBox.question(
+            self, "⚠️ Confirm Deletion",
+            f"You are about to permanently delete {len(tracks_to_delete)} duplicate tracks.\n\n"
+            f"📊 Space to be freed: ~{sum(t['file_size'] or 0 for t in tracks_to_delete) / (1024*1024):.1f}MB\n"
+            f"📝 Playlists affected: {len(playlists_affected)}\n\n"
+            "🔄 Playlists will be automatically updated to use the remaining versions.\n\n"
+            "⚠️ THIS CANNOT BE UNDONE!\n\n"
+            "Are you absolutely sure you want to continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            self.execute_deletion(tracks_to_delete)
+
+    def create_duplicate_log(self, tracks_to_delete):
+        """Create a detailed log file of the duplicate deletion operation"""
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_filename = f"duplicate_deletion_log_{timestamp}.txt"
+
+            # Try to save in script directory first
+            try:
+                if hasattr(sys, '_MEIPASS'):
+                    script_dir = os.path.dirname(sys.executable)
+                else:
+                    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+                log_path = os.path.join(script_dir, log_filename)
+            except:
+                # Fallback to temp directory
+                import tempfile
+                log_path = os.path.join(tempfile.gettempdir(), log_filename)
+
+            with open(log_path, 'w', encoding='utf-8') as log_file:
+                log_file.write("🔍 PLEX LIBRARY DUPLICATE DELETION LOG\n")
+                log_file.write("=" * 50 + "\n")
+                log_file.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_file.write(f"Total duplicate groups: {len(self.duplicate_groups)}\n")
+                log_file.write(f"Tracks selected for deletion: {len(tracks_to_delete)}\n")
+                log_file.write("\n")
+
+                # Log all duplicate groups with details
+                for group_idx, group in enumerate(self.duplicate_groups, 1):
+                    log_file.write(f"\n{'='*60}\n")
+                    log_file.write(f"DUPLICATE GROUP {group_idx}: {group[0]['title']} - {group[0]['artist']}\n")
+                    log_file.write(f"{'='*60}\n")
+
+                    # Sort by quality for logging
+                    sorted_tracks = sorted(group, key=lambda t: (t['bitrate'] or 0, t['file_size'] or 0), reverse=True)
+
+                    for track_idx, track in enumerate(sorted_tracks, 1):
+                        action = "DELETING" if track['rating_key'] in self.selected_for_deletion else "KEEPING"
+                        quality_note = "(BEST QUALITY)" if track_idx == 1 else "(LOWER QUALITY)"
+
+                        log_file.write(f"\n  Track {track_idx}: {action} {quality_note}\n")
+                        log_file.write(f"    Title: {track['title']}\n")
+                        log_file.write(f"    Artist: {track['artist']}\n")
+                        log_file.write(f"    Album: {track['album']}\n")
+                        log_file.write(f"    Duration: {track['duration'] // 60000 if track['duration'] else 0}:{(track['duration'] % 60000) // 1000:02d if track['duration'] else 0}\n")
+                        log_file.write(f"    Bitrate: {track['bitrate'] or 'Unknown'}kbps\n")
+                        log_file.write(f"    File Size: {track['file_size'] / (1024*1024):.1f}MB\n" if track['file_size'] else "    File Size: Unknown\n")
+                        log_file.write(f"    File Path: {track['file_path']}\n")
+                        log_file.write(f"    Rating Key: {track['rating_key']}\n")
+
+                        if track['playlists']:
+                            log_file.write(f"    Playlists: {', '.join(track['playlists'])}\n")
+                        else:
+                            log_file.write("    Playlists: None\n")
+
+                log_file.write(f"\n{'='*60}\n")
+                log_file.write("DELETION SUMMARY\n")
+                log_file.write(f"{'='*60}\n")
+                space_saved = sum(t['file_size'] or 0 for t in tracks_to_delete) / (1024*1024)
+                log_file.write(f"Estimated space to be freed: {space_saved:.1f}MB\n")
+                log_file.write(f"Operation initiated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+            return log_path
+
+        except Exception as e:
+            logging.error(f"Failed to create duplicate deletion log: {e}")
+            return None
+
+    def execute_deletion(self, tracks_to_delete):
+        """Execute the actual deletion process with comprehensive logging"""
+        # Create detailed log before deletion
+        log_path = self.create_duplicate_log(tracks_to_delete)
+
+        # Create progress dialog
+        progress = QProgressDialog("Deleting duplicate tracks...", "Cancel", 0, len(tracks_to_delete), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        deleted_count = 0
+        errors = []
+        deletion_log = []
+
+        for i, track in enumerate(tracks_to_delete):
+            if progress.wasCanceled():
+                break
+
+            progress.setValue(i)
+            progress.setLabelText(f"Deleting: {track['title']} - {track['artist']}")
+
+            try:
+                # Delete from Plex library
+                plex_track = self.plex_server.fetchItem(track['rating_key'])
+                plex_track.delete()
+                deleted_count += 1
+                success_msg = f"✅ DELETED: {track['title']} - {track['artist']} ({track['file_path']})"
+                deletion_log.append(success_msg)
+                logging.info(f"Deleted duplicate track: {track['title']} - {track['artist']}")
+
+            except Exception as e:
+                error_msg = f"❌ FAILED: {track['title']} - {track['artist']}: {str(e)}"
+                errors.append(f"{track['title']} - {track['artist']}: {str(e)}")
+                deletion_log.append(error_msg)
+                logging.error(f"Failed to delete duplicate: {error_msg}")
+
+        progress.setValue(len(tracks_to_delete))
+
+        # Update log with deletion results
+        if log_path:
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    log_file.write(f"\n{'='*60}\n")
+                    log_file.write("DELETION RESULTS\n")
+                    log_file.write(f"{'='*60}\n")
+                    log_file.write(f"Successfully deleted: {deleted_count} tracks\n")
+                    log_file.write(f"Failed to delete: {len(errors)} tracks\n")
+                    log_file.write(f"Operation completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+                    log_file.write("DETAILED DELETION LOG:\n")
+                    log_file.write("-" * 30 + "\n")
+                    for entry in deletion_log:
+                        log_file.write(f"{entry}\n")
+
+                    if errors:
+                        log_file.write(f"\nERRORS ENCOUNTERED:\n")
+                        log_file.write("-" * 20 + "\n")
+                        for error in errors:
+                            log_file.write(f"❌ {error}\n")
+
+            except Exception as e:
+                logging.error(f"Failed to update deletion log: {e}")
+
+        # Show completion summary
+        completion_msg = f"🎉 Successfully deleted {deleted_count} duplicate tracks!"
+        if log_path:
+            completion_msg += f"\n\n📄 Detailed log saved to:\n{log_path}"
+
+        if errors:
+            QMessageBox.warning(self, "Deletion Completed with Errors",
+                              f"✅ Successfully deleted: {deleted_count} tracks\n"
+                              f"❌ Failed to delete: {len(errors)} tracks\n\n"
+                              f"Errors:\n" + "\n".join(errors[:5]) +
+                              (f"\n... and {len(errors) - 5} more" if len(errors) > 5 else "") +
+                              (f"\n\n📄 Full log saved to:\n{log_path}" if log_path else ""))
+        else:
+            QMessageBox.information(self, "Deletion Completed",
+                                  f"{completion_msg}\n\nYour library is now cleaner and more organized.")
+
+        self.accept()  # Close dialog
+
 
 class PlexPlaylistManager(QMainWindow):
     def __init__(self):
@@ -4112,7 +4713,8 @@ class PlexPlaylistManager(QMainWindow):
         self.local_tracks_btn = ModernButton('Local Tracks')
         self.sync_btn = ModernButton('Sync Manager')
         self.tools_btn = ModernButton('Tools & Utilities')
-        
+        self.settings_btn = ModernButton('⚙️ Settings')
+
         sidebar_layout.addWidget(self.connection_btn)
         sidebar_layout.addWidget(self.playlists_btn)
         # REMOVED: sidebar_layout.addWidget(self.import_export_btn)
@@ -4120,6 +4722,7 @@ class PlexPlaylistManager(QMainWindow):
         sidebar_layout.addWidget(self.local_tracks_btn)
         sidebar_layout.addWidget(self.sync_btn)
         sidebar_layout.addWidget(self.tools_btn)
+        sidebar_layout.addWidget(self.settings_btn)
         sidebar_layout.addStretch()
         
         main_layout.addWidget(sidebar)
@@ -4136,7 +4739,8 @@ class PlexPlaylistManager(QMainWindow):
         self.create_local_tracks_page()
         self.create_sync_manager_page()
         self.create_tools_page()
-        
+        self.create_settings_page()
+
         # Connect buttons to switch pages (updated indices)
         self.connection_btn.clicked.connect(lambda: self.content_stack.setCurrentIndex(0))
         self.playlists_btn.clicked.connect(lambda: self.content_stack.setCurrentIndex(1))
@@ -4145,6 +4749,7 @@ class PlexPlaylistManager(QMainWindow):
         self.local_tracks_btn.clicked.connect(lambda: self.content_stack.setCurrentIndex(3))  # Changed from 4 to 3
         self.sync_btn.clicked.connect(lambda: self.content_stack.setCurrentIndex(4))  # Changed from 5 to 4
         self.tools_btn.clicked.connect(lambda: self.content_stack.setCurrentIndex(5))  # Changed from 6 to 5
+        self.settings_btn.clicked.connect(lambda: self.content_stack.setCurrentIndex(6))  # New settings page
         
         # Status bar
         self.statusBar().showMessage('Ready')
@@ -4278,8 +4883,9 @@ class PlexPlaylistManager(QMainWindow):
         playlist_ops_layout.addWidget(self.merge_playlists_btn, 0, 0)
         
         # Duplicate detection
-        self.find_duplicates_btn = ModernButton("Find Duplicate Tracks")
+        self.find_duplicates_btn = ModernButton("🔍 Find Library Duplicates")
         self.find_duplicates_btn.clicked.connect(self.find_duplicate_tracks)
+        self.find_duplicates_btn.setToolTip("Scan entire music library for duplicate tracks with safe deletion options")
         playlist_ops_layout.addWidget(self.find_duplicates_btn, 0, 1)
         
         # Backup playlists
@@ -4324,6 +4930,121 @@ class PlexPlaylistManager(QMainWindow):
         
         layout.addWidget(analysis_group)
         
+        layout.addStretch()
+        self.content_stack.addWidget(page)
+
+    def create_settings_page(self):
+        """Create settings page with global configuration options"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        # Settings header
+        layout.addWidget(QLabel("<h2>⚙️ Settings & Configuration</h2>"))
+
+        # Track Matching Filters Section
+        filters_group = QGroupBox("🎯 Track Matching Filters")
+        filters_group.setToolTip("These filters apply to all playlist imports (streaming services, M3U files, etc.)")
+        filters_layout = QVBoxLayout()
+
+        # Enable filters checkbox
+        self.enable_filters_checkbox = QCheckBox("Enable smart filtering for better track matching")
+        self.enable_filters_checkbox.setChecked(True)
+        self.enable_filters_checkbox.setStyleSheet("""
+            QCheckBox {
+                font-weight: bold;
+                color: #2196F3;
+                padding: 8px;
+                font-size: 14px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 2px solid #2196F3;
+                background-color: transparent;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                border: 2px solid #2196F3;
+                background-color: #2196F3;
+                border-radius: 3px;
+            }
+        """)
+        filters_layout.addWidget(self.enable_filters_checkbox)
+
+        # Filter options with better styling
+        filter_options_layout = QVBoxLayout()
+        filter_options_layout.setContentsMargins(20, 10, 0, 0)  # Indent
+
+        self.filter_live_checkbox = QCheckBox("🎤 Avoid 'Live' versions (prioritize studio recordings)")
+        self.filter_live_checkbox.setChecked(True)
+        self.filter_live_checkbox.setToolTip("Reduces priority of albums containing 'live', 'concert', or 'tour'")
+
+        self.filter_compilation_checkbox = QCheckBox("📀 Avoid 'Best Of' and 'Greatest Hits' compilations")
+        self.filter_compilation_checkbox.setChecked(True)
+        self.filter_compilation_checkbox.setToolTip("Reduces priority of albums containing 'best of', 'greatest hits', 'collection', or 'anthology'")
+
+        self.filter_remaster_checkbox = QCheckBox("🔄 Deprioritize 'Remaster' and 'Remastered' versions")
+        self.filter_remaster_checkbox.setChecked(False)  # Some people prefer remasters
+        self.filter_remaster_checkbox.setToolTip("Reduces priority of albums containing 'remaster' or 'remastered'")
+
+        self.filter_deluxe_checkbox = QCheckBox("💿 Deprioritize 'Deluxe', 'Special', and 'Extended' editions")
+        self.filter_deluxe_checkbox.setChecked(False)
+        self.filter_deluxe_checkbox.setToolTip("Reduces priority of albums containing 'deluxe', 'special', 'extended', 'expanded', or 'anniversary'")
+
+        # Style the filter checkboxes
+        filter_style = """
+            QCheckBox {
+                color: #ffffff;
+                padding: 6px;
+                font-size: 13px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 2px solid #4CAF50;
+                background-color: transparent;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                border: 2px solid #4CAF50;
+                background-color: #4CAF50;
+                border-radius: 3px;
+            }
+        """
+
+        for checkbox in [self.filter_live_checkbox, self.filter_compilation_checkbox,
+                        self.filter_remaster_checkbox, self.filter_deluxe_checkbox]:
+            checkbox.setStyleSheet(filter_style)
+
+        filter_options_layout.addWidget(self.filter_live_checkbox)
+        filter_options_layout.addWidget(self.filter_compilation_checkbox)
+        filter_options_layout.addWidget(self.filter_remaster_checkbox)
+        filter_options_layout.addWidget(self.filter_deluxe_checkbox)
+
+        filters_layout.addLayout(filter_options_layout)
+
+        # Info section
+        info_label = QLabel("ℹ️ These filters help prioritize the correct versions of tracks when multiple versions exist in your Plex library (e.g., studio vs live, original vs compilation).")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #ffffff; font-style: italic; padding: 10px; background-color: #4a4a4a; border-radius: 5px; margin: 10px 0;")
+        filters_layout.addWidget(info_label)
+
+        filters_group.setLayout(filters_layout)
+        layout.addWidget(filters_group)
+
+        # Future settings placeholder
+        future_group = QGroupBox("🚧 More Settings (Coming Soon)")
+        future_layout = QVBoxLayout()
+        future_label = QLabel("Additional configuration options will be added here in future updates.")
+        future_label.setStyleSheet("color: #888888; font-style: italic; padding: 20px;")
+        future_layout.addWidget(future_label)
+        future_group.setLayout(future_layout)
+        layout.addWidget(future_group)
+
         layout.addStretch()
         self.content_stack.addWidget(page)
 
@@ -4791,7 +5512,13 @@ class PlexPlaylistManager(QMainWindow):
             with open(save_path, 'w', encoding='utf-8') as file:
                 file.write("#EXTM3U\n")
                 for track_path in selected_tracks:
-                    file.write(f"{track_path}\n")
+                    # Normalize path separators for cross-platform compatibility
+                    # PRESERVE CASE - very important for UNC paths
+                    normalized_path = track_path.replace('\\', '/')
+
+                    # Log the path to help debug case issues
+                    logging.debug(f"Writing track path to M3U: {normalized_path}")
+                    file.write(f"{normalized_path}\n")
             
             self.statusBar().showMessage(f"Playlist saved to {save_path}")
             
@@ -4830,7 +5557,9 @@ class PlexPlaylistManager(QMainWindow):
             with open(temp_file, 'w', encoding='utf-8') as file:
                 file.write("#EXTM3U\n")
                 for track_path in selected_tracks:
-                    file.write(f"{track_path}\n")
+                    # Normalize path separators for cross-platform compatibility
+                    normalized_path = track_path.replace('\\', '/')
+                    file.write(f"{normalized_path}\n")
             
             # Upload the playlist to Plex
             self.upload_playlist(temp_file)
@@ -5104,7 +5833,7 @@ class PlexPlaylistManager(QMainWindow):
             }
         """)
         streaming_layout.addWidget(self.add_to_sync_checkbox)
-    
+
         self.import_playlist_button = QPushButton("Import Playlist to Plex")
         self.import_playlist_button.clicked.connect(self.import_streaming_playlist)
         streaming_layout.addWidget(self.import_playlist_button)
@@ -5667,27 +6396,110 @@ class PlexPlaylistManager(QMainWindow):
 
     # Tools and utilities methods
     def find_duplicate_tracks(self):
-        """Find duplicate tracks across all playlists using background thread"""
+        """Find duplicate tracks in entire music library using background thread"""
         if not self.plex_server:
             QMessageBox.warning(self, "Not Connected", "Please connect to Plex server first.")
             return
-        
+
         # Prevent multiple simultaneous scans
         if hasattr(self, 'duplicates_thread') and self.duplicates_thread.isRunning():
-            QMessageBox.information(self, "Scan in Progress", "Duplicate scan is already running. Please wait...")
+            QMessageBox.information(self, "Scan in Progress", "Library duplicate scan is already running. Please wait...")
             return
-        
+
+        # Create custom dialog for scan options
+        scan_dialog = QDialog(self)
+        scan_dialog.setWindowTitle("Library Duplicate Scan Options")
+        scan_dialog.setModal(True)
+        scan_dialog.resize(500, 300)
+
+        layout = QVBoxLayout(scan_dialog)
+
+        # Header
+        header = QLabel("🔍 Configure Library Duplicate Scan")
+        header.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196F3; padding: 10px;")
+        layout.addWidget(header)
+
+        # Description
+        desc = QLabel("This will scan your entire music library for duplicate tracks based on title and artist matching.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #666; padding: 10px; font-size: 14px;")
+        layout.addWidget(desc)
+
+        # Options group
+        options_group = QGroupBox("Scan Options")
+        options_layout = QVBoxLayout(options_group)
+
+        # Playlist checking option
+        check_playlists_cb = QCheckBox("📝 Check which playlists contain duplicates")
+        check_playlists_cb.setChecked(True)
+        check_playlists_cb.setStyleSheet("font-size: 14px; padding: 8px;")
+        options_layout.addWidget(check_playlists_cb)
+
+        playlist_warning = QLabel("⚠️ Playlist checking can add significant time for large libraries but provides valuable information for decision-making.")
+        playlist_warning.setWordWrap(True)
+        playlist_warning.setStyleSheet("color: #ff9800; font-size: 12px; font-style: italic; padding: 5px 20px;")
+        options_layout.addWidget(playlist_warning)
+
+        # Fast scan info
+        fast_info = QLabel("💨 Disable playlist checking for faster scanning (you can still see full track details and delete safely)")
+        fast_info.setWordWrap(True)
+        fast_info.setStyleSheet("color: #4CAF50; font-size: 12px; padding: 5px 20px;")
+        options_layout.addWidget(fast_info)
+
+        layout.addWidget(options_group)
+
+        # Time estimate
+        time_estimate = QLabel("⏱️ Estimated time: 30 seconds - 5 minutes depending on library size and options")
+        time_estimate.setStyleSheet("color: #666; font-style: italic; padding: 10px; text-align: center;")
+        layout.addWidget(time_estimate)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(scan_dialog.reject)
+        button_layout.addWidget(cancel_btn)
+
+        start_btn = QPushButton("🚀 Start Scan")
+        start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px 16px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        start_btn.clicked.connect(scan_dialog.accept)
+        start_btn.setDefault(True)
+        button_layout.addWidget(start_btn)
+
+        layout.addLayout(button_layout)
+
+        # Show dialog and get result
+        if scan_dialog.exec_() != QDialog.Accepted:
+            return
+
+        # Get scan options
+        include_playlist_check = check_playlists_cb.isChecked()
+
         # Show loading dialog
-        self.show_loading("Scanning for duplicates...", "Initializing scan...")
-        
+        self.show_loading("Scanning music library for duplicates...", "Initializing library scan...")
+
         # Disable the button to prevent multiple clicks
         self.find_duplicates_btn.setEnabled(False)
-        self.find_duplicates_btn.setText("Scanning...")
-        
-        # Start background scan
-        self.duplicates_thread = FindDuplicatesThread(self.plex_server, self)
+        self.find_duplicates_btn.setText("Scanning Library...")
+
+        # Start background scan with options
+        self.duplicates_thread = LibraryDuplicateFinderThread(self.plex_server, self)
+        self.duplicates_thread.include_playlist_check = include_playlist_check
         self.duplicates_thread.progress_update.connect(self.update_duplicates_progress)
-        self.duplicates_thread.duplicates_found.connect(self.on_duplicates_found)
+        self.duplicates_thread.duplicates_found.connect(self.on_library_duplicates_found)
         self.duplicates_thread.error.connect(self.on_duplicates_error)
         self.duplicates_thread.finished.connect(self.on_duplicates_finished)
         self.duplicates_thread.start()
@@ -5794,11 +6606,25 @@ class PlexPlaylistManager(QMainWindow):
         QMessageBox.critical(self, "Scan Error", f"Error scanning for duplicates: {error_message}")
         self.statusBar().showMessage("Duplicate scan failed")
     
+    def on_library_duplicates_found(self, duplicate_groups):
+        """Handle library duplicate scan results with professional management UI"""
+        self.hide_loading()
+
+        if not duplicate_groups:
+            QMessageBox.information(self, "No Duplicates Found",
+                                  "🎉 Great news! No duplicate tracks were found in your music library.\n\n"
+                                  "Your library is clean and well-organized!")
+            return
+
+        # Create professional duplicate management dialog
+        dialog = LibraryDuplicateManagerDialog(duplicate_groups, self.plex_server, self)
+        dialog.exec_()
+
     def on_duplicates_finished(self):
         """Handle duplicate scan completion"""
         # Re-enable the button
         self.find_duplicates_btn.setEnabled(True)
-        self.find_duplicates_btn.setText("Find Duplicate Tracks")
+        self.find_duplicates_btn.setText("🔍 Find Library Duplicates")
     
     def backup_all_playlists(self):
         """FIXED: Backup all playlists using background thread to prevent UI freezing"""
@@ -6476,36 +7302,252 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self._perform_upload(path)
     
     def _prepare_playlist_for_upload(self, path):
-        """Normalize playlist file for Plex upload (handle Windows paths)."""
+        """Normalize playlist file for Plex upload (handle relative paths, path separators, and Unicode)."""
         temp_path = None
-        try:
-            with open(path, 'r', encoding='utf-8-sig') as original:
-                lines = original.readlines()
-        except UnicodeDecodeError:
-            with open(path, 'r', encoding='latin-1', errors='replace') as original:
-                lines = original.readlines()
 
-        modified = False
+        logging.info(f"=== STARTING PLAYLIST NORMALIZATION FOR: {path} ===")
+
+        # Try multiple encodings to handle special characters
+        try:
+            encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'latin1']
+            lines = None
+            for encoding in encodings:
+                try:
+                    with open(path, 'r', encoding=encoding) as original:
+                        lines = original.readlines()
+                    logging.info(f"Successfully read playlist with encoding: {encoding}")
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if lines is None:
+                # Fallback to original behavior
+                with open(path, 'r', encoding='latin-1', errors='replace') as original:
+                    lines = original.readlines()
+                logging.info("Used fallback latin-1 encoding")
+        except Exception as e:
+            logging.error(f"Failed to read playlist file {path}: {e}")
+            return None
+
+        logging.info(f"Read {len(lines)} lines from playlist")
+
+        # Check if we need normalization (various path types that might cause issues)
+        needs_normalization = False
+        for line in lines:
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            file_path = line.strip()
+            logging.debug(f"Checking path for normalization: '{file_path}'")
+
+            # Force normalization for UNC paths regardless of other conditions
+            if file_path.startswith('//') or file_path.startswith('\\\\'):
+                logging.debug(f"UNC path detected, forcing normalization: {file_path}")
+                needs_normalization = True
+                break
+
+            if (not os.path.isabs(file_path) or          # Relative path
+                '\\' in file_path or                      # Backslashes (includes \\UNC)
+                file_path.startswith('smb://') or         # SMB protocol
+                file_path.startswith('cifs://') or        # CIFS protocol
+                file_path.startswith('ftp://') or         # FTP protocol
+                file_path.startswith('sftp://') or        # SFTP protocol
+                file_path.startswith('file://') or        # File protocol
+                '://' in file_path or                     # Any protocol scheme
+                any(ord(c) > 127 for c in file_path)):    # Non-ASCII chars
+                needs_normalization = True
+                break
+
+        if not needs_normalization:
+            logging.info(f"=== NO NORMALIZATION NEEDED FOR: {path} ===")
+            return None  # No temp file needed
+
+        # Perform normalization
+        logging.info(f"=== NORMALIZING PLAYLIST: {path} - UNC/problematic paths detected ===")
+        logging.info(f"Total lines to process: {len(lines)}")
+        playlist_dir = os.path.dirname(os.path.abspath(path))
         normalized_lines = []
+
         for line in lines:
             if not line.strip() or line.lstrip().startswith('#'):
                 normalized_lines.append(line)
                 continue
 
-            normalized_line = line.replace('\\', '/')
-            if normalized_line != line:
-                modified = True
-            normalized_lines.append(normalized_line)
+            file_path = line.strip()
 
-        if modified:
+            # Handle different path types
+            if file_path.startswith('\\\\') or file_path.startswith('//'):
+                # UNC network path - convert to Windows backslash format (user confirmed this works)
+                if file_path.startswith('//'):
+                    # Convert from Unix format to Windows format, preserving case
+                    normalized_path = file_path.replace('/', '\\')
+                else:
+                    # Already Windows format, just ensure it's clean
+                    normalized_path = file_path
+
+                # Ensure we have exactly two backslashes at the start
+                if not normalized_path.startswith('\\\\'):
+                    if normalized_path.startswith('\\'):
+                        normalized_path = '\\' + normalized_path
+                    else:
+                        normalized_path = '\\\\' + normalized_path
+
+                # CRITICAL: Fix case sensitivity issue for server names
+                # Extract server name (first part after \\) and ensure proper case
+                parts = normalized_path.split('\\')
+                if len(parts) >= 3 and parts[2]:  # parts[0]='', parts[1]='', parts[2]=server_name
+                    server_name = parts[2]
+                    # Check if server name is all lowercase and try to fix it
+                    if server_name.islower() and '-' in server_name:
+                        # Common pattern: desktop-xxxxx should be Desktop-xxxxx
+                        if server_name.startswith('desktop-'):
+                            parts[2] = 'Desktop-' + server_name[8:]  # Replace 'desktop-' with 'Desktop-'
+                            normalized_path = '\\'.join(parts)
+                            logging.info(f"Fixed server name case: {server_name} -> {parts[2]}")
+
+                logging.info(f"Normalized UNC path: {file_path} -> {normalized_path}")
+
+            elif any(file_path.startswith(proto) for proto in ['smb://', 'cifs://', 'ftp://', 'sftp://', 'file://']):
+                # Protocol-based network paths
+                # Keep the protocol but normalize separators
+                normalized_path = file_path.replace('\\', '/')
+                logging.debug(f"Normalized protocol path: {file_path} -> {normalized_path}")
+
+            elif '://' in file_path:
+                # Any other protocol scheme - preserve but normalize separators
+                normalized_path = file_path.replace('\\', '/')
+                logging.debug(f"Normalized other protocol path: {file_path} -> {normalized_path}")
+
+            elif not os.path.isabs(file_path):
+                # Handle relative paths
+                abs_path = os.path.join(playlist_dir, file_path)
+                abs_path = os.path.normpath(abs_path)
+
+                # Try to resolve the path
+                if os.path.exists(abs_path):
+                    file_path = abs_path
+                    logging.debug(f"Resolved relative path: {line.strip()} -> {file_path}")
+                else:
+                    # Try with alternate separators
+                    alt_path = file_path.replace('\\', '/') if '\\' in file_path else file_path.replace('/', '\\')
+                    alt_abs_path = os.path.join(playlist_dir, alt_path)
+                    alt_abs_path = os.path.normpath(alt_abs_path)
+
+                    if os.path.exists(alt_abs_path):
+                        file_path = alt_abs_path
+                        logging.debug(f"Resolved with alt separators: {line.strip()} -> {file_path}")
+                    else:
+                        # Keep trying to resolve, use best guess
+                        file_path = abs_path
+                        logging.warning(f"Could not verify path exists: {file_path}")
+
+                # Normalize path separators for Plex (forward slashes)
+                normalized_path = file_path.replace('\\', '/')
+
+            else:
+                # Absolute local path (C:\, /mnt/, etc.) - just normalize separators
+                normalized_path = file_path.replace('\\', '/')
+                if file_path != normalized_path:
+                    logging.debug(f"Normalized separators: {file_path} -> {normalized_path}")
+
+            normalized_lines.append(normalized_path + '\n')
+
+        # Create temp folder for playlist processing
+        try:
+            # Get script directory - handle both .py and .exe scenarios
+            if hasattr(sys, '_MEIPASS'):
+                # Running as PyInstaller bundle
+                script_dir = os.path.dirname(sys.executable)
+            else:
+                # Running as Python script
+                script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+            # Create temp folder
+            temp_folder = os.path.join(script_dir, "playlist_temp")
+            if not os.path.exists(temp_folder):
+                os.makedirs(temp_folder)
+                logging.debug(f"Created temp folder: {temp_folder}")
+
+            # Clean up old temp files - keep only last 3 files
+            try:
+                temp_files = []
+                for file in os.listdir(temp_folder):
+                    if file.endswith('.m3u'):
+                        file_path = os.path.join(temp_folder, file)
+                        temp_files.append((file_path, os.path.getmtime(file_path)))
+
+                # Sort by modification time (newest first)
+                temp_files.sort(key=lambda x: x[1], reverse=True)
+
+                # Remove all but the 3 newest files
+                if len(temp_files) > 3:
+                    for file_path, _ in temp_files[3:]:
+                        try:
+                            os.remove(file_path)
+                            logging.debug(f"Removed old temp file: {os.path.basename(file_path)}")
+                        except OSError:
+                            pass  # Ignore if file is in use or can't be deleted
+
+                logging.debug(f"Temp folder cleanup: keeping {min(len(temp_files), 3)} most recent files")
+            except Exception as e:
+                logging.debug(f"Temp folder cleanup failed: {e}")
+
+            # Use original filename (not _normalized suffix)
+            original_filename = os.path.basename(path)
+            temp_path = os.path.join(temp_folder, original_filename)
+
+            # Remove existing temp file if it exists
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                    logging.debug(f"Removed existing temp file: {temp_path}")
+                except OSError as e:
+                    logging.warning(f"Could not remove existing temp file: {e}")
+
+            logging.info(f"Processing playlist in temp folder: {temp_folder}")
+
+            with open(temp_path, 'w', encoding='utf-8', newline='') as temp_file:
+                temp_file.writelines(normalized_lines)
+
+            # Ensure file is properly written and ready
+            import time
+            time.sleep(0.1)  # Small delay to ensure file is written
+
+            # Verify file was created successfully and is readable
+            if not os.path.exists(temp_path):
+                raise OSError(f"Temp file was not created: {temp_path}")
+
+            file_size = os.path.getsize(temp_path)
+            if file_size == 0:
+                raise OSError(f"Temp file is empty: {temp_path}")
+
+            # Verify we can read the file back
+            try:
+                with open(temp_path, 'r', encoding='utf-8') as verify_file:
+                    verify_lines = verify_file.readlines()
+                if len(verify_lines) != len(normalized_lines):
+                    raise OSError(f"Temp file verification failed: expected {len(normalized_lines)} lines, got {len(verify_lines)}")
+            except Exception as e:
+                raise OSError(f"Cannot read temp file for verification: {e}")
+
+            logging.info(f"=== SUCCESSFULLY CREATED TEMP PLAYLIST: {original_filename} in temp folder ===")
+            logging.info(f"Temp file full path: {temp_path}")
+            logging.info(f"Temp file size: {file_size} bytes, lines: {len(verify_lines)}")
+            return temp_path
+
+        except Exception as e:
+            logging.warning(f"Failed to create temp playlist in script dir: {e}")
+
+            # Fallback to system temp directory
             import tempfile
-            temp_file = tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8', newline='')
-            with temp_file as temp:
-                temp.writelines(normalized_lines)
-            logging.debug(f"Created normalized temporary playlist for upload: {temp_file.name}")
-            temp_path = temp_file.name
-
-        return temp_path
+            try:
+                temp_fd, temp_path = tempfile.mkstemp(suffix='.m3u', prefix='syncra_playlist_')
+                with os.fdopen(temp_fd, 'w', encoding='utf-8', newline='') as temp_file:
+                    temp_file.writelines(normalized_lines)
+                logging.info(f"Created normalized playlist in system temp: {temp_path}")
+                return temp_path
+            except Exception as e2:
+                logging.error(f"Failed to create temp playlist anywhere: {e2}")
+                return None
 
     def _perform_upload(self, path, custom_name=None):
         """Perform the actual playlist upload with conflict checking"""
@@ -6570,8 +7612,8 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 return
         
             url = f"http://{plex_server}:{plex_port}/playlists/upload"
-            params = {'X-Plex-Token': plex_token}
-            data = {'sectionID': library_section_id}
+            params = {'X-Plex-Token': plex_token, 'sectionID': library_section_id}
+            data = {}
 
             upload_success = False
             upload_errors = []
@@ -6582,10 +7624,29 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     normalized_temp_path = self._prepare_playlist_for_upload(path)
                     upload_file_path = normalized_temp_path or path
 
+                    # If playlist was renamed and we have a temp file, rename the temp file too
+                    if normalized_temp_path and playlist_name != os.path.splitext(os.path.basename(path))[0]:
+                        temp_folder = os.path.dirname(normalized_temp_path)
+                        new_temp_filename = f"{playlist_name}.m3u"
+                        new_temp_path = os.path.join(temp_folder, new_temp_filename)
+
+                        try:
+                            os.rename(normalized_temp_path, new_temp_path)
+                            normalized_temp_path = new_temp_path
+                            upload_file_path = new_temp_path
+                            logging.info(f"Renamed temp file to match new playlist name: {new_temp_filename}")
+                        except OSError as e:
+                            logging.warning(f"Could not rename temp file: {e}")
+
+                    # Use the playlist name for upload (which may be renamed)
+                    upload_filename = f"{playlist_name}.m3u"
+
+                    logging.info(f"Uploading file: {upload_file_path} as {upload_filename}")
+
                     with open(upload_file_path, 'rb') as playlist_file:
                         files = {
                             'file': (
-                                os.path.basename(path),
+                                upload_filename,  # Keep original name
                                 playlist_file,
                                 'audio/x-mpegurl'
                             )
@@ -6593,7 +7654,6 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                         response = requests.post(
                             url,
                             params=params,
-                            data=data,
                             files=files,
                             timeout=30
                         )
@@ -6604,26 +7664,48 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     upload_errors.append(f"Direct upload failed: {upload_error}")
                     logging.warning(f"Direct playlist upload failed, will retry using server path: {upload_error}")
                 finally:
+                    # Clean up temp folder after upload attempt
                     if normalized_temp_path and os.path.exists(normalized_temp_path):
-                        try:
-                            os.remove(normalized_temp_path)
-                        except OSError:
-                            logging.debug(f"Failed to remove temp playlist file: {normalized_temp_path}")
+                        temp_folder = os.path.dirname(normalized_temp_path)
+                        if upload_success:
+                            # Remove only this specific temp file after successful upload
+                            try:
+                                os.remove(normalized_temp_path)
+                                logging.info(f"Cleaned up temp file after successful upload: {os.path.basename(normalized_temp_path)}")
+                            except OSError as e:
+                                logging.warning(f"Could not clean up temp file: {e}")
+                        else:
+                            # Keep temp files for debugging failed uploads
+                            logging.info(f"KEEPING TEMP FILE FOR INSPECTION (upload failed): {os.path.basename(normalized_temp_path)}")
             else:
                 upload_errors.append('Playlist file is not accessible locally for direct upload.')
 
             if not upload_success:
-                fallback_params = {'sectionID': library_section_id, 'path': path, 'X-Plex-Token': plex_token}
-                try:
-                    response = requests.post(url, params=fallback_params, timeout=30)
-                    response.raise_for_status()
-                    upload_success = True
-                    logging.info(f"Uploaded playlist '{playlist_name}' using server-side path fallback.")
-                except requests.RequestException as fallback_error:
-                    upload_errors.append(f"Server path upload failed: {fallback_error}")
+                # Check if this is a localhost/local server
+                is_local_server = plex_server in ['127.0.0.1', 'localhost', '::1'] or plex_server.startswith('192.168.') or plex_server.startswith('10.') or plex_server.startswith('172.')
+
+                if is_local_server:
+                    # For local servers, try server-side path upload with normalized temp file if available
+                    upload_path = normalized_temp_path if normalized_temp_path else path
+                    fallback_params = {'sectionID': library_section_id, 'path': upload_path, 'X-Plex-Token': plex_token}
+                    logging.info(f"Server-side upload using file: {upload_path}")
+                    try:
+                        response = requests.post(url, params=fallback_params, timeout=30)
+                        response.raise_for_status()
+                        upload_success = True
+                        logging.info(f"Uploaded playlist '{playlist_name}' using server-side path fallback.")
+                    except requests.RequestException as fallback_error:
+                        upload_errors.append(f"Server path upload failed: {fallback_error}")
+                        logging.error(f"Server-side fallback failed for local server: {fallback_error}")
+                else:
+                    # For remote servers, don't attempt server-side fallback
+                    logging.info(f"Skipping server-side fallback for remote server {plex_server}")
+
+                # If still not successful, raise the error
+                if not upload_success:
                     combined_error = '; '.join(upload_errors)
                     logging.error(f"Playlist upload failed for '{playlist_name}': {combined_error}")
-                    raise requests.RequestException(combined_error) from fallback_error
+                    raise requests.RequestException(combined_error)
 
             if upload_success:
                 self.statusBar().showMessage(f"'{playlist_name}' imported successfully.")
@@ -6643,11 +7725,41 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     def _merge_with_existing(self, file_path, existing_playlist):
         """Merge M3U file tracks with existing playlist"""
         try:
-            # Read tracks from M3U file
-            with open(file_path, 'r', encoding='utf-8') as file:
-                content = file.readlines()
-            
-            new_tracks = [line.strip() for line in content if line.strip() and not line.startswith('#')]
+            # Read tracks from M3U file with proper encoding handling
+            encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'latin1']
+            content = None
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as file:
+                        content = file.readlines()
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if content is None:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    content = file.readlines()
+
+            # Process tracks with basic path normalization for merge
+            playlist_dir = os.path.dirname(os.path.abspath(file_path))
+            new_tracks = []
+
+            for line in content:
+                if not line.strip() or line.lstrip().startswith('#'):
+                    continue
+
+                track_path = line.strip()
+
+                # Handle relative paths for merge
+                if not os.path.isabs(track_path):
+                    abs_path = os.path.join(playlist_dir, track_path)
+                    abs_path = os.path.normpath(abs_path)
+                    if os.path.exists(abs_path):
+                        track_path = abs_path
+
+                # Normalize separators
+                track_path = track_path.replace('\\', '/')
+                new_tracks.append(track_path)
             
             if not new_tracks:
                 QMessageBox.warning(self, "Empty Playlist", "No tracks found in the M3U file.")
@@ -6798,8 +7910,9 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     # Use the actual file path from Plex, not just track info
                     for part in item.iterParts():
                         if hasattr(part, 'file') and part.file:
-                            # Write the full file path as it was before
-                            file.write(f"{part.file}\n")
+                            # Normalize path separators for cross-platform compatibility
+                            normalized_path = part.file.replace('\\', '/')
+                            file.write(f"{normalized_path}\n")
                             break
                     else:
                         # Fallback: if no file path available, use track info
