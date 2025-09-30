@@ -13,7 +13,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.10.2"
+__version__ = "2.11.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -4650,6 +4650,8 @@ class PlexPlaylistManager(QMainWindow):
         self.last_section_id = None  # Remember the last selected Plex library section
         self.auto_sync_timer = QTimer()
         self.auto_sync_timer.timeout.connect(self.perform_auto_sync)
+        self.path_mappings = []  # Store user-defined path mappings
+        self.plex_library_paths = []  # Cache Plex library root paths
         self.initUI()
         self.load_config()
         self.setStyleSheet(self.get_stylesheet())
@@ -5052,14 +5054,90 @@ class PlexPlaylistManager(QMainWindow):
         filters_group.setLayout(filters_layout)
         layout.addWidget(filters_group)
 
-        # Future settings placeholder
-        future_group = QGroupBox("🚧 More Settings (Coming Soon)")
-        future_layout = QVBoxLayout()
-        future_label = QLabel("Additional configuration options will be added here in future updates.")
-        future_label.setStyleSheet("color: #888888; font-style: italic; padding: 20px;")
-        future_layout.addWidget(future_label)
-        future_group.setLayout(future_layout)
-        layout.addWidget(future_group)
+        # Path Mappings Section
+        path_mappings_group = QGroupBox("🗺️ Path Mappings for M3U Playlist Uploads")
+        path_mappings_group.setToolTip("Configure path transformations for cross-platform playlist imports (Windows ↔ Linux/Mac/NAS)")
+        path_mappings_layout = QVBoxLayout()
+
+        # Info section
+        path_info = QLabel(
+            "📁 Path mappings help when your M3U playlists contain paths that don't match your Plex server's paths.\n"
+            "Common scenarios: Windows PC → Linux/Mac/Synology NAS, Local drives → Network shares\n\n"
+            "Example: Replace 'C:\\Music\\' with '/volume1/music/' for Synology NAS"
+        )
+        path_info.setWordWrap(True)
+        path_info.setStyleSheet("color: #ffffff; padding: 10px; background-color: #4a4a4a; border-radius: 5px; margin: 5px 0;")
+        path_mappings_layout.addWidget(path_info)
+
+        # Detect Plex paths button
+        detect_btn_layout = QHBoxLayout()
+        self.detect_plex_paths_btn = ModernButton('🔍 Auto-Detect Plex Library Paths')
+        self.detect_plex_paths_btn.clicked.connect(self.detect_and_show_plex_paths)
+        detect_btn_layout.addWidget(self.detect_plex_paths_btn)
+        detect_btn_layout.addStretch()
+        path_mappings_layout.addLayout(detect_btn_layout)
+
+        # Path mappings list
+        self.path_mappings_list = QListWidget()
+        self.path_mappings_list.setMaximumHeight(200)
+        path_mappings_layout.addWidget(QLabel("Configured Path Mappings:"))
+        path_mappings_layout.addWidget(self.path_mappings_list)
+
+        # Add new mapping controls
+        add_mapping_layout = QHBoxLayout()
+
+        self.source_path_input = ModernLineEdit()
+        self.source_path_input.setPlaceholderText("Source path (e.g., C:\\Music or //NAS/Music)")
+
+        self.target_path_input = ModernLineEdit()
+        self.target_path_input.setPlaceholderText("Target path (e.g., /volume1/music or /mnt/music)")
+
+        add_mapping_btn = ModernButton('➕ Add Mapping')
+        add_mapping_btn.clicked.connect(self.add_path_mapping)
+
+        remove_mapping_btn = ModernButton('➖ Remove Selected')
+        remove_mapping_btn.clicked.connect(self.remove_path_mapping)
+
+        add_mapping_layout.addWidget(QLabel("Source:"))
+        add_mapping_layout.addWidget(self.source_path_input)
+        add_mapping_layout.addWidget(QLabel("→ Target:"))
+        add_mapping_layout.addWidget(self.target_path_input)
+        add_mapping_layout.addWidget(add_mapping_btn)
+        add_mapping_layout.addWidget(remove_mapping_btn)
+
+        path_mappings_layout.addLayout(add_mapping_layout)
+
+        # Common presets
+        presets_label = QLabel("Quick Presets:")
+        presets_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        path_mappings_layout.addWidget(presets_label)
+
+        presets_layout = QHBoxLayout()
+
+        win_to_synology_btn = ModernButton('Windows → Synology')
+        win_to_synology_btn.clicked.connect(lambda: self.apply_path_preset('win_synology'))
+        win_to_synology_btn.setToolTip("C:\\ → /volume1/")
+
+        win_to_linux_btn = ModernButton('Windows → Linux/Mac')
+        win_to_linux_btn.clicked.connect(lambda: self.apply_path_preset('win_linux'))
+        win_to_linux_btn.setToolTip("C:\\ → /mnt/")
+
+        unc_to_synology_btn = ModernButton('UNC → Synology')
+        unc_to_synology_btn.clicked.connect(lambda: self.apply_path_preset('unc_synology'))
+        unc_to_synology_btn.setToolTip("\\\\NAS\\ → /volume1/")
+
+        presets_layout.addWidget(win_to_synology_btn)
+        presets_layout.addWidget(win_to_linux_btn)
+        presets_layout.addWidget(unc_to_synology_btn)
+        presets_layout.addStretch()
+
+        path_mappings_layout.addLayout(presets_layout)
+
+        path_mappings_group.setLayout(path_mappings_layout)
+        layout.addWidget(path_mappings_group)
+
+        # Refresh the path mappings list
+        self.refresh_path_mappings_list()
 
         layout.addStretch()
         self.content_stack.addWidget(page)
@@ -7316,7 +7394,394 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         else:
             # No conflict, proceed with normal upload
             self._perform_upload(path)
-    
+
+    # ==================== PATH MAPPING SYSTEM ====================
+
+    def detect_plex_library_paths(self):
+        """Detect Plex library root paths from the API"""
+        try:
+            if not self.plex_server:
+                return []
+
+            library_paths = []
+            section_id = self.section_combo.currentData()
+
+            if section_id:
+                library_section = self.plex_server.library.sectionByID(section_id)
+                # Get all locations for this library
+                for location in library_section.locations:
+                    library_paths.append(location)
+                    logging.info(f"Detected Plex library path: {location}")
+
+            self.plex_library_paths = library_paths
+            return library_paths
+        except Exception as e:
+            logging.error(f"Error detecting Plex library paths: {str(e)}")
+            return []
+
+    def normalize_path_for_os(self, path):
+        """Normalize path format based on OS patterns"""
+        # Detect path type
+        is_windows = '\\' in path or (len(path) > 1 and path[1] == ':')
+        is_unc = path.startswith('\\\\') or path.startswith('//')
+        is_unix = path.startswith('/') and not is_unc
+
+        # Return normalized version
+        if is_unc:
+            # UNC path - convert to Windows format
+            return path.replace('/', '\\')
+        elif is_windows:
+            # Windows path
+            return path.replace('/', '\\')
+        elif is_unix:
+            # Unix/Linux/Mac path
+            return path.replace('\\', '/')
+        else:
+            # Unknown format, return as-is
+            return path
+
+    def apply_path_mappings(self, file_path):
+        """Apply user-defined path mappings to transform paths"""
+        original_path = file_path
+
+        # Try each mapping in order
+        for mapping in self.path_mappings:
+            source = mapping.get('source', '')
+            target = mapping.get('target', '')
+
+            if not source or not target:
+                continue
+
+            # Normalize separators for comparison
+            normalized_file = file_path.replace('\\', '/').lower()
+            normalized_source = source.replace('\\', '/').lower()
+
+            if normalized_file.startswith(normalized_source):
+                # Replace the prefix
+                remainder = file_path[len(source):]
+                # Clean up any double separators
+                while remainder.startswith('/') or remainder.startswith('\\'):
+                    remainder = remainder[1:]
+
+                # Combine with target, using target's separator style
+                if '\\' in target:
+                    new_path = target.rstrip('\\/') + '\\' + remainder
+                else:
+                    new_path = target.rstrip('\\/') + '/' + remainder
+
+                logging.info(f"Applied mapping: {original_path} -> {new_path}")
+                return new_path
+
+        return file_path
+
+    def suggest_path_mapping(self, local_path):
+        """Suggest a path mapping based on detected Plex library paths"""
+        if not self.plex_library_paths:
+            self.detect_plex_library_paths()
+
+        suggestions = []
+
+        # Extract the likely music folder name from local path
+        local_normalized = local_path.replace('\\', '/').lower()
+
+        # Common patterns to extract base path
+        for keyword in ['music', 'audio', 'media', 'library']:
+            if keyword in local_normalized:
+                # Find the segment containing this keyword
+                parts = local_normalized.split('/')
+                for i, part in enumerate(parts):
+                    if keyword in part:
+                        local_base = '/'.join(local_path.split('/')[:i+1])
+
+                        # Suggest mapping to each Plex library path
+                        for plex_path in self.plex_library_paths:
+                            suggestions.append({
+                                'source': local_base,
+                                'target': plex_path,
+                                'confidence': 'medium'
+                            })
+                        break
+                break
+
+        # Also check for drive letter mappings (Windows to NAS)
+        if len(local_path) > 1 and local_path[1] == ':':
+            drive_letter = local_path[0]
+            for plex_path in self.plex_library_paths:
+                suggestions.append({
+                    'source': f"{drive_letter}:",
+                    'target': plex_path,
+                    'confidence': 'low'
+                })
+
+        return suggestions
+
+    def create_upload_diagnostic_log(self, m3u_path, failed_tracks):
+        """Create a detailed diagnostic log for failed uploads"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_filename = f"upload_diagnostic_{timestamp}.log"
+
+            # Use temp folder
+            if hasattr(sys, '_MEIPASS'):
+                script_dir = os.path.dirname(sys.executable)
+            else:
+                script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+            log_folder = os.path.join(script_dir, "upload_logs")
+            if not os.path.exists(log_folder):
+                os.makedirs(log_folder)
+
+            log_path = os.path.join(log_folder, log_filename)
+
+            with open(log_path, 'w', encoding='utf-8') as log_file:
+                log_file.write("=" * 80 + "\n")
+                log_file.write("SYNCRA - PLAYLIST UPLOAD DIAGNOSTIC LOG\n")
+                log_file.write("=" * 80 + "\n\n")
+
+                log_file.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_file.write(f"Playlist File: {m3u_path}\n")
+                log_file.write(f"Operating System: {platform.system()} {platform.release()}\n\n")
+
+                log_file.write("=" * 80 + "\n")
+                log_file.write("PLEX SERVER INFORMATION\n")
+                log_file.write("=" * 80 + "\n")
+                log_file.write(f"Server IP: {self.server_ip_input.text()}\n")
+                log_file.write(f"Server Port: {self.server_port_input.text()}\n")
+
+                if self.plex_library_paths:
+                    log_file.write(f"\nDetected Plex Library Paths:\n")
+                    for path in self.plex_library_paths:
+                        log_file.write(f"  - {path}\n")
+                else:
+                    log_file.write(f"\nNo Plex library paths detected\n")
+
+                log_file.write(f"\n" + "=" * 80 + "\n")
+                log_file.write("CONFIGURED PATH MAPPINGS\n")
+                log_file.write("=" * 80 + "\n")
+                if self.path_mappings:
+                    for i, mapping in enumerate(self.path_mappings, 1):
+                        log_file.write(f"{i}. {mapping['source']} -> {mapping['target']}\n")
+                else:
+                    log_file.write("No path mappings configured\n")
+
+                log_file.write(f"\n" + "=" * 80 + "\n")
+                log_file.write(f"FAILED TRACKS ({len(failed_tracks)} total)\n")
+                log_file.write("=" * 80 + "\n\n")
+
+                for i, track_info in enumerate(failed_tracks[:50], 1):  # Limit to first 50
+                    track_path = track_info.get('path', 'Unknown')
+                    reason = track_info.get('reason', 'Unknown error')
+
+                    log_file.write(f"Track #{i}:\n")
+                    log_file.write(f"  Path: {track_path}\n")
+                    log_file.write(f"  Reason: {reason}\n")
+
+                    # Add path analysis
+                    if track_path != 'Unknown':
+                        log_file.write(f"  Analysis:\n")
+                        if track_path.startswith('\\\\') or track_path.startswith('//'):
+                            log_file.write(f"    - Type: UNC Network Path\n")
+                        elif len(track_path) > 1 and track_path[1] == ':':
+                            log_file.write(f"    - Type: Windows Local Path (Drive {track_path[0]}:)\n")
+                        elif track_path.startswith('/'):
+                            log_file.write(f"    - Type: Unix/Linux/Mac Path\n")
+                        else:
+                            log_file.write(f"    - Type: Relative or Unknown Path\n")
+
+                        # Check if it would match any Plex library paths
+                        if self.plex_library_paths:
+                            found_match = False
+                            for plex_path in self.plex_library_paths:
+                                if track_path.replace('\\', '/').lower().startswith(plex_path.replace('\\', '/').lower()):
+                                    log_file.write(f"    - Matches Plex library: {plex_path}\n")
+                                    found_match = True
+                            if not found_match:
+                                log_file.write(f"    - Does NOT match any Plex library paths\n")
+
+                    log_file.write("\n")
+
+                if len(failed_tracks) > 50:
+                    log_file.write(f"... and {len(failed_tracks) - 50} more failed tracks\n\n")
+
+                log_file.write("=" * 80 + "\n")
+                log_file.write("RECOMMENDATIONS\n")
+                log_file.write("=" * 80 + "\n\n")
+
+                if not self.path_mappings:
+                    log_file.write("1. No path mappings configured. This is likely the cause of the failure.\n")
+                    log_file.write("   Go to Settings -> Path Mappings to configure path transformations.\n\n")
+
+                if failed_tracks:
+                    sample_path = failed_tracks[0].get('path', '')
+                    if sample_path:
+                        suggestions = self.suggest_path_mapping(sample_path)
+                        if suggestions:
+                            log_file.write("2. Suggested path mappings based on your setup:\n")
+                            for suggestion in suggestions[:3]:  # Top 3 suggestions
+                                log_file.write(f"   Source: {suggestion['source']}\n")
+                                log_file.write(f"   Target: {suggestion['target']}\n")
+                                log_file.write(f"   Confidence: {suggestion['confidence']}\n\n")
+
+                log_file.write("\n" + "=" * 80 + "\n")
+                log_file.write("END OF DIAGNOSTIC LOG\n")
+                log_file.write("=" * 80 + "\n")
+
+            return log_path
+        except Exception as e:
+            logging.error(f"Error creating diagnostic log: {str(e)}")
+            return None
+
+    def detect_and_show_plex_paths(self):
+        """Detect and display Plex library paths"""
+        paths = self.detect_plex_library_paths()
+
+        if paths:
+            paths_str = '\n'.join(f"  • {path}" for path in paths)
+            QMessageBox.information(self, "Plex Library Paths Detected",
+                                  f"Found {len(paths)} Plex library path(s):\n\n{paths_str}\n\n"
+                                  f"Use these paths as 'Target' when creating path mappings.")
+        else:
+            QMessageBox.warning(self, "No Paths Detected",
+                              "Could not detect Plex library paths.\n\n"
+                              "Make sure you're connected to Plex and have selected a music library.")
+
+    def add_path_mapping(self):
+        """Add a new path mapping"""
+        source = self.source_path_input.text().strip()
+        target = self.target_path_input.text().strip()
+
+        if not source or not target:
+            QMessageBox.warning(self, "Invalid Mapping",
+                              "Both source and target paths are required.")
+            return
+
+        # Check for duplicates
+        for mapping in self.path_mappings:
+            if mapping['source'].lower() == source.lower():
+                reply = QMessageBox.question(self, "Duplicate Source",
+                                           f"A mapping for '{source}' already exists.\n\nReplace it?",
+                                           QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    self.path_mappings.remove(mapping)
+                else:
+                    return
+
+        self.path_mappings.append({'source': source, 'target': target})
+        self.refresh_path_mappings_list()
+        self.save_config()
+
+        self.source_path_input.clear()
+        self.target_path_input.clear()
+
+        logging.info(f"Added path mapping: {source} -> {target}")
+
+    def remove_path_mapping(self):
+        """Remove selected path mapping"""
+        current_row = self.path_mappings_list.currentRow()
+
+        if current_row < 0:
+            QMessageBox.warning(self, "No Selection",
+                              "Please select a path mapping to remove.")
+            return
+
+        if current_row < len(self.path_mappings):
+            removed = self.path_mappings.pop(current_row)
+            self.refresh_path_mappings_list()
+            self.save_config()
+            logging.info(f"Removed path mapping: {removed['source']} -> {removed['target']}")
+
+    def refresh_path_mappings_list(self):
+        """Refresh the path mappings list display"""
+        self.path_mappings_list.clear()
+
+        if not self.path_mappings:
+            item = QListWidgetItem("No path mappings configured")
+            item.setForeground(QColor('#888888'))
+            self.path_mappings_list.addItem(item)
+        else:
+            for mapping in self.path_mappings:
+                item_text = f"{mapping['source']}  →  {mapping['target']}"
+                self.path_mappings_list.addItem(item_text)
+
+    def apply_path_preset(self, preset_type):
+        """Apply a predefined path mapping preset"""
+        presets = {
+            'win_synology': {
+                'message': 'Windows → Synology NAS preset.\n\nEnter your Windows drive letter (e.g., C) and Synology volume (e.g., volume1):',
+                'source_template': '{drive}:',
+                'target_template': '/volume{vol}',
+                'inputs': ['Drive letter (C, D, E...)', 'Volume number (1, 2, 3...)']
+            },
+            'win_linux': {
+                'message': 'Windows → Linux/Mac preset.\n\nEnter your Windows drive letter (e.g., C) and mount point (e.g., mnt/music):',
+                'source_template': '{drive}:',
+                'target_template': '/{mount}',
+                'inputs': ['Drive letter (C, D, E...)', 'Mount path (e.g., mnt/music)']
+            },
+            'unc_synology': {
+                'message': 'UNC Network Path → Synology preset.\n\nEnter your UNC server name and Synology volume:',
+                'source_template': '\\\\{server}',
+                'target_template': '/volume{vol}',
+                'inputs': ['Server/NAS name', 'Volume number (1, 2, 3...)']
+            }
+        }
+
+        preset = presets.get(preset_type)
+        if not preset:
+            return
+
+        # Show input dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Configure Path Preset")
+        dialog.setMinimumWidth(400)
+        dialog_layout = QVBoxLayout(dialog)
+
+        dialog_layout.addWidget(QLabel(preset['message']))
+
+        inputs = []
+        for input_label in preset['inputs']:
+            layout = QHBoxLayout()
+            layout.addWidget(QLabel(f"{input_label}:"))
+            input_field = QLineEdit()
+            layout.addWidget(input_field)
+            dialog_layout.addLayout(layout)
+            inputs.append(input_field)
+
+        buttons = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+        dialog_layout.addLayout(buttons)
+
+        if dialog.exec_() == QDialog.Accepted:
+            values = [inp.text().strip() for inp in inputs]
+
+            if not all(values):
+                QMessageBox.warning(self, "Invalid Input", "All fields are required.")
+                return
+
+            # Build source and target from template
+            if preset_type == 'win_synology':
+                source = preset['source_template'].format(drive=values[0].upper())
+                target = preset['target_template'].format(vol=values[1])
+            elif preset_type == 'win_linux':
+                source = preset['source_template'].format(drive=values[0].upper())
+                target = preset['target_template'].format(mount=values[1].strip('/'))
+            elif preset_type == 'unc_synology':
+                source = preset['source_template'].format(server=values[0])
+                target = preset['target_template'].format(vol=values[1])
+
+            self.source_path_input.setText(source)
+            self.target_path_input.setText(target)
+
+            # Auto-add the mapping
+            self.add_path_mapping()
+
+    # ==================== END PATH MAPPING SYSTEM ====================
+
     def _prepare_playlist_for_upload(self, path):
         """Normalize playlist file for Plex upload (handle relative paths, path separators, and Unicode)."""
         temp_path = None
@@ -7464,6 +7929,13 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 normalized_path = file_path.replace('\\', '/')
                 if file_path != normalized_path:
                     logging.debug(f"Normalized separators: {file_path} -> {normalized_path}")
+
+            # APPLY USER-DEFINED PATH MAPPINGS
+            if self.path_mappings:
+                mapped_path = self.apply_path_mappings(normalized_path)
+                if mapped_path != normalized_path:
+                    logging.info(f"Path mapping applied: {normalized_path} -> {mapped_path}")
+                    normalized_path = mapped_path
 
             normalized_lines.append(normalized_path + '\n')
 
@@ -8227,6 +8699,11 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         self.last_section_id = config.get('last_section') or None
 
+        # Load path mappings
+        self.path_mappings = config.get('path_mappings', [])
+        if self.path_mappings:
+            logging.info(f'Loaded {len(self.path_mappings)} path mapping(s)')
+
         # Refresh Spotify login state using the saved config
         self.load_spotify_config()
 
@@ -8254,7 +8731,8 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 "server_ip": self.server_ip_input.text(),
                 "server_port": self.server_port_input.text(),
                 "token": self.token_input.text(),
-                "last_section": self.section_combo.currentData()
+                "last_section": self.section_combo.currentData(),
+                "path_mappings": self.path_mappings
             })
             
             # Save merged config
