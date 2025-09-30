@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.10.1 - 2025-09-29
+### Bug Fixes
+- Fixed critical bug where `best_score` variable was accessed before assignment in playlist conversion
+- Fixed same `best_score` initialization issue in sync manager's track matching function
+- Both fixes prevent "cannot access local variable 'best_score' where it is not associated with a value" errors during Deezer playlist conversion and sync operations
+
 ## v2.10 - 2025-09-29
 ### Major Features Added
 - Complete overhaul of duplicate finder: Now scans entire music library instead of just playlists

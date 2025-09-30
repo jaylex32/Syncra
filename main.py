@@ -12,6 +12,8 @@ import platform
 import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+__version__ = "2.10.1"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -2131,6 +2133,8 @@ class PlaylistSortingThread(QThread):
                 if best_match and best_match not in ordered_tracks:
                     ordered_tracks.append(best_match)
                     logging.info(f"✅ Matched '{streaming_track}' to '{best_match.title}' (score: {best_score:.1f})")
+                elif best_match:
+                    logging.warning(f"❌ Track already in playlist: '{streaming_track}' (score: {best_score:.1f})")
                 else:
                     logging.warning(f"❌ No match for '{streaming_track}' (best score: {best_score:.1f})")
             
@@ -4089,11 +4093,14 @@ class PlaylistConverterThread(QThread):
             scored_tracks.append((plex_track, combined_score))
 
         # Find the best match
+        best_match = None
+        best_score = 0
+
         if scored_tracks:
             scored_tracks.sort(key=lambda x: x[1], reverse=True)
             best_match = scored_tracks[0][0]
             best_score = scored_tracks[0][1]
-        
+
         # NEW: Handle different score ranges
         if best_score >= 80:
             # High confidence - auto accept
