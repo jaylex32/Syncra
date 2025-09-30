@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.10.2 - 2025-09-30
+### Bug Fixes
+- Fixed critical bug where `album_title` variable was not initialized before use in sync manager
+- Added proper error handling for album filtering when track metadata is unavailable
+- Wrapped filter logic in try-except blocks to prevent crashes during sync operations
+
 ## v2.10.1 - 2025-09-29
 ### Bug Fixes
 - Fixed critical bug where `best_score` variable was accessed before assignment in playlist conversion

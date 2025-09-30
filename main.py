@@ -13,7 +13,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.10.1"
+__version__ = "2.10.2"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -1912,31 +1912,37 @@ class SyncThread(QThread):
 
                 combined_score = (title_score * 0.7) + (artist_score * 0.3)
 
+                # Initialize album_title
+                album_title = ''
+
                 # Apply smart filtering if enabled
                 if hasattr(self, 'enable_filters_checkbox') and self.enable_filters_checkbox.isChecked():
-                    album_title = plex_track.album().title.lower() if plex_track.album() else ''
+                    try:
+                        album_title = plex_track.album().title.lower() if plex_track.album() else ''
 
-                    # Apply penalties for unwanted album types
-                    penalty = 0
+                        # Apply penalties for unwanted album types
+                        penalty = 0
 
-                    if hasattr(self, 'filter_live_checkbox') and self.filter_live_checkbox.isChecked():
-                        if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
-                            penalty += 15
+                        if hasattr(self, 'filter_live_checkbox') and self.filter_live_checkbox.isChecked():
+                            if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
+                                penalty += 15
 
-                    if hasattr(self, 'filter_compilation_checkbox') and self.filter_compilation_checkbox.isChecked():
-                        if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
-                            penalty += 12
+                        if hasattr(self, 'filter_compilation_checkbox') and self.filter_compilation_checkbox.isChecked():
+                            if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
+                                penalty += 12
 
-                    if hasattr(self, 'filter_remaster_checkbox') and self.filter_remaster_checkbox.isChecked():
-                        if any(keyword in album_title for keyword in ['remaster', 'remastered']):
-                            penalty += 8
+                        if hasattr(self, 'filter_remaster_checkbox') and self.filter_remaster_checkbox.isChecked():
+                            if any(keyword in album_title for keyword in ['remaster', 'remastered']):
+                                penalty += 8
 
-                    if hasattr(self, 'filter_deluxe_checkbox') and self.filter_deluxe_checkbox.isChecked():
-                        if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
-                            penalty += 6
+                        if hasattr(self, 'filter_deluxe_checkbox') and self.filter_deluxe_checkbox.isChecked():
+                            if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
+                                penalty += 6
 
-                    # Apply penalty to score
-                    combined_score = max(0, combined_score - penalty)
+                        # Apply penalty to score
+                        combined_score = max(0, combined_score - penalty)
+                    except Exception as filter_error:
+                        logging.warning(f"Could not apply filters to track: {str(filter_error)}")
 
                 scored_tracks.append((plex_track, combined_score, album_title))
 
@@ -4066,29 +4072,32 @@ class PlaylistConverterThread(QThread):
 
             # Apply smart filtering if enabled (same as other find_best_match)
             if hasattr(self.parent, 'enable_filters_checkbox') and self.parent.enable_filters_checkbox.isChecked():
-                album_title = plex_track.album().title.lower() if plex_track.album() else ''
+                try:
+                    album_title = plex_track.album().title.lower() if plex_track.album() else ''
 
-                # Apply penalties for unwanted album types
-                penalty = 0
+                    # Apply penalties for unwanted album types
+                    penalty = 0
 
-                if hasattr(self.parent, 'filter_live_checkbox') and self.parent.filter_live_checkbox.isChecked():
-                    if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
-                        penalty += 15
+                    if hasattr(self.parent, 'filter_live_checkbox') and self.parent.filter_live_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
+                            penalty += 15
 
-                if hasattr(self.parent, 'filter_compilation_checkbox') and self.parent.filter_compilation_checkbox.isChecked():
-                    if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
-                        penalty += 12
+                    if hasattr(self.parent, 'filter_compilation_checkbox') and self.parent.filter_compilation_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
+                            penalty += 12
 
-                if hasattr(self.parent, 'filter_remaster_checkbox') and self.parent.filter_remaster_checkbox.isChecked():
-                    if any(keyword in album_title for keyword in ['remaster', 'remastered']):
-                        penalty += 8
+                    if hasattr(self.parent, 'filter_remaster_checkbox') and self.parent.filter_remaster_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['remaster', 'remastered']):
+                            penalty += 8
 
-                if hasattr(self.parent, 'filter_deluxe_checkbox') and self.parent.filter_deluxe_checkbox.isChecked():
-                    if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
-                        penalty += 6
+                    if hasattr(self.parent, 'filter_deluxe_checkbox') and self.parent.filter_deluxe_checkbox.isChecked():
+                        if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
+                            penalty += 6
 
-                # Apply penalty to score
-                combined_score = max(0, combined_score - penalty)
+                    # Apply penalty to score
+                    combined_score = max(0, combined_score - penalty)
+                except Exception as filter_error:
+                    logging.warning(f"Could not apply filters to track: {str(filter_error)}")
 
             scored_tracks.append((plex_track, combined_score))
 
