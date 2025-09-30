@@ -13,7 +13,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.11.0"
+__version__ = "2.11.1"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -7457,17 +7457,23 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             normalized_source = source.replace('\\', '/').lower()
 
             if normalized_file.startswith(normalized_source):
-                # Replace the prefix
-                remainder = file_path[len(source):]
-                # Clean up any double separators
-                while remainder.startswith('/') or remainder.startswith('\\'):
+                # Get the remainder after the source prefix (using normalized paths)
+                remainder = normalized_file[len(normalized_source):]
+                # Clean up any leading separators
+                while remainder.startswith('/'):
                     remainder = remainder[1:]
 
-                # Combine with target, using target's separator style
-                if '\\' in target:
-                    new_path = target.rstrip('\\/') + '\\' + remainder
+                # Determine target separator style
+                target_sep = '\\' if '\\' in target else '/'
+
+                # Normalize target path
+                clean_target = target.rstrip('\\/')
+
+                # Combine with consistent separators
+                if remainder:
+                    new_path = clean_target + target_sep + remainder.replace('/', target_sep)
                 else:
-                    new_path = target.rstrip('\\/') + '/' + remainder
+                    new_path = clean_target
 
                 logging.info(f"Applied mapping: {original_path} -> {new_path}")
                 return new_path

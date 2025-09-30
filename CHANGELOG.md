@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.11.1 - 2025-09-30
+### Bug Fixes
+- Fixed critical path separator mixing issue in path mapping system
+- Corrected `apply_path_mappings()` to maintain consistent separators throughout transformed paths
+- Issue was causing mixed separators like `F:\Music\Artist/Album/Track.flac` instead of `F:\Music\Artist\Album\Track.flac`
+- Now properly uses target path's separator style for entire transformed path
+
 ## v2.11.0 - 2025-09-30
 ### Major Features Added
 - **Comprehensive Path Mapping System for M3U Playlist Uploads**
