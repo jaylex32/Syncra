@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.11.2 - 2025-09-30
+### Critical Bug Fixes
+- **Fixed case sensitivity bug in path mapping system** - Path mappings were converting all paths to lowercase, causing Plex to reject uploads with 400/500 errors
+- **Fixed missing #EXTM3U header in normalized M3U files** - M3U files now properly include required header for Plex compatibility
+- **Fixed path mappings not displaying in Settings UI after restart** - Added missing UI refresh call when loading saved path mappings from config
+- Added automatic diagnostic log creation when playlist uploads fail, providing detailed error analysis and troubleshooting information
+
+### Technical Details
+- Modified `apply_path_mappings()` to preserve original case while doing case-insensitive prefix matching
+- Ensured all file path operations maintain exact case from source files
+- Added #EXTM3U header validation and automatic injection during M3U normalization
+- Path mappings now correctly display in Settings UI immediately after program restart
+
 ## v2.11.1 - 2025-09-30
 ### Bug Fixes
 - Fixed critical path separator mixing issue in path mapping system

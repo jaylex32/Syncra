@@ -7452,13 +7452,15 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             if not source or not target:
                 continue
 
-            # Normalize separators for comparison
-            normalized_file = file_path.replace('\\', '/').lower()
-            normalized_source = source.replace('\\', '/').lower()
+            # Normalize separators for comparison (case-insensitive)
+            normalized_file_compare = file_path.replace('\\', '/').lower()
+            normalized_source_compare = source.replace('\\', '/').lower()
 
-            if normalized_file.startswith(normalized_source):
-                # Get the remainder after the source prefix (using normalized paths)
-                remainder = normalized_file[len(normalized_source):]
+            if normalized_file_compare.startswith(normalized_source_compare):
+                # Get the remainder from the ORIGINAL file_path to preserve case
+                normalized_file_original = file_path.replace('\\', '/')
+                remainder = normalized_file_original[len(source.replace('\\', '/')):]
+
                 # Clean up any leading separators
                 while remainder.startswith('/'):
                     remainder = remainder[1:]
@@ -7854,6 +7856,17 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         playlist_dir = os.path.dirname(os.path.abspath(path))
         normalized_lines = []
 
+        # Ensure M3U header is present
+        has_header = False
+        for line in lines:
+            if line.strip() == '#EXTM3U':
+                has_header = True
+                break
+
+        if not has_header:
+            normalized_lines.append('#EXTM3U\n')
+            logging.info("Added missing #EXTM3U header")
+
         for line in lines:
             if not line.strip() or line.lstrip().startswith('#'):
                 normalized_lines.append(line)
@@ -8195,10 +8208,24 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     # For remote servers, don't attempt server-side fallback
                     logging.info(f"Skipping server-side fallback for remote server {plex_server}")
 
-                # If still not successful, raise the error
+                # If still not successful, create diagnostic log and raise error
                 if not upload_success:
                     combined_error = '; '.join(upload_errors)
                     logging.error(f"Playlist upload failed for '{playlist_name}': {combined_error}")
+
+                    # Create diagnostic log if temp file exists
+                    if normalized_temp_path and os.path.exists(normalized_temp_path):
+                        try:
+                            diagnostic_log_path = self.create_upload_diagnostic_log(normalized_temp_path, [])
+                            if diagnostic_log_path:
+                                logging.info(f"Created diagnostic log: {diagnostic_log_path}")
+                                QMessageBox.warning(self, "Upload Failed - Diagnostic Created",
+                                    f"Playlist upload failed: {combined_error}\n\n"
+                                    f"Diagnostic log created at:\n{diagnostic_log_path}\n\n"
+                                    f"Temp playlist kept at:\n{normalized_temp_path}")
+                        except Exception as diag_error:
+                            logging.warning(f"Could not create diagnostic log: {diag_error}")
+
                     raise requests.RequestException(combined_error)
 
             if upload_success:
@@ -8709,6 +8736,8 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         self.path_mappings = config.get('path_mappings', [])
         if self.path_mappings:
             logging.info(f'Loaded {len(self.path_mappings)} path mapping(s)')
+            # Refresh the UI to display loaded mappings
+            self.refresh_path_mappings_list()
 
         # Refresh Spotify login state using the saved config
         self.load_spotify_config()
