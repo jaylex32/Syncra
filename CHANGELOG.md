@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.12.0 - 2025-10-21
+### Spotify Authentication Updates
+- Implemented resilient TOTP-based token refresh with rotating browser user agents.
+- Added support for fetching Spotify secret dictionaries from configurable URLs or local files.
+- Improved retry logic, backoff timing, and validation to reduce anonymous token failures.
+
+### Developer Experience
+- Bumped application version metadata to 2.12.0 for the release packaging.
+
 ## v2.11.2 - 2025-09-30
 ### Critical Bug Fixes
 - **Fixed case sensitivity bug in path mapping system** - Path mappings were converting all paths to lowercase, causing Plex to reject uploads with 400/500 errors

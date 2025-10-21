@@ -13,7 +13,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.11.1"
+__version__ = "2.12.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -46,6 +46,7 @@ from time import time_ns
 import threading
 from email.utils import parsedate_to_datetime
 import secrets
+from pathlib import Path
 
 CONFIG_FILE = "app_config.json"
 SYNC_CONFIG_FILE = "sync_config.json"
@@ -3222,20 +3223,19 @@ class SpotifyAnonymousAuth:
         self.access_token = None
         self.token_expiration = 0
         self.client_id = None
-        self.user_agent = self.get_random_user_agent()
+        self.user_agent = None
         self.session = self._setup_session()
         
         # TOTP Configuration from friend's working code
         self.secret_cipher_dict = {
-            "12": [107, 81, 49, 57, 67, 93, 87, 81, 69, 67, 40, 93, 48, 50, 46, 91, 94, 113, 41, 108, 77, 107, 34],
-            "11": [111, 45, 40, 73, 95, 74, 35, 85, 105, 107, 60, 110, 55, 72, 69, 70, 114, 83, 63, 88, 91],
-            "10": [61, 110, 58, 98, 35, 79, 117, 69, 102, 72, 92, 102, 69, 93, 41, 101, 42, 75],
-            "9": [109, 101, 90, 99, 66, 92, 116, 108, 85, 70, 86, 49, 68, 54, 87, 50, 72, 121, 52, 64, 57, 43, 36, 81, 97, 72, 53, 41, 78, 56],
-            "8": [37, 84, 32, 76, 87, 90, 87, 47, 13, 75, 48, 54, 44, 28, 19, 21, 22],
-            "7": [59, 91, 66, 74, 30, 66, 74, 38, 46, 50, 72, 61, 44, 71, 86, 39, 89],
-            "6": [21, 24, 85, 46, 48, 35, 33, 8, 11, 63, 76, 12, 55, 77, 14, 7, 54],
-            "5": [12, 56, 76, 33, 88, 44, 88, 33, 78, 78, 11, 66, 22, 22, 55, 69, 54],
+            "61": [123, 105, 79, 70, 110, 59, 52, 125, 60, 49, 80, 70, 89, 75, 80, 86, 63, 53, 123, 37, 117, 49, 52, 93, 77, 62, 47, 86, 48, 104, 68, 72],
+            "60": [79, 109, 69, 123, 90, 65, 46, 74, 94, 34, 58, 48, 70, 71, 92, 85, 122, 63, 91, 64, 87, 87],
+            "59": [44, 55, 47, 42, 70, 40, 34, 114, 76, 74, 50, 111, 120, 97, 75, 76, 94, 102, 43, 69, 49, 120, 118, 80, 64, 78],
         }
+        self.secret_dict_source = (os.getenv("SPOTIFY_SECRET_DICT_URL") or "https://github.com/xyloflake/spot-secrets-go/blob/main/secrets/secretDict.json?raw=true").strip()
+        self.token_max_retries = 3
+        self.token_retry_delay = 0.5
+        self.secret_fetch_timeout = 15
         self.totp_ver = 0  # Auto-select highest
         self.token_url = "https://open.spotify.com/api/token"
         self.server_time_url = "https://open.spotify.com/"
@@ -3334,17 +3334,17 @@ class SpotifyAnonymousAuth:
         
         return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    def fetch_server_time(self) -> int:
+    def fetch_server_time(self, user_agent: str) -> int:
         """Fetch server time from Spotify using Date header"""
         headers = {
-            "User-Agent": self.user_agent,
+            "User-Agent": user_agent,
             "Accept": "*/*",
         }
 
         try:
             if platform.system() != 'Windows':
                 signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(17)  # 15 + 2 second timeout
+                signal.alarm(17)
             response = self.session.head(self.server_time_url, headers=headers, timeout=15, verify=True)
             response.raise_for_status()
         except TimeoutException as e:
@@ -3361,39 +3361,67 @@ class SpotifyAnonymousAuth:
 
         return int(parsedate_to_datetime(date_hdr).timestamp())
 
-    def generate_totp(self):
-        """Generate TOTP using the secret derivation method from friend's working code"""
-        if str((ver := self.totp_ver or max(map(int, self.secret_cipher_dict)))) not in self.secret_cipher_dict:
+    def generate_totp(self, secret_dict: Optional[Dict[str, List[int]]] = None, server_time: Optional[int] = None) -> str:
+        """Generate a TOTP value for the provided server time"""
+        if secret_dict is None:
+            secret_dict = self.secret_cipher_dict
+        if server_time is None:
+            raise ValueError("server_time is required to generate TOTP")
+
+        ver = self.totp_ver or max(map(int, secret_dict))
+        key = str(ver)
+        if key not in secret_dict:
             raise Exception(f"generate_totp(): Defined TOTP_VER ({ver}) is missing in SECRET_CIPHER_DICT")
 
-        secret_cipher_bytes = self.secret_cipher_dict[str(ver)]
+        secret_cipher_bytes = secret_dict[key]
         transformed = [e ^ ((t % 33) + 9) for t, e in enumerate(secret_cipher_bytes)]
-        joined = "".join(str(num) for num in transformed)
+        joined = ''.join(str(num) for num in transformed)
         hex_str = joined.encode().hex()
         secret = base64.b32encode(bytes.fromhex(hex_str)).decode().rstrip("=")
 
-        return pyotp.TOTP(secret, digits=6, interval=30)
+        totp = pyotp.TOTP(secret, digits=6, interval=30)
+        return totp.at(server_time)
 
     def fetch_and_update_secrets(self):
-        """Fetch updated secrets from remote URL"""
-        secret_url = "https://github.com/Thereallo1026/spotify-secrets/blob/main/secrets/secretDict.json?raw=true"
-        
+        """Fetch updated secrets from remote or local source"""
+        source = (self.secret_dict_source or '').strip()
+        if not source:
+            return False
+
         try:
-            response = requests.get(secret_url, timeout=15, verify=True)
-            response.raise_for_status()
-            secrets_data = response.json()
+            payload = None
+            if source.lower().startswith(('http://', 'https://')):
+                headers = {
+                    "User-Agent": self.get_random_user_agent(),
+                    "Accept": "application/json",
+                }
+                response = self.session.get(source, headers=headers, timeout=self.secret_fetch_timeout, verify=True)
+                response.raise_for_status()
+                payload = response.json()
+            else:
+                resolved_source = source
+                if source.startswith('file:'):
+                    parsed = urllib.parse.urlparse(source)
+                    raw_path = parsed.path
+                    if parsed.netloc:
+                        raw_path = f"/{parsed.netloc}{parsed.path}"
+                    resolved_source = urllib.parse.unquote(raw_path or parsed.path)
+                    if os.name == 'nt' and resolved_source.startswith('/') and len(resolved_source) > 3 and resolved_source[2] == ':':
+                        resolved_source = resolved_source.lstrip('/')
+                path = Path(resolved_source).expanduser()
+                payload = json.loads(path.read_text(encoding='utf-8'))
 
-            if not isinstance(secrets_data, dict) or not secrets_data:
-                raise ValueError("Fetched payload not a non‑empty dict")
+            if not isinstance(payload, dict) or not payload:
+                raise ValueError('Fetched payload not a non-empty dict')
 
-            for key, value in secrets_data.items():
+            for key, value in payload.items():
                 if not isinstance(key, str) or not key.isdigit():
                     raise ValueError(f"Invalid key format: {key}")
                 if not isinstance(value, list) or not all(isinstance(x, int) for x in value):
                     raise ValueError(f"Invalid value format for key {key}")
 
-            self.secret_cipher_dict = secrets_data
-            logging.info("✅ Updated secrets from remote source")
+            self.secret_cipher_dict = {str(k): list(v) for k, v in payload.items()}
+            logging.info('✅ Updated Spotify TOTP secrets from source')
             return True
 
         except Exception as e:
@@ -3402,8 +3430,9 @@ class SpotifyAnonymousAuth:
 
     def try_get_temporary_cookie(self):
         """Try to get a temporary cookie by simulating a browser visit"""
+        user_agent = self.get_random_user_agent()
         headers = {
-            "User-Agent": self.user_agent,
+            "User-Agent": user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
             "Accept-Encoding": "gzip, deflate, br",
@@ -3414,63 +3443,64 @@ class SpotifyAnonymousAuth:
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
         }
-        
+
+        self.user_agent = user_agent
+
         try:
-            # Visit Spotify homepage to potentially get a session cookie
             response = self.session.get("https://open.spotify.com/", headers=headers, timeout=10)
-            
-            # Extract any cookies that might be useful
             cookies = self.session.cookies
             for cookie in cookies:
                 if cookie.name == 'sp_dc' and cookie.value:
                     logging.info("✅ Found temporary sp_dc cookie")
                     return cookie.value
-                    
-            # Try to visit the Web Player to get a session
+
             response = self.session.get("https://open.spotify.com/search", headers=headers, timeout=10)
-            
             cookies = self.session.cookies
             for cookie in cookies:
                 if cookie.name == 'sp_dc' and cookie.value:
                     logging.info("✅ Found temporary sp_dc cookie from web player")
                     return cookie.value
-                    
+
         except Exception as e:
             logging.debug(f"Could not get temporary cookie: {e}")
-        
+
         return None
 
-    def refresh_access_token_with_totp(self, sp_dc: str = None) -> dict:
+    def refresh_access_token_with_totp(self, sp_dc: str = None, secret_dict: Optional[Dict[str, List[int]]] = None, user_agent: Optional[str] = None) -> dict:
         """Refresh access token using TOTP method from friend's working code"""
+        secret_dict = secret_dict or self.secret_cipher_dict
+        user_agent = user_agent or self.get_random_user_agent()
+        self.user_agent = user_agent
+
         transport = True
         init = True
         session = self.session
         data: dict = {}
-        token = ""
+        token = ''
 
-        server_time = self.fetch_server_time()
-        totp_obj = self.generate_totp()
+        server_time = self.fetch_server_time(user_agent)
         client_time = int(time_ns() / 1000 / 1000)
-        otp_value = totp_obj.at(server_time)
+        otp_value = self.generate_totp(secret_dict, server_time)
+        totp_ver = self.totp_ver or max(map(int, secret_dict))
 
         params = {
             "reason": "transport",
             "productType": "web-player",
             "totp": otp_value,
             "totpServer": otp_value,
-            "totpVer": self.totp_ver,
+            "totpVer": totp_ver,
         }
 
-        if self.totp_ver < 10:
+        if totp_ver < 10:
             params.update({
                 "sTime": server_time,
                 "cTime": client_time,
-                "buildDate": time.strftime("%Y-%m-%d", time.gmtime(server_time)),
+                "buildDate": time.strftime('%Y-%m-%d', time.gmtime(server_time)),
                 "buildVer": f"web-player_{time.strftime('%Y-%m-%d', time.gmtime(server_time))}_{server_time * 1000}_{secrets.token_hex(4)}",
             })
 
         headers = {
-            "User-Agent": self.user_agent,
+            "User-Agent": user_agent,
             "Accept": "application/json",
             "Referer": "https://open.spotify.com/",
             "App-Platform": "WebPlayer",
@@ -3479,14 +3509,12 @@ class SpotifyAnonymousAuth:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
-        
-        # Add cookie if available
+
         if sp_dc:
-            headers["Cookie"] = f"sp_dc={sp_dc}"
+            headers['Cookie'] = f'sp_dc={sp_dc}'
 
-        last_err = ""
+        last_err = ''
 
-        # Try transport mode first
         try:
             if platform.system() != "Windows":
                 signal.signal(signal.SIGALRM, timeout_handler)
@@ -3495,7 +3523,7 @@ class SpotifyAnonymousAuth:
             response = session.get(self.token_url, params=params, headers=headers, timeout=15, verify=True)
             response.raise_for_status()
             data = response.json()
-            token = data.get("accessToken", "")
+            token = data.get('accessToken', '')
 
         except (requests.RequestException, TimeoutException, requests.HTTPError, ValueError) as e:
             transport = False
@@ -3504,9 +3532,8 @@ class SpotifyAnonymousAuth:
             if platform.system() != "Windows":
                 signal.alarm(0)
 
-        # If transport failed or token is invalid, try init mode
-        if not transport or (transport and not self.validate_token(token, data.get("clientId", ""))):
-            params["reason"] = "init"
+        if not transport or (transport and not self.validate_token(token, data.get('clientId', ''), user_agent)):
+            params['reason'] = 'init'
 
             try:
                 if platform.system() != "Windows":
@@ -3516,7 +3543,7 @@ class SpotifyAnonymousAuth:
                 response = session.get(self.token_url, params=params, headers=headers, timeout=15, verify=True)
                 response.raise_for_status()
                 data = response.json()
-                token = data.get("accessToken", "")
+                token = data.get('accessToken', '')
 
             except (requests.RequestException, TimeoutException, requests.HTTPError, ValueError) as e:
                 init = False
@@ -3525,26 +3552,28 @@ class SpotifyAnonymousAuth:
                 if platform.system() != "Windows":
                     signal.alarm(0)
 
-        if not init or not data or "accessToken" not in data:
+        if not init or not data or 'accessToken' not in data:
             raise Exception(f"refresh_access_token_with_totp(): Unsuccessful token request{': ' + last_err if last_err else ''}")
 
         return {
-            "access_token": token,
-            "expires_at": data["accessTokenExpirationTimestampMs"] // 1000,
-            "client_id": data.get("clientId", ""),
-            "length": len(token)
+            'access_token': token,
+            'expires_at': data['accessTokenExpirationTimestampMs'] // 1000,
+            'client_id': data.get('clientId', ''),
+            'length': len(token),
+            'user_agent': user_agent,
         }
 
-    def validate_token(self, access_token: str, client_id: str = None) -> bool:
+    def validate_token(self, access_token: str, client_id: str = None, user_agent: Optional[str] = None) -> bool:
         """Test if token is valid by making a lightweight API call"""
         url = "https://api.spotify.com/v1/me"
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        if self.user_agent:
-            headers.update({"User-Agent": self.user_agent})
+        agent = user_agent or self.user_agent
+        if agent:
+            headers["User-Agent"] = agent
 
         if client_id:
-            headers.update({"Client-Id": client_id})
+            headers["Client-Id"] = client_id
 
         if platform.system() != 'Windows':
             signal.signal(signal.SIGALRM, timeout_handler)
@@ -3562,76 +3591,75 @@ class SpotifyAnonymousAuth:
     def get_token_with_working_method(self):
         """Get Spotify access token using the working TOTP method"""
         now = time.time()
-    
-        # Return cached token if still valid
-        if self.cached_access_token and now < self.access_token_expires_at and self.validate_token(self.cached_access_token, self.cached_client_id):
-            logging.debug("✅ Using cached valid token")
+
+        if self.cached_access_token and now < self.access_token_expires_at and self.validate_token(self.cached_access_token, self.cached_client_id, self.user_agent):
+            logging.debug('✅ Using cached valid token')
             return self.cached_access_token
-    
-        max_retries = 3
+
+        max_retries = self.token_max_retries
         retry = 0
-        last_error = ""
-    
-        # OPTION 1: Use the cookie defined at the top of the file
-        sp_dc_to_use = SP_DC_COOKIE if SP_DC_COOKIE and SP_DC_COOKIE != "your_sp_dc_cookie_value_here" else None
-        
-        # Also check environment variable as backup
+        last_error = ''
+
+        sp_dc_to_use = SP_DC_COOKIE if SP_DC_COOKIE and SP_DC_COOKIE != 'your_sp_dc_cookie_value_here' else None
+
         env_cookie = os.getenv('SP_DC_COOKIE', '')
-        if env_cookie and env_cookie != "your_sp_dc_cookie_value_here":
+        if env_cookie and env_cookie != 'your_sp_dc_cookie_value_here':
             sp_dc_to_use = env_cookie
-        
-        # Try to get temporary cookie if none provided
+
         if not sp_dc_to_use:
             sp_dc_to_use = self.try_get_temporary_cookie()
-    
+
         while retry < max_retries:
             try:
                 token_data = self.refresh_access_token_with_totp(sp_dc_to_use)
-                token = token_data["access_token"]
-                client_id = token_data.get("client_id", "")
-    
+                token = token_data['access_token']
+                client_id = token_data.get('client_id', '')
+                token_user_agent = token_data.get('user_agent', self.user_agent)
+
                 self.cached_access_token = token
-                self.access_token_expires_at = token_data["expires_at"]
+                self.access_token_expires_at = token_data['expires_at']
                 self.cached_client_id = client_id
-    
-                if self.cached_access_token is None or not self.validate_token(self.cached_access_token, self.cached_client_id):
+                self.user_agent = token_user_agent
+
+                if not self.cached_access_token or not self.validate_token(self.cached_access_token, self.cached_client_id, token_user_agent):
                     retry += 1
-                    time.sleep(0.5)
+                    time.sleep(self.token_retry_delay * retry)
                 else:
-                    logging.info(f"✅ Successfully obtained Spotify token (attempt {retry + 1})")
+                    logging.info(f'✅ Successfully obtained Spotify token (attempt {retry + 1})')
                     break
             except Exception as e:
                 last_error = str(e)
                 retry += 1
                 if retry < max_retries:
-                    logging.warning(f"Token attempt {retry} failed: {str(e)}, retrying...")
-                    time.sleep(0.5)
-    
+                    logging.warning(f'Token attempt {retry} failed: {e}, retrying...')
+                    time.sleep(self.token_retry_delay * retry)
+
         if retry == max_retries:
-            # Try to fetch updated secrets and retry once more
             if self.fetch_and_update_secrets():
                 try:
-                    token_data = self.refresh_access_token_with_totp(sp_dc_to_use)
-                    token = token_data["access_token"]
-                    client_id = token_data.get("client_id", "")
-    
+                    token_data = self.refresh_access_token_with_totp(sp_dc_to_use, self.secret_cipher_dict)
+                    token = token_data['access_token']
+                    client_id = token_data.get('client_id', '')
+                    token_user_agent = token_data.get('user_agent', self.user_agent)
+
                     self.cached_access_token = token
-                    self.access_token_expires_at = token_data["expires_at"]
+                    self.access_token_expires_at = token_data['expires_at']
                     self.cached_client_id = client_id
-    
-                    if self.cached_access_token and self.validate_token(self.cached_access_token, self.cached_client_id):
-                        logging.info("✅ Successfully obtained Spotify token with updated secrets")
+                    self.user_agent = token_user_agent
+
+                    if self.cached_access_token and self.validate_token(self.cached_access_token, self.cached_client_id, token_user_agent):
+                        logging.info('✅ Successfully obtained Spotify token with updated secrets')
                         return self.cached_access_token
                 except Exception as e:
                     last_error = str(e)
-    
+
             error_msg = (
                 f"Failed to obtain valid Spotify access token after {max_retries} attempts. "
                 f"Last error: {last_error}\n\n"
                 f"🔑 Please set your sp_dc cookie value in the SP_DC_COOKIE variable at the top of main.py"
             )
             raise RuntimeError(error_msg)
-    
+
         return self.cached_access_token
 
     def get_token(self):
