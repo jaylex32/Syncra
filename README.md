@@ -79,6 +79,10 @@ Built with:
 - **Spotipy** for Spotify integration
 - **Advanced fuzzy matching** for cross-platform track identification
 
+## Telegram Group
+
+- ** Join me at the Telegram group for Requests and ideas: https://t.me/+I1Yyz6WdBxsyMzQx
+
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
