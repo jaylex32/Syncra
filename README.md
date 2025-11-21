@@ -81,7 +81,7 @@ Built with:
 
 ## Telegram Group
 
-- ** Join me at the Telegram group for Requests and ideas: https://t.me/+I1Yyz6WdBxsyMzQx
+- Join me at the Telegram group for Requests and ideas: https://t.me/+I1Yyz6WdBxsyMzQx
 
 ## 📄 License
 
