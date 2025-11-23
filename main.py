@@ -23,7 +23,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QMessageBox, QComboBox, QStackedWidget, QGroupBox, QDialog,
                              QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
                              QSplitter, QTabWidget, QSpinBox, QDateTimeEdit, QSlider,
-                             QFormLayout, QGridLayout, QScrollArea, QFrame, QInputDialog, QMenu, QProgressDialog)
+                             QFormLayout, QGridLayout, QScrollArea, QFrame, QInputDialog, QMenu, QProgressDialog,
+                             QButtonGroup, QRadioButton)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QSettings
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QDrag
 #from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -1638,6 +1639,147 @@ class PlaylistMergerDialog(QDialog):
             logging.error(f"Error merging playlists: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to merge playlists: {str(e)}")
 
+class SmartM3UUploadThread(QThread):
+    """Thread for smart M3U upload to prevent UI freezing"""
+    progress_update = pyqtSignal(str, int)  # message, percentage
+    track_found = pyqtSignal(object)  # matched track
+    track_prompt_needed = pyqtSignal(str, str, list, int, int, object)  # title, artist, candidates, index, total, result_holder
+    upload_complete = pyqtSignal(int, int, list)  # matched_count, total_count, not_found_list
+    upload_error = pyqtSignal(str)
+
+    def __init__(self, m3u_path, track_infos, library_section, parent=None):
+        super().__init__(parent)
+        self.m3u_path = m3u_path
+        self.track_infos = track_infos
+        self.library_section = library_section
+        self.matched_tracks = []
+        self.not_found = []
+        self.parent_widget = parent
+
+    def run(self):
+        """Run the smart matching process in background thread"""
+        try:
+            total_tracks = len(self.track_infos)
+
+            for i, track_info in enumerate(self.track_infos):
+                try:
+                    title = track_info['title']
+                    artist = track_info['artist']
+
+                    self.progress_update.emit(f"Finding tracks... ({i+1}/{total_tracks})",
+                                            int((i + 1) / total_tracks * 100))
+
+                    # Perform search strategies (same logic as before)
+                    search_results = self.library_section.searchTracks(title=title, limit=50)
+
+                    # Strategy 2: Remove underscores and special characters
+                    if not search_results and title:
+                        cleaned_title = title.replace('_', ' ').replace('?', '').strip()
+                        if cleaned_title != title:
+                            search_results = self.library_section.searchTracks(title=cleaned_title, limit=50)
+
+                    # Strategy 3: Search by artist
+                    if not search_results and artist:
+                        try:
+                            artist_results = self.library_section.searchTracks(artist=artist, limit=100)
+                            search_results = []
+                            for track in artist_results:
+                                if any(word.lower() in track.title.lower() for word in title.split() if len(word) > 3):
+                                    search_results.append(track)
+                        except:
+                            pass
+
+                    # Strategy 4: Broad search
+                    if not search_results and title:
+                        first_word = title.split()[0] if ' ' in title else title
+                        if len(first_word) > 3:
+                            broad_results = self.library_section.searchTracks(title=first_word, limit=50)
+                            if artist:
+                                search_results = [t for t in broad_results if artist.lower() in (
+                                    t.originalTitle or t.grandparentTitle if hasattr(t, 'grandparentTitle') else ''
+                                ).lower()]
+                            else:
+                                search_results = broad_results
+
+                    if search_results:
+                        # Score matches
+                        scored_matches = []
+                        for track in search_results:
+                            try:
+                                track_artist = track.originalTitle or (track.grandparentTitle if hasattr(track, 'grandparentTitle') else '')
+                                if not track_artist and hasattr(track, 'artist'):
+                                    track_artist_obj = track.artist()
+                                    if track_artist_obj:
+                                        track_artist = track_artist_obj.title
+
+                                score = 0
+                                # Title scoring
+                                title_lower = title.lower()
+                                track_title_lower = track.title.lower()
+                                if track_title_lower == title_lower:
+                                    score += 40
+                                elif title_lower in track_title_lower or track_title_lower in title_lower:
+                                    score += 30
+                                elif any(word in track_title_lower for word in title_lower.split() if len(word) > 3):
+                                    score += 20
+
+                                # Artist scoring
+                                if artist and track_artist:
+                                    artist_lower = artist.lower()
+                                    track_artist_lower = track_artist.lower()
+                                    if track_artist_lower == artist_lower:
+                                        score += 60
+                                    elif artist_lower in track_artist_lower or track_artist_lower in artist_lower:
+                                        score += 50
+                                    elif any(word in track_artist_lower for word in artist_lower.split() if len(word) > 3):
+                                        score += 30
+
+                                scored_matches.append((track, score, track_artist))
+                            except:
+                                continue
+
+                        scored_matches.sort(key=lambda x: x[1], reverse=True)
+
+                        if scored_matches:
+                            best_match, best_score, best_artist = scored_matches[0]
+
+                            # High confidence - auto add
+                            if best_score >= 80:
+                                self.matched_tracks.append(best_match)
+                            else:
+                                # Medium/Low confidence - need user input
+                                # We need to prompt on the main thread
+                                result_holder = {'track': None}
+                                self.track_prompt_needed.emit(
+                                    title, artist, scored_matches[:5], i + 1, total_tracks, result_holder
+                                )
+                                # Wait for result (will be set by main thread)
+                                import time
+                                timeout = 0
+                                while result_holder.get('track') is None and result_holder.get('skipped') is None and timeout < 300:
+                                    time.sleep(0.1)
+                                    timeout += 1
+
+                                if result_holder.get('track'):
+                                    self.matched_tracks.append(result_holder['track'])
+                                else:
+                                    self.not_found.append(f"{title} - {artist}" if artist else title)
+                        else:
+                            self.not_found.append(f"{title} - {artist}" if artist else title)
+                    else:
+                        self.not_found.append(f"{title} - {artist}" if artist else title)
+
+                except Exception as track_error:
+                    logging.error(f"Error processing track {track_info}: {track_error}")
+                    self.not_found.append(f"{track_info.get('title', 'Unknown')} - {track_info.get('artist', '')}")
+
+            # Upload complete
+            self.upload_complete.emit(len(self.matched_tracks), total_tracks, self.not_found)
+
+        except Exception as e:
+            logging.error(f"Smart M3U upload thread error: {str(e)}")
+            self.upload_error.emit(str(e))
+
 class SyncThread(QThread):
     progress_update = pyqtSignal(str, int)  # message, percentage
     sync_complete = pyqtSignal(str, int, int)  # playlist_name, added_tracks, total_tracks
@@ -1690,10 +1832,13 @@ class SyncThread(QThread):
             # Capture current playlist state for duplicate detection/clearing
             current_items = list(plex_playlist.items())
             plex_tracks = set()
+            plex_track_keys = set()  # Store track rating keys for exact duplicate detection
             if not clear_before_sync:
                 for track in current_items:
                     signature = f"{track.title}_{track.originalTitle or (track.artist().title if hasattr(track, 'artist') and track.artist() else '')}"
                     plex_tracks.add(signature.lower())
+                    # Also store the unique Plex rating key for exact duplicate detection
+                    plex_track_keys.add(track.ratingKey)
 
             # Resolve source tracks from the configured URL
             source_tracks = []
@@ -1719,15 +1864,72 @@ class SyncThread(QThread):
             for i, track_info in enumerate(source_tracks):
                 self._ensure_not_cancelled()
 
-                track_signature = track_info.lower()
+                # Handle both old format (string) and new format (dict with 'path' and 'parsed')
+                if isinstance(track_info, dict):
+                    track_path = track_info.get('path')
+                    parsed_info = track_info.get('parsed', '')
+                else:
+                    # Old format for Spotify/Deezer/Tidal
+                    track_path = None
+                    parsed_info = track_info
+
+                track_signature = parsed_info.lower()
+
+                # Skip duplicate entries in the M3U source file itself
                 if track_signature in seen_signatures:
                     continue
                 seen_signatures.add(track_signature)
 
-                if not clear_before_sync and track_signature in plex_tracks:
-                    continue
+                plex_track = None
 
-                plex_track = self.find_best_match(library_section, track_info)
+                # Determine matching strategy for M3U files
+                use_smart_matching = False
+                if hasattr(self.parent(), 'm3u_smart_matching_radio'):
+                    use_smart_matching = self.parent().m3u_smart_matching_radio.isChecked()
+
+                # Try path-based or smart matching for M3U files
+                if track_path:
+                    if use_smart_matching:
+                        # Smart matching mode: Use Plex API search instead of path matching
+                        # Extract title and artist from parsed info
+                        if ' - ' in parsed_info:
+                            parts = parsed_info.split(' - ', 1)
+                            track_title = parts[0].strip()
+                            artist_name = parts[1].strip()
+                            plex_track = self.find_track_by_plex_search(library_section, track_title, artist_name)
+                            if plex_track:
+                                logging.info(f"Smart matching found: {plex_track.title} (from M3U)")
+                        else:
+                            plex_track = self.find_track_by_plex_search(library_section, parsed_info)
+                    else:
+                        # Path matching mode: Use exact file paths (original behavior)
+                        plex_track = self.find_track_by_path(library_section, track_path)
+
+                        # Log if path matching failed (will fall back to fuzzy matching)
+                        if not plex_track:
+                            logging.warning(f"Path match failed for: {track_path}, falling back to fuzzy matching")
+
+                    # If we found a track, check if it's already in the playlist
+                    if plex_track and not clear_before_sync:
+                        if plex_track.ratingKey in plex_track_keys:
+                            logging.debug(f"Track already in playlist, skipping: {plex_track.title}")
+                            continue
+
+                # Fall back to fuzzy matching if other methods failed
+                if not plex_track:
+                    # For fuzzy matching, use the old signature-based duplicate check
+                    # This prevents adding multiple versions of the same song when using fuzzy matching
+                    if not clear_before_sync and track_signature in plex_tracks:
+                        continue
+
+                    plex_track = self.find_best_match(library_section, parsed_info)
+
+                    # Also check by ratingKey for fuzzy matches
+                    if plex_track and not clear_before_sync:
+                        if plex_track.ratingKey in plex_track_keys:
+                            logging.debug(f"Track (by fuzzy match) already in playlist, skipping: {plex_track.title}")
+                            continue
+
                 if plex_track:
                     missing_tracks.append(plex_track)
 
@@ -1813,19 +2015,31 @@ class SyncThread(QThread):
         try:
             with open(file_path, 'r', encoding='utf-8') as file:
                 content = file.readlines()
-            
+
             tracks = []
             for line in content:
                 line = line.strip()
                 if line and not line.startswith('#'):
-                    # Parse the track info regardless of format
-                    parsed_track = self.parse_track_info_smart(line)
-                    if parsed_track:
-                        tracks.append(parsed_track)
-            
+                    # Store both the original path and parsed info
+                    # Format: {"path": "original/file/path", "parsed": "Track - Artist"}
+                    if '\\' in line or '/' in line:
+                        # This is a file path - preserve it for exact matching
+                        parsed_track = self.parse_track_info_smart(line)
+                        tracks.append({
+                            'path': line,
+                            'parsed': parsed_track
+                        })
+                    else:
+                        # This is already parsed format (Track - Artist)
+                        parsed_track = self.parse_track_info_smart(line)
+                        tracks.append({
+                            'path': None,
+                            'parsed': parsed_track
+                        })
+
             logging.info(f"Parsed {len(tracks)} tracks from M3U file: {file_path}")
             return tracks
-            
+
         except Exception as e:
             logging.error(f"Error getting M3U tracks: {str(e)}")
             return []
@@ -1961,6 +2175,151 @@ class SyncThread(QThread):
             raise
         except Exception as e:
             logging.error(f'Error finding match for track: {str(e)}')
+            return None
+
+    def find_track_by_path(self, library_section, file_path):
+        """Find track by exact file path to avoid duplicate matches
+
+        This method tries multiple matching strategies in order of specificity:
+        1. Exact full path match
+        2. Suffix match (for different mount points)
+        3. Partial match of last 3+ path components (artist/album/track)
+
+        Returns the first matching track found, or None if no match.
+        """
+        try:
+            self._ensure_not_cancelled()
+
+            # Normalize path separators for comparison
+            search_path = file_path.replace('\\', '/').lower()
+
+            # Extract filename for initial search to narrow down candidates
+            import os
+            filename = os.path.basename(search_path)
+            filename_without_ext = os.path.splitext(filename)[0]
+
+            # Search by title (filename without extension) to get a smaller candidate set
+            # This is much faster than iterating through all tracks
+            try:
+                candidate_tracks = library_section.searchTracks(title=filename_without_ext)
+            except:
+                # If search fails, fall back to getting all tracks
+                candidate_tracks = library_section.all()
+
+            # Try to find exact match first
+            for track in candidate_tracks:
+                try:
+                    self._ensure_not_cancelled()
+
+                    # Get all media parts (file paths) for this track
+                    for media in track.media:
+                        for part in media.parts:
+                            track_path = part.file.replace('\\', '/').lower()
+
+                            # Strategy 1: Exact match
+                            if track_path == search_path:
+                                logging.info(f"Found exact path match: {part.file}")
+                                return track
+
+                            # Strategy 2: Suffix match (Plex path ends with M3U path)
+                            # Handles cases like M3U: "Music/Artist/Album/Track.flac"
+                            # and Plex: "/mnt/data/Music/Artist/Album/Track.flac"
+                            if track_path.endswith(search_path):
+                                logging.info(f"Found suffix path match: {part.file}")
+                                return track
+
+                except AttributeError:
+                    # Track doesn't have media/parts
+                    continue
+
+            # Strategy 3: Partial match (last 3+ components)
+            # Only try this if exact/suffix matching failed
+            path_parts = search_path.split('/')
+            if len(path_parts) >= 3:
+                partial_search = '/'.join(path_parts[-3:])  # artist/album/track
+
+                for track in candidate_tracks:
+                    try:
+                        self._ensure_not_cancelled()
+
+                        for media in track.media:
+                            for part in media.parts:
+                                track_path = part.file.replace('\\', '/').lower()
+
+                                if track_path.endswith(partial_search):
+                                    logging.info(f"Found partial path match (last 3 components): {part.file}")
+                                    return track
+
+                    except AttributeError:
+                        continue
+
+            logging.debug(f"No path match found for: {file_path}")
+            return None
+
+        except SyncCancelled:
+            raise
+        except Exception as e:
+            logging.error(f'Error finding track by path: {str(e)}')
+            return None
+
+    def find_track_by_plex_search(self, library_section, track_title, artist_name=""):
+        """Find track using Plex's native search API (improved method for NAS/remote servers)
+
+        This method uses Plex's built-in search functionality which is much more reliable
+        for cross-platform scenarios (Windows -> NAS, different mount points, etc.)
+
+        Uses the Plex Media Server API endpoint: /library/sections/{id}/all?type=10
+        where type=10 specifies audio tracks.
+
+        Args:
+            library_section: Plex library section object
+            track_title: Title of the track to find
+            artist_name: Artist name (optional, improves accuracy)
+
+        Returns:
+            First matching Plex track object, or None if no match found
+        """
+        try:
+            self._ensure_not_cancelled()
+
+            # Use Plex's native search API with type=10 for tracks
+            # This is much more reliable than manual iteration
+            search_results = library_section.searchTracks(title=track_title, limit=50)
+
+            if not search_results:
+                logging.debug(f"No tracks found for title: {track_title}")
+                return None
+
+            # If we have an artist name, filter results by artist
+            if artist_name:
+                for track in search_results:
+                    try:
+                        # Get track's artist
+                        track_artist = track.originalTitle or (track.grandparentTitle if hasattr(track, 'grandparentTitle') else '')
+
+                        if not track_artist and hasattr(track, 'artist'):
+                            track_artist_obj = track.artist()
+                            if track_artist_obj:
+                                track_artist = track_artist_obj.title
+
+                        # Fuzzy match artist names (case insensitive, partial match)
+                        if track_artist and artist_name.lower() in track_artist.lower():
+                            logging.info(f"Found track via Plex search: {track.title} by {track_artist}")
+                            return track
+
+                    except Exception as track_error:
+                        logging.debug(f"Error checking track artist: {track_error}")
+                        continue
+
+            # If no artist match or no artist provided, return first result
+            # (Plex search already ranks by relevance)
+            logging.info(f"Found track via Plex search (no artist filter): {search_results[0].title}")
+            return search_results[0]
+
+        except SyncCancelled:
+            raise
+        except Exception as e:
+            logging.error(f'Error finding track by Plex search: {str(e)}')
             return None
 
     def parse_track_info(self, track):
@@ -4678,6 +5037,9 @@ class PlexPlaylistManager(QMainWindow):
         self.last_section_id = None  # Remember the last selected Plex library section
         self.auto_sync_timer = QTimer()
         self.auto_sync_timer.timeout.connect(self.perform_auto_sync)
+        self.scheduled_sync_timer = QTimer()
+        self.scheduled_sync_timer.timeout.connect(self.check_scheduled_sync)
+        self.scheduled_sync_timer.start(60000)  # Check every minute
         self.path_mappings = []  # Store user-defined path mappings
         self.plex_library_paths = []  # Cache Plex library root paths
         self.initUI()
@@ -4813,16 +5175,68 @@ class PlexPlaylistManager(QMainWindow):
         self.auto_sync_checkbox = QCheckBox("Enable Auto-Sync")
         self.auto_sync_checkbox.stateChanged.connect(self.toggle_auto_sync)
         header_layout.addWidget(self.auto_sync_checkbox)
-        
+
         self.sync_interval_spinbox = QSpinBox()
         self.sync_interval_spinbox.setMinimum(5)
         self.sync_interval_spinbox.setMaximum(1440)  # 24 hours
         self.sync_interval_spinbox.setValue(60)
         self.sync_interval_spinbox.setSuffix(" minutes")
+        self.sync_interval_spinbox.valueChanged.connect(lambda: self.save_sync_config())
         header_layout.addWidget(QLabel("Interval:"))
         header_layout.addWidget(self.sync_interval_spinbox)
-        
+
         layout.addLayout(header_layout)
+
+        # Scheduled Sync Section
+        scheduled_group = QGroupBox("Scheduled Sync")
+        scheduled_layout = QVBoxLayout(scheduled_group)
+
+        # First row: Enable checkbox, date/time picker
+        first_row = QHBoxLayout()
+
+        self.scheduled_sync_checkbox = QCheckBox("Enable Scheduled Sync")
+        self.scheduled_sync_checkbox.stateChanged.connect(self.toggle_scheduled_sync)
+        first_row.addWidget(self.scheduled_sync_checkbox)
+
+        first_row.addWidget(QLabel("Start Date & Time:"))
+
+        from PyQt5.QtCore import QDateTime
+        self.scheduled_datetime = QDateTimeEdit()
+        self.scheduled_datetime.setCalendarPopup(True)  # Show calendar popup
+        self.scheduled_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.scheduled_datetime.setMinimumDateTime(QDateTime.currentDateTime())
+        self.scheduled_datetime.setDateTime(QDateTime.currentDateTime().addSecs(3600))  # Default 1 hour from now
+        self.scheduled_datetime.dateTimeChanged.connect(self.on_scheduled_datetime_changed)
+        first_row.addWidget(self.scheduled_datetime)
+
+        first_row.addStretch()
+        scheduled_layout.addLayout(first_row)
+
+        # Second row: Repeat options
+        second_row = QHBoxLayout()
+
+        second_row.addWidget(QLabel("Repeat:"))
+
+        self.repeat_combo = QComboBox()
+        self.repeat_combo.addItem("Once (No Repeat)", "once")
+        self.repeat_combo.addItem("Daily", "daily")
+        self.repeat_combo.addItem("Every Weekday (Mon-Fri)", "weekdays")
+        self.repeat_combo.addItem("Weekly (Every 7 days)", "weekly")
+        self.repeat_combo.addItem("Bi-Weekly (Every 14 days)", "biweekly")
+        self.repeat_combo.addItem("Monthly (Every 30 days)", "monthly")
+        self.repeat_combo.currentIndexChanged.connect(self.on_repeat_changed)
+        second_row.addWidget(self.repeat_combo)
+
+        second_row.addWidget(QLabel("     Status:"))
+
+        self.scheduled_status_label = QLabel("No scheduled sync")
+        self.scheduled_status_label.setStyleSheet("color: #888; font-style: italic;")
+        second_row.addWidget(self.scheduled_status_label)
+
+        second_row.addStretch()
+        scheduled_layout.addLayout(second_row)
+
+        layout.addWidget(scheduled_group)
         
         # Sync configurations
         sync_group = QGroupBox("Sync Configurations")
@@ -5166,6 +5580,78 @@ class PlexPlaylistManager(QMainWindow):
 
         # Refresh the path mappings list
         self.refresh_path_mappings_list()
+
+        # M3U Matching Mode Section
+        matching_mode_group = QGroupBox("🎵 M3U Playlist Matching Mode")
+        matching_mode_group.setToolTip("Choose how M3U playlists match tracks in your Plex library")
+        matching_mode_layout = QVBoxLayout()
+
+        # Info section
+        matching_info = QLabel(
+            "Choose how to match tracks from M3U playlists:\n\n"
+            "🎯 <b>Smart Matching (Recommended for NAS/Remote)</b>: Uses track title and artist metadata. Perfect for "
+            "remote servers, NAS setups, or when file paths don't match. Works across different mount points.\n\n"
+            "📁 <b>Path Matching</b>: Uses exact file paths from M3U. Best for local servers where M3U paths "
+            "match exactly with Plex library paths. Fastest but requires identical paths."
+        )
+        matching_info.setWordWrap(True)
+        matching_info.setTextFormat(Qt.RichText)
+        matching_info.setStyleSheet("color: #ffffff; padding: 10px; background-color: #4a4a4a; border-radius: 5px; margin: 5px 0;")
+        matching_mode_layout.addWidget(matching_info)
+
+        # Radio buttons for matching mode
+        self.m3u_smart_matching_radio = QCheckBox("🎯 Smart Matching (metadata-based)")
+        self.m3u_smart_matching_radio.setChecked(False)  # Default to path matching for backward compatibility
+        self.m3u_smart_matching_radio.setToolTip("Match tracks by title and artist using Plex search API. Ideal for NAS/remote servers.")
+        self.m3u_smart_matching_radio.stateChanged.connect(self.on_m3u_matching_mode_changed)
+
+        self.m3u_path_matching_radio = QCheckBox("📁 Path Matching (file path-based)")
+        self.m3u_path_matching_radio.setChecked(True)  # Default
+        self.m3u_path_matching_radio.setToolTip("Match tracks by exact file paths. Requires M3U paths to match Plex library paths.")
+        self.m3u_path_matching_radio.stateChanged.connect(self.on_m3u_matching_mode_changed)
+
+        # Style the radio buttons
+        radio_style = """
+            QCheckBox {
+                color: #ffffff;
+                padding: 8px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 2px solid #2196F3;
+                background-color: transparent;
+                border-radius: 9px;
+            }
+            QCheckBox::indicator:checked {
+                border: 2px solid #2196F3;
+                background-color: #2196F3;
+                border-radius: 9px;
+            }
+        """
+
+        self.m3u_smart_matching_radio.setStyleSheet(radio_style)
+        self.m3u_path_matching_radio.setStyleSheet(radio_style)
+
+        matching_mode_layout.addWidget(self.m3u_smart_matching_radio)
+        matching_mode_layout.addWidget(self.m3u_path_matching_radio)
+
+        # Warning for path matching
+        path_warning = QLabel(
+            "⚠️ <b>Note</b>: If you experience issues with tracks not being found (especially with NAS/remote servers), "
+            "switch to Smart Matching mode."
+        )
+        path_warning.setWordWrap(True)
+        path_warning.setTextFormat(Qt.RichText)
+        path_warning.setStyleSheet("color: #FF9800; font-style: italic; padding: 10px; background-color: #3a3a3a; border-radius: 5px; margin: 5px 0;")
+        matching_mode_layout.addWidget(path_warning)
+
+        matching_mode_group.setLayout(matching_mode_layout)
+        layout.addWidget(matching_mode_group)
 
         layout.addStretch()
         self.content_stack.addWidget(page)
@@ -6185,7 +6671,150 @@ class PlexPlaylistManager(QMainWindow):
         else:
             self.auto_sync_timer.stop()
             self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-sync disabled")
-    
+
+        # Save the auto-sync state to config file
+        self.save_sync_config()
+
+    def toggle_scheduled_sync(self, state):
+        """Toggle scheduled sync functionality"""
+        from PyQt5.QtCore import QDateTime
+
+        if state == Qt.Checked:
+            scheduled_time = self.scheduled_datetime.dateTime()
+            current_time = QDateTime.currentDateTime()
+
+            # Validate that scheduled time is in the future
+            if scheduled_time <= current_time:
+                QMessageBox.warning(self, "Invalid Time",
+                    "Scheduled time must be in the future. Please select a later date/time.")
+                self.scheduled_sync_checkbox.setChecked(False)
+                return
+
+            # Update status label with repeat info
+            self.update_scheduled_status_label()
+
+            repeat_type = self.repeat_combo.currentText()
+            self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Scheduled sync enabled: {repeat_type}")
+        else:
+            self.scheduled_status_label.setText("No scheduled sync")
+            self.scheduled_status_label.setStyleSheet("color: #888; font-style: italic;")
+            self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Scheduled sync disabled")
+
+        # Save settings
+        self.save_sync_config()
+
+    def on_scheduled_datetime_changed(self):
+        """Handle scheduled datetime changes"""
+        if self.scheduled_sync_checkbox.isChecked():
+            # Update the status label when time changes
+            self.update_scheduled_status_label()
+
+        # Save settings
+        self.save_sync_config()
+
+    def on_repeat_changed(self):
+        """Handle repeat interval changes"""
+        if self.scheduled_sync_checkbox.isChecked():
+            self.update_scheduled_status_label()
+
+        # Save settings
+        self.save_sync_config()
+
+    def update_scheduled_status_label(self):
+        """Update the status label with current schedule info"""
+        from PyQt5.QtCore import QDateTime
+
+        scheduled_time = self.scheduled_datetime.dateTime()
+        current_time = QDateTime.currentDateTime()
+
+        if scheduled_time > current_time:
+            seconds_until = current_time.secsTo(scheduled_time)
+            hours = seconds_until // 3600
+            minutes = (seconds_until % 3600) // 60
+
+            time_str = scheduled_time.toString("yyyy-MM-dd HH:mm")
+            repeat_type = self.repeat_combo.currentData()
+
+            # Build status message based on repeat type
+            if repeat_type == "once":
+                status = f"⏰ Scheduled for {time_str} (in {hours}h {minutes}m)"
+            elif repeat_type == "daily":
+                status = f"⏰ Next sync: {time_str} (in {hours}h {minutes}m) • Repeats daily"
+            elif repeat_type == "weekdays":
+                status = f"⏰ Next sync: {time_str} (in {hours}h {minutes}m) • Repeats weekdays"
+            elif repeat_type == "weekly":
+                status = f"⏰ Next sync: {time_str} (in {hours}h {minutes}m) • Repeats weekly"
+            elif repeat_type == "biweekly":
+                status = f"⏰ Next sync: {time_str} (in {hours}h {minutes}m) • Repeats bi-weekly"
+            elif repeat_type == "monthly":
+                status = f"⏰ Next sync: {time_str} (in {hours}h {minutes}m) • Repeats monthly"
+            else:
+                status = f"⏰ Scheduled for {time_str} (in {hours}h {minutes}m)"
+
+            self.scheduled_status_label.setText(status)
+            self.scheduled_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        else:
+            self.scheduled_status_label.setText("⚠️ Scheduled time is in the past")
+            self.scheduled_status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
+
+    def check_scheduled_sync(self):
+        """Check if it's time to run scheduled sync (called every minute)"""
+        if not self.scheduled_sync_checkbox.isChecked():
+            return
+
+        from PyQt5.QtCore import QDateTime
+        scheduled_time = self.scheduled_datetime.dateTime()
+        current_time = QDateTime.currentDateTime()
+
+        # Check if current time has passed or equals the scheduled time
+        if current_time >= scheduled_time:
+            repeat_type = self.repeat_combo.currentData()
+
+            self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⏰ Executing scheduled sync...")
+
+            # Perform the sync
+            self.sync_all_playlists()
+
+            # Handle repeat logic
+            if repeat_type == "once":
+                # One-time sync, disable after execution
+                self.scheduled_sync_checkbox.setChecked(False)
+                self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] One-time scheduled sync completed")
+            elif repeat_type == "daily":
+                # Schedule next day at same time
+                next_sync = scheduled_time.addDays(1)
+                self.scheduled_datetime.setDateTime(next_sync)
+                self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Daily sync completed. Next sync: {next_sync.toString('yyyy-MM-dd HH:mm')}")
+            elif repeat_type == "weekdays":
+                # Schedule next weekday at same time
+                next_sync = scheduled_time.addDays(1)
+                # Skip weekends (Saturday = 6, Sunday = 7)
+                while next_sync.date().dayOfWeek() in [6, 7]:
+                    next_sync = next_sync.addDays(1)
+                self.scheduled_datetime.setDateTime(next_sync)
+                self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Weekday sync completed. Next sync: {next_sync.toString('yyyy-MM-dd HH:mm')}")
+            elif repeat_type == "weekly":
+                # Schedule 7 days later
+                next_sync = scheduled_time.addDays(7)
+                self.scheduled_datetime.setDateTime(next_sync)
+                self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Weekly sync completed. Next sync: {next_sync.toString('yyyy-MM-dd HH:mm')}")
+            elif repeat_type == "biweekly":
+                # Schedule 14 days later
+                next_sync = scheduled_time.addDays(14)
+                self.scheduled_datetime.setDateTime(next_sync)
+                self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Bi-weekly sync completed. Next sync: {next_sync.toString('yyyy-MM-dd HH:mm')}")
+            elif repeat_type == "monthly":
+                # Schedule 30 days later
+                next_sync = scheduled_time.addDays(30)
+                self.scheduled_datetime.setDateTime(next_sync)
+                self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Monthly sync completed. Next sync: {next_sync.toString('yyyy-MM-dd HH:mm')}")
+
+            # Save the updated schedule
+            self.save_sync_config()
+        else:
+            # Update countdown display
+            self.update_scheduled_status_label()
+
     def add_sync_config(self):
         """Add new sync configuration"""
         playlist_name = self.sync_playlist_combo.currentText()
@@ -6358,9 +6987,14 @@ class PlexPlaylistManager(QMainWindow):
             if os.path.exists(SYNC_CONFIG_FILE):
                 with open(SYNC_CONFIG_FILE, 'r') as f:
                     sync_config = json.load(f)
-                
+
+                logging.info(f"Loading sync config from {SYNC_CONFIG_FILE}")
+
                 # Load sync configurations into table
-                for playlist_name, config in sync_config.get('sync_playlists', {}).items():
+                playlists = sync_config.get('sync_playlists', {})
+                logging.info(f"Found {len(playlists)} sync playlist configuration(s)")
+
+                for playlist_name, config in playlists.items():
                     row = self.sync_configs_table.rowCount()
                     self.sync_configs_table.insertRow(row)
                     
@@ -6385,9 +7019,39 @@ class PlexPlaylistManager(QMainWindow):
                 # Load auto-sync settings
                 self.auto_sync_checkbox.setChecked(sync_config.get('auto_sync', False))
                 self.sync_interval_spinbox.setValue(sync_config.get('sync_interval', 60))
-                
+
+                # Load scheduled sync settings
+                from PyQt5.QtCore import QDateTime
+                scheduled_enabled = sync_config.get('scheduled_sync_enabled', False)
+                scheduled_datetime_str = sync_config.get('scheduled_sync_datetime', '')
+                scheduled_repeat = sync_config.get('scheduled_sync_repeat', 'once')
+
+                # Load repeat setting
+                repeat_index = self.repeat_combo.findData(scheduled_repeat)
+                if repeat_index >= 0:
+                    self.repeat_combo.setCurrentIndex(repeat_index)
+
+                if scheduled_datetime_str:
+                    try:
+                        scheduled_dt = QDateTime.fromString(scheduled_datetime_str, "yyyy-MM-dd HH:mm")
+                        # Only load if the scheduled time is still in the future (or if it's a recurring sync)
+                        if scheduled_dt > QDateTime.currentDateTime() or scheduled_repeat != 'once':
+                            self.scheduled_datetime.setDateTime(scheduled_dt)
+                            self.scheduled_sync_checkbox.setChecked(scheduled_enabled)
+                        else:
+                            # Past one-time scheduled sync, reset to default (1 hour from now)
+                            self.scheduled_datetime.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+                            logging.info("One-time scheduled sync time was in the past, resetting to default")
+                    except Exception as dt_error:
+                        logging.warning(f"Could not parse scheduled datetime: {dt_error}")
+                        self.scheduled_datetime.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+            else:
+                logging.info(f"Sync config file not found: {SYNC_CONFIG_FILE}")
+
         except Exception as e:
             logging.error(f"Error loading sync config: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
     
     def sync_selected_playlists(self):
         """Sync selected playlists from the table"""
@@ -6507,9 +7171,12 @@ class PlexPlaylistManager(QMainWindow):
             sync_config = {
                 'sync_playlists': configs,
                 'auto_sync': self.auto_sync_checkbox.isChecked(),
-                'sync_interval': self.sync_interval_spinbox.value()
+                'sync_interval': self.sync_interval_spinbox.value(),
+                'scheduled_sync_enabled': self.scheduled_sync_checkbox.isChecked(),
+                'scheduled_sync_datetime': self.scheduled_datetime.dateTime().toString("yyyy-MM-dd HH:mm"),
+                'scheduled_sync_repeat': self.repeat_combo.currentData()
             }
-            
+
             with open(SYNC_CONFIG_FILE, 'w') as f:
                 json.dump(sync_config, f, indent=4)
                 
@@ -7739,6 +8406,22 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 item_text = f"{mapping['source']}  →  {mapping['target']}"
                 self.path_mappings_list.addItem(item_text)
 
+    def on_m3u_matching_mode_changed(self, state):
+        """Handle M3U matching mode radio button changes"""
+        sender = self.sender()
+
+        if sender == self.m3u_smart_matching_radio and state == Qt.Checked:
+            # User selected smart matching
+            self.m3u_path_matching_radio.setChecked(False)
+            logging.info("M3U matching mode changed to: Smart Matching (metadata-based)")
+        elif sender == self.m3u_path_matching_radio and state == Qt.Checked:
+            # User selected path matching
+            self.m3u_smart_matching_radio.setChecked(False)
+            logging.info("M3U matching mode changed to: Path Matching (file path-based)")
+
+        # Save the setting
+        self.save_config()
+
     def apply_path_preset(self, preset_type):
         """Apply a predefined path mapping preset"""
         presets = {
@@ -8089,7 +8772,16 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         try:
             # Get playlist name
             playlist_name = custom_name or os.path.splitext(os.path.basename(path))[0]
-            
+
+            # Check if smart matching is enabled
+            use_smart_matching = self.m3u_smart_matching_radio.isChecked()
+
+            if use_smart_matching and (path.endswith('.m3u') or path.endswith('.m3u8')):
+                # Use smart matching approach for M3U files
+                logging.info(f"Using smart matching for M3U upload: {playlist_name}")
+                self._perform_smart_m3u_upload(path, playlist_name)
+                return
+
             # Check for existing playlist BEFORE uploading
             existing_playlist = self.check_playlist_exists(playlist_name)
             
@@ -8270,7 +8962,612 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         
         # Refresh the playlist list after import
         self.fetch_playlists()
-    
+
+    def _perform_smart_m3u_upload(self, m3u_path, playlist_name):
+        """Upload M3U playlist using smart matching (for remote/NAS servers)"""
+        try:
+            # Reset auto-skip flag for new upload
+            self._auto_skip_uncertain = False
+            # Check for existing playlist
+            existing_playlist = self.check_playlist_exists(playlist_name)
+
+            if existing_playlist:
+                # Show conflict resolution dialog
+                dialog = QMessageBox(self)
+                dialog.setWindowTitle("Playlist Already Exists")
+                dialog.setText(f"A playlist named '{playlist_name}' already exists in your Plex server.")
+                dialog.setInformativeText("What would you like to do?")
+
+                overwrite_btn = dialog.addButton("🔄 Overwrite", QMessageBox.DestructiveRole)
+                rename_btn = dialog.addButton("📝 Rename New", QMessageBox.AcceptRole)
+                cancel_btn = dialog.addButton("❌ Cancel", QMessageBox.RejectRole)
+
+                dialog.exec_()
+
+                if dialog.clickedButton() == cancel_btn:
+                    self.statusBar().showMessage("Import cancelled by user")
+                    return
+
+                elif dialog.clickedButton() == overwrite_btn:
+                    # Delete existing playlist
+                    existing_playlist.delete()
+                    logging.info(f"Deleted existing playlist: {playlist_name}")
+                    self.statusBar().showMessage(f"Overwriting existing playlist: {playlist_name}")
+
+                elif dialog.clickedButton() == rename_btn:
+                    # Generate new name with timestamp
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+                    new_playlist_name = f"{playlist_name}_{timestamp}"
+
+                    # Double-check the new name doesn't exist
+                    counter = 1
+                    while self.check_playlist_exists(new_playlist_name):
+                        new_playlist_name = f"{playlist_name}_{timestamp}_{counter}"
+                        counter += 1
+
+                    playlist_name = new_playlist_name
+                    logging.info(f"Renamed playlist to: {playlist_name}")
+
+            # Parse M3U file to get track info
+            self.statusBar().showMessage(f"Parsing M3U file: {playlist_name}...")
+            track_infos = []
+
+            encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'latin1']
+            content = None
+            for encoding in encodings:
+                try:
+                    with open(m3u_path, 'r', encoding=encoding) as file:
+                        content = file.readlines()
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if not content:
+                raise Exception("Could not read M3U file with any supported encoding")
+
+            # Parse tracks from M3U
+            for line in content:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Extract track info from file path
+                    import os
+                    filename = os.path.basename(line)
+                    filename_without_ext = os.path.splitext(filename)[0]
+
+                    # Try to extract artist and title from filename
+                    # Common formats: "Artist - Title", "Title - Artist", "01 - Artist - Title"
+                    if ' - ' in filename_without_ext:
+                        parts = filename_without_ext.split(' - ')
+                        if len(parts) >= 2:
+                            # Remove track number if present (e.g., "01 ")
+                            first_part = parts[0].strip()
+                            if first_part.isdigit() and len(parts) >= 3:
+                                # Format: "01 - Artist - Title"
+                                artist = parts[1].strip()
+                                title = parts[2].strip()
+                            else:
+                                # Format: "Artist - Title" (most common M3U format)
+                                # Based on path structure: F:/Music/Artist/Artist - Album/Artist - Title.flac
+                                artist = parts[0].strip()
+                                title = parts[1].strip()
+
+                            track_infos.append({'title': title, 'artist': artist})
+                        else:
+                            track_infos.append({'title': filename_without_ext, 'artist': ''})
+                    else:
+                        track_infos.append({'title': filename_without_ext, 'artist': ''})
+
+            if not track_infos:
+                raise Exception("No tracks found in M3U file")
+
+            logging.info(f"Found {len(track_infos)} tracks in M3U file")
+
+            # Get library section
+            library_section_id = self.section_combo.currentData()
+            if not library_section_id:
+                raise Exception("Please select a library section")
+
+            library_section = self.plex_server.library.sectionByID(library_section_id)
+
+            # Store playlist name for later use
+            self._pending_playlist_name = playlist_name
+
+            # Start thread for track matching (prevents UI freezing)
+            self.statusBar().showMessage(f"Finding tracks in Plex library... (0/{len(track_infos)})")
+
+            self._smart_upload_thread = SmartM3UUploadThread(m3u_path, track_infos, library_section, self)
+            self._smart_upload_thread.progress_update.connect(self._on_smart_upload_progress)
+            self._smart_upload_thread.track_prompt_needed.connect(self._on_smart_upload_prompt)
+            self._smart_upload_thread.upload_complete.connect(self._on_smart_upload_complete)
+            self._smart_upload_thread.upload_error.connect(self._on_smart_upload_error)
+            self._smart_upload_thread.start()
+
+        except Exception as e:
+            error_message = f"Failed to start smart M3U upload. Error: {str(e)}"
+            self.statusBar().showMessage(error_message)
+            QMessageBox.critical(self, "Import Error", error_message)
+            logging.error(f"Smart M3U upload failed: {str(e)}")
+
+    def _on_smart_upload_progress(self, message, percentage):
+        """Handle progress updates from smart upload thread"""
+        self.statusBar().showMessage(message)
+
+    def _on_smart_upload_prompt(self, title, artist, candidates, current_index, total_tracks, result_holder):
+        """Handle track selection prompt from thread"""
+        # Check if auto-skip is enabled
+        if self._auto_skip_uncertain:
+            result_holder['skipped'] = True
+            return
+
+        # Show selection dialog on main thread
+        user_choice = self._prompt_track_selection(title, artist, candidates, current_index, total_tracks)
+
+        if user_choice:
+            result_holder['track'] = user_choice
+        else:
+            result_holder['skipped'] = True
+
+    def _on_smart_upload_complete(self, matched_count, total_count, not_found_list):
+        """Handle upload completion from thread"""
+        try:
+            playlist_name = self._pending_playlist_name
+
+            # Create playlist with matched tracks
+            if matched_count > 0:
+                self.statusBar().showMessage(f"Creating playlist with {matched_count} tracks...")
+                matched_tracks = self._smart_upload_thread.matched_tracks
+                new_playlist = self.plex_server.createPlaylist(playlist_name, items=matched_tracks)
+                logging.info(f"Created playlist '{playlist_name}' with {matched_count} tracks")
+
+                # Show success message
+                success_msg = f"✅ Successfully imported '{playlist_name}' using smart matching!\n\n"
+                success_msg += f"📊 Found: {matched_count}/{total_count} tracks"
+
+                if not_found_list:
+                    success_msg += f"\n\n⚠️ Could not find {len(not_found_list)} tracks:\n"
+                    success_msg += "\n".join(not_found_list[:10])
+                    if len(not_found_list) > 10:
+                        success_msg += f"\n...and {len(not_found_list) - 10} more"
+
+                QMessageBox.information(self, "Import Complete", success_msg)
+                self.statusBar().showMessage(f"'{playlist_name}' imported successfully ({matched_count} tracks)")
+
+                # Refresh playlist list
+                self.fetch_playlists()
+            else:
+                raise Exception("No tracks could be matched in your Plex library")
+
+        except Exception as e:
+            error_message = f"Failed to create playlist. Error: {str(e)}"
+            self.statusBar().showMessage(error_message)
+            QMessageBox.critical(self, "Import Error", error_message)
+            logging.error(f"Smart M3U playlist creation failed: {str(e)}")
+
+    def _on_smart_upload_error(self, error_msg):
+        """Handle error from smart upload thread"""
+        error_message = f"Smart M3U upload error: {error_msg}"
+        self.statusBar().showMessage(error_message)
+        QMessageBox.critical(self, "Import Error", error_message)
+
+    def _prompt_track_selection(self, original_title, original_artist, candidates, current_index, total_tracks):
+        """Show dialog for user to manually select the correct track from candidates (modified to return track directly)"""
+        # Remove old massive block of code and replace with simpler version
+        for i, track_info in enumerate(track_infos):
+                try:
+                    # Use Plex search API with improved matching
+                    title = track_info['title']
+                    artist = track_info['artist']
+
+                    # Try multiple search strategies
+                    search_results = library_section.searchTracks(title=title, limit=50)
+
+                    # Strategy 1: Direct title search
+                    if not search_results and title:
+                        # Strategy 2: Remove underscores and special characters
+                        cleaned_title = title.replace('_', ' ').replace('?', '').strip()
+                        if cleaned_title != title:
+                            search_results = library_section.searchTracks(title=cleaned_title, limit=50)
+                            logging.info(f"Trying cleaned title: {cleaned_title}")
+
+                    # Strategy 3: Search by artist if title search fails
+                    if not search_results and artist:
+                        try:
+                            artist_results = library_section.searchTracks(artist=artist, limit=100)
+                            # Filter by title similarity
+                            search_results = []
+                            for track in artist_results:
+                                if any(word.lower() in track.title.lower() for word in title.split() if len(word) > 3):
+                                    search_results.append(track)
+                            if search_results:
+                                logging.info(f"Found via artist search: {len(search_results)} candidates")
+                        except:
+                            pass
+
+                    # Strategy 4: Broad search with just first word of title
+                    if not search_results and title:
+                        first_word = title.split()[0] if ' ' in title else title
+                        if len(first_word) > 3:
+                            broad_results = library_section.searchTracks(title=first_word, limit=50)
+                            # Filter by artist if available
+                            if artist:
+                                search_results = [t for t in broad_results if artist.lower() in (
+                                    t.originalTitle or t.grandparentTitle if hasattr(t, 'grandparentTitle') else ''
+                                ).lower()]
+                            else:
+                                search_results = broad_results
+                            if search_results:
+                                logging.info(f"Found via broad search: {len(search_results)} candidates")
+
+                    if search_results:
+                        # Score and rank matches
+                        scored_matches = []
+
+                        for track in search_results:
+                            try:
+                                track_artist = track.originalTitle or (track.grandparentTitle if hasattr(track, 'grandparentTitle') else '')
+                                if not track_artist and hasattr(track, 'artist'):
+                                    track_artist_obj = track.artist()
+                                    if track_artist_obj:
+                                        track_artist = track_artist_obj.title
+
+                                # Calculate match score (0-100)
+                                score = 0
+
+                                # Title match (40 points max)
+                                title_lower = title.lower()
+                                track_title_lower = track.title.lower()
+                                if track_title_lower == title_lower:
+                                    score += 40  # Exact match
+                                elif title_lower in track_title_lower or track_title_lower in title_lower:
+                                    score += 30  # Partial match
+                                elif any(word in track_title_lower for word in title_lower.split() if len(word) > 3):
+                                    score += 20  # Word match
+
+                                # Artist match (60 points max)
+                                if artist and track_artist:
+                                    artist_lower = artist.lower()
+                                    track_artist_lower = track_artist.lower()
+                                    if track_artist_lower == artist_lower:
+                                        score += 60  # Exact match
+                                    elif artist_lower in track_artist_lower or track_artist_lower in artist_lower:
+                                        score += 50  # Partial match
+                                    elif any(word in track_artist_lower for word in artist_lower.split() if len(word) > 3):
+                                        score += 30  # Word match
+
+                                scored_matches.append((track, score, track_artist))
+
+                            except Exception as score_error:
+                                logging.debug(f"Error scoring track: {score_error}")
+                                continue
+
+                        # Sort by score (highest first)
+                        scored_matches.sort(key=lambda x: x[1], reverse=True)
+
+                        if scored_matches:
+                            best_match, best_score, best_artist = scored_matches[0]
+
+                            # High confidence match (score >= 80)
+                            if best_score >= 80:
+                                matched_tracks.append(best_match)
+                                logging.info(f"✓ High confidence match ({best_score}): {best_match.title} by {best_artist}")
+
+                            # Medium confidence (50-79) - prompt user (unless auto-skip enabled)
+                            elif best_score >= 50:
+                                if self._auto_skip_uncertain:
+                                    # Auto-skip enabled, don't prompt
+                                    not_found.append(f"{title} - {artist}" if artist else title)
+                                    logging.info(f"⏭️ Auto-skipped (medium confidence {best_score}): {title}")
+                                else:
+                                    # Show user selection dialog
+                                    user_choice = self._prompt_track_selection(
+                                        original_title=title,
+                                        original_artist=artist,
+                                        candidates=scored_matches[:5],  # Top 5 matches
+                                        current_index=i + 1,
+                                        total_tracks=len(track_infos)
+                                    )
+
+                                    if user_choice:
+                                        matched_tracks.append(user_choice)
+                                        logging.info(f"✓ User selected: {user_choice.title}")
+                                    else:
+                                        not_found.append(f"{title} - {artist}" if artist else title)
+                                        logging.info(f"✗ User skipped: {title}")
+
+                            # Low confidence (< 50) - prompt user or skip
+                            else:
+                                if self._auto_skip_uncertain:
+                                    # Auto-skip enabled, don't prompt
+                                    not_found.append(f"{title} - {artist}" if artist else title)
+                                    logging.info(f"⏭️ Auto-skipped (low confidence {best_score}): {title}")
+                                else:
+                                    user_choice = self._prompt_track_selection(
+                                        original_title=title,
+                                        original_artist=artist,
+                                        candidates=scored_matches[:5],
+                                        current_index=i + 1,
+                                        total_tracks=len(track_infos)
+                                    )
+
+                                    if user_choice:
+                                        matched_tracks.append(user_choice)
+                                        logging.info(f"✓ User selected: {user_choice.title}")
+                                    else:
+                                        not_found.append(f"{title} - {artist}" if artist else title)
+                                        logging.info(f"✗ User skipped: {title}")
+                        else:
+                            not_found.append(f"{title} - {artist}" if artist else title)
+                            logging.warning(f"Not found: {title} by {artist}")
+                    else:
+                        not_found.append(f"{title} - {artist}" if artist else title)
+                        logging.warning(f"Not found: {title} by {artist}")
+
+                    # Update progress
+                    if (i + 1) % 10 == 0 or i == len(track_infos) - 1:
+                        self.statusBar().showMessage(f"Finding tracks... ({i+1}/{len(track_infos)})")
+
+                except Exception as track_error:
+                    logging.error(f"Error finding track {track_info}: {track_error}")
+                    not_found.append(f"{track_info.get('title', 'Unknown')} - {track_info.get('artist', '')}")
+
+            # Create playlist
+            if matched_tracks:
+                self.statusBar().showMessage(f"Creating playlist with {len(matched_tracks)} tracks...")
+                new_playlist = self.plex_server.createPlaylist(playlist_name, items=matched_tracks)
+                logging.info(f"Created playlist '{playlist_name}' with {len(matched_tracks)} tracks")
+
+                # Show success message
+                success_msg = f"✅ Successfully imported '{playlist_name}' using smart matching!\n\n"
+                success_msg += f"📊 Found: {len(matched_tracks)}/{len(track_infos)} tracks"
+
+                if not_found:
+                    success_msg += f"\n\n⚠️ Could not find {len(not_found)} tracks:\n"
+                    success_msg += "\n".join(not_found[:10])  # Show first 10
+                    if len(not_found) > 10:
+                        success_msg += f"\n...and {len(not_found) - 10} more"
+
+                QMessageBox.information(self, "Import Complete", success_msg)
+                self.statusBar().showMessage(f"'{playlist_name}' imported successfully ({len(matched_tracks)} tracks)")
+
+                # Refresh playlist list
+                self.fetch_playlists()
+            else:
+                raise Exception("No tracks could be matched in your Plex library")
+
+        except Exception as e:
+            error_message = f"Failed to import {os.path.basename(m3u_path)} using smart matching. Error: {str(e)}"
+            self.statusBar().showMessage(error_message)
+            QMessageBox.critical(self, "Import Error", error_message)
+            logging.error(f"Smart M3U upload failed: {str(e)}")
+
+    def _prompt_track_selection(self, original_title, original_artist, candidates, current_index, total_tracks):
+        """Show dialog for user to manually select the correct track from candidates
+
+        Args:
+            original_title: The title from the M3U file
+            original_artist: The artist from the M3U file
+            candidates: List of (track, score, artist) tuples sorted by score
+            current_index: Current track number being processed
+            total_tracks: Total number of tracks
+
+        Returns:
+            Selected Plex track object or None if skipped
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"🎵 Select Correct Track ({current_index}/{total_tracks})")
+        dialog.setMinimumWidth(700)
+        dialog.setMinimumHeight(450)
+
+        # Apply dark theme styling to dialog
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1a1a1a;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QScrollArea {
+                background-color: #1a1a1a;
+                border: none;
+            }
+        """)
+
+        layout = QVBoxLayout(dialog)
+
+        # Original track info
+        original_info = QLabel(
+            f"<h3 style='color: #2196F3; margin-bottom: 5px;'>Looking for:</h3>"
+            f"<p style='font-size: 14px; line-height: 1.6;'>"
+            f"<b style='color: #4CAF50;'>Title:</b> <span style='color: #ffffff;'>{original_title}</span><br>"
+            f"<b style='color: #4CAF50;'>Artist:</b> <span style='color: #ffffff;'>{original_artist or 'Unknown'}</span></p>"
+        )
+        original_info.setTextFormat(Qt.RichText)
+        original_info.setStyleSheet("""
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #3a3a3a;
+        """)
+        layout.addWidget(original_info)
+
+        # Instructions
+        instructions = QLabel(
+            "<span style='color: #FF9800;'>⚠️</span> "
+            "<span style='color: #ffffff;'>No exact match found. Please select the correct track from the options below, or skip if none match:</span>"
+        )
+        instructions.setTextFormat(Qt.RichText)
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("""
+            padding: 12px;
+            background-color: #2a2a2a;
+            border-left: 3px solid #FF9800;
+            border-radius: 3px;
+            margin-top: 10px;
+            margin-bottom: 10px;
+        """)
+        layout.addWidget(instructions)
+
+        # Candidates list
+        candidates_label = QLabel("<h4 style='color: #2196F3; margin-bottom: 8px;'>Available matches:</h4>")
+        candidates_label.setTextFormat(Qt.RichText)
+        candidates_label.setStyleSheet("padding: 5px;")
+        layout.addWidget(candidates_label)
+
+        # Create radio button group
+        button_group = QButtonGroup(dialog)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background-color: #1a1a1a;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background-color: #1a1a1a;
+                width: 12px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #4a4a4a;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #5a5a5a;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        scroll_widget = QWidget()
+        scroll_widget.setStyleSheet("background-color: #1a1a1a;")
+        scroll_layout = QVBoxLayout(scroll_widget)
+
+        radio_buttons = []
+        for i, (track, score, track_artist) in enumerate(candidates):
+            try:
+                # Get album info
+                album = track.parentTitle if hasattr(track, 'parentTitle') else 'Unknown Album'
+
+                # Get year
+                year = ""
+                if hasattr(track, 'parentYear'):
+                    year = f" ({track.parentYear})"
+
+                # Create radio button with track info
+                confidence = "🟢" if score >= 80 else "🟡" if score >= 50 else "🔴"
+                confidence_color = "#4CAF50" if score >= 80 else "#FF9800" if score >= 50 else "#f44336"
+
+                radio_text = (
+                    f"{confidence} <b style='color: #ffffff; font-size: 14px;'>{track.title}</b> "
+                    f"<span style='color: #aaaaaa;'>by</span> "
+                    f"<span style='color: #2196F3;'>{track_artist}</span><br>"
+                    f"<span style='color: #888888; font-size: 12px;'>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+                    f"Album: <i style='color: #aaaaaa;'>{album}{year}</i></span><br>"
+                    f"<span style='color: {confidence_color}; font-size: 11px; font-weight: bold;'>"
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Match confidence: {score}%</span>"
+                )
+
+                radio = QRadioButton()
+                radio.setText("")  # We'll use a label for rich text
+                radio.setStyleSheet("""
+                    QRadioButton::indicator {
+                        width: 18px;
+                        height: 18px;
+                    }
+                    QRadioButton::indicator::unchecked {
+                        border: 2px solid #555555;
+                        background-color: #1a1a1a;
+                        border-radius: 9px;
+                    }
+                    QRadioButton::indicator::unchecked:hover {
+                        border: 2px solid #2196F3;
+                        background-color: #2a2a2a;
+                    }
+                    QRadioButton::indicator::checked {
+                        border: 2px solid #2196F3;
+                        background-color: #2196F3;
+                        border-radius: 9px;
+                    }
+                """)
+
+                label = QLabel(radio_text)
+                label.setTextFormat(Qt.RichText)
+                label.setWordWrap(True)
+                label.setStyleSheet("""
+                    QLabel {
+                        padding: 12px;
+                        background-color: #1e1e1e;
+                        border-radius: 5px;
+                        border: 1px solid #3a3a3a;
+                        margin: 3px 0px;
+                    }
+                    QLabel:hover {
+                        background-color: #2a2a2a;
+                        border: 1px solid #2196F3;
+                    }
+                """)
+
+                # Make label clickable
+                label.mousePressEvent = lambda event, r=radio: r.setChecked(True)
+
+                row_layout = QHBoxLayout()
+                row_layout.addWidget(radio)
+                row_layout.addWidget(label, 1)
+                scroll_layout.addLayout(row_layout)
+
+                button_group.addButton(radio, i)
+                radio_buttons.append((radio, track))
+
+                # Select first option by default
+                if i == 0:
+                    radio.setChecked(True)
+
+            except Exception as e:
+                logging.error(f"Error displaying track option: {e}")
+
+        scroll_layout.addStretch()
+        scroll_area.setWidget(scroll_widget)
+        layout.addWidget(scroll_area)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        select_btn = ModernButton("✅ Use Selected Track")
+        select_btn.clicked.connect(dialog.accept)
+
+        skip_btn = ModernButton("⏭️ Skip This Track")
+        skip_btn.clicked.connect(dialog.reject)
+
+        skip_all_btn = ModernButton("❌ Auto-Skip All Uncertain")
+        skip_all_btn.setToolTip("Skip this and all remaining uncertain matches")
+        skip_all_btn.clicked.connect(lambda: dialog.done(2))  # Custom return code
+
+        button_layout.addWidget(select_btn)
+        button_layout.addWidget(skip_btn)
+        button_layout.addWidget(skip_all_btn)
+        button_layout.addStretch()
+
+        layout.addLayout(button_layout)
+
+        # Show dialog
+        result = dialog.exec_()
+
+        if result == QDialog.Accepted:
+            # Find selected track
+            for radio, track in radio_buttons:
+                if radio.isChecked():
+                    return track
+        elif result == 2:
+            # User wants to skip all uncertain matches
+            # Set a flag to auto-skip remaining uncertain matches
+            if not hasattr(self, '_auto_skip_uncertain'):
+                self._auto_skip_uncertain = True
+
+        return None
+
     def _merge_with_existing(self, file_path, existing_playlist):
         """Merge M3U file tracks with existing playlist"""
         try:
@@ -8767,8 +10064,16 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # Refresh the UI to display loaded mappings
             self.refresh_path_mappings_list()
 
+        # Load M3U matching mode
+        use_smart_matching = config.get('m3u_use_smart_matching', False)
+        self.m3u_smart_matching_radio.setChecked(use_smart_matching)
+        self.m3u_path_matching_radio.setChecked(not use_smart_matching)
+
         # Refresh Spotify login state using the saved config
         self.load_spotify_config()
+
+        # Load sync configurations
+        self.load_sync_config()
 
         if token_value and self.server_ip_input.text() and self.server_port_input.text():
             logging.info('Auto-connecting to Plex using saved token.')
@@ -8795,7 +10100,8 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 "server_port": self.server_port_input.text(),
                 "token": self.token_input.text(),
                 "last_section": self.section_combo.currentData(),
-                "path_mappings": self.path_mappings
+                "path_mappings": self.path_mappings,
+                "m3u_use_smart_matching": self.m3u_smart_matching_radio.isChecked()
             })
             
             # Save merged config
@@ -8991,6 +10297,100 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         QTableWidget::item:selected {
             background-color: #4a4a4a;
         }
+
+        /* QDateTimeEdit styling */
+        QDateTimeEdit {
+            background-color: #2a2a2a;
+            border: 1px solid #3a3a3a;
+            padding: 5px;
+            border-radius: 3px;
+            color: #ffffff;
+            min-height: 20px;
+        }
+        QDateTimeEdit::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 20px;
+            border-left: 1px solid #3a3a3a;
+            background-color: #3a3a3a;
+        }
+        QDateTimeEdit::up-button, QDateTimeEdit::down-button {
+            background-color: #3a3a3a;
+            border: none;
+            width: 16px;
+        }
+        QDateTimeEdit::up-button:hover, QDateTimeEdit::down-button:hover {
+            background-color: #4a4a4a;
+        }
+
+        /* QCalendarWidget styling - Dark theme */
+        QCalendarWidget {
+            background-color: #2a2a2a;
+            color: #ffffff;
+        }
+        QCalendarWidget QToolButton {
+            background-color: #3a3a3a;
+            color: #ffffff;
+            border: none;
+            border-radius: 3px;
+            padding: 5px;
+            margin: 2px;
+        }
+        QCalendarWidget QToolButton:hover {
+            background-color: #4a4a4a;
+        }
+        QCalendarWidget QToolButton:pressed {
+            background-color: #2a2a2a;
+        }
+        QCalendarWidget QMenu {
+            background-color: #2a2a2a;
+            color: #ffffff;
+        }
+        QCalendarWidget QSpinBox {
+            background-color: #2a2a2a;
+            color: #ffffff;
+            border: 1px solid #3a3a3a;
+            selection-background-color: #4a4a4a;
+            selection-color: #ffffff;
+        }
+        QCalendarWidget QWidget#qt_calendar_navigationbar {
+            background-color: #3a3a3a;
+        }
+        QCalendarWidget QAbstractItemView {
+            background-color: #2a2a2a;
+            color: #ffffff;
+            selection-background-color: #2196F3;
+            selection-color: #ffffff;
+            alternate-background-color: #2a2a2a;
+        }
+        QCalendarWidget QAbstractItemView:enabled {
+            color: #ffffff;
+        }
+        QCalendarWidget QAbstractItemView:disabled {
+            color: #666666;
+        }
+        QCalendarWidget QWidget {
+            alternate-background-color: #2a2a2a;
+        }
+        /* Calendar header (days of week) */
+        QCalendarWidget QWidget#qt_calendar_calendarview {
+            background-color: #2a2a2a;
+            border: 1px solid #3a3a3a;
+        }
+        /* Calendar grid */
+        QCalendarWidget QTableView {
+            background-color: #2a2a2a;
+            gridline-color: #3a3a3a;
+            selection-background-color: #2196F3;
+        }
+        /* Current day highlight */
+        QCalendarWidget QTableView::item:selected {
+            background-color: #2196F3;
+            color: #ffffff;
+        }
+        QCalendarWidget QTableView::item:hover {
+            background-color: #4a4a4a;
+        }
         """
 
     def closeEvent(self, event):
@@ -9026,7 +10426,11 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # Stop auto-sync timer
             if self.auto_sync_timer.isActive():
                 self.auto_sync_timer.stop()
-            
+
+            # Stop scheduled sync timer
+            if self.scheduled_sync_timer.isActive():
+                self.scheduled_sync_timer.stop()
+
             # Save configuration and cache
             self.save_config()
             self.save_sync_config()
