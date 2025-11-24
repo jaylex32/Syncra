@@ -13,7 +13,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.12.0"
+__version__ = "2.13.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -50,6 +50,240 @@ import secrets
 from pathlib import Path
 
 CONFIG_FILE = "app_config.json"
+
+
+# ============================================================================
+# SECURE CREDENTIAL MANAGER - Multi-OS Production-Ready
+# ============================================================================
+
+class SecureCredentialManager:
+    """
+    Production-ready credential manager with multi-OS support.
+
+    Backends (in order of preference):
+    1. Windows: Windows Credential Manager (native, secure)
+    2. macOS: Keychain (native, secure)
+    3. Linux: Secret Service API (GNOME Keyring, KWallet)
+    4. Fallback: AES-256 encrypted file (all platforms)
+
+    Works with PyInstaller binaries on all platforms.
+    """
+
+    def __init__(self, app_name="Syncra"):
+        self.app_name = app_name
+        self.service_name = f"{app_name}_credentials"
+        self.platform = platform.system()
+
+        # Determine which backend to use
+        self.backend = self._initialize_backend()
+        logging.info(f"Credential storage backend: {self.backend}")
+
+    def _initialize_backend(self):
+        """Detect and initialize the best available backend"""
+
+        # Try keyring library first (supports all platforms)
+        try:
+            import keyring
+            # Test if keyring works
+            keyring.get_keyring()
+            return "keyring"
+        except Exception as e:
+            logging.warning(f"Keyring not available: {e}")
+
+        # Fallback to encrypted file storage
+        return "encrypted_file"
+
+    def save_password(self, username, password):
+        """Save password securely using the best available method"""
+        if not password:
+            return
+
+        try:
+            if self.backend == "keyring":
+                import keyring
+                keyring.set_password(self.service_name, username, password)
+                logging.info(f"Password saved to system keyring for {username}")
+            else:
+                # Use encrypted file storage
+                self._save_encrypted(username, password)
+                logging.info(f"Password saved to encrypted storage for {username}")
+        except Exception as e:
+            logging.error(f"Failed to save password: {e}")
+            # Emergency fallback to encrypted file
+            try:
+                self._save_encrypted(username, password)
+            except Exception as fallback_error:
+                logging.error(f"Fallback save also failed: {fallback_error}")
+
+    def get_password(self, username):
+        """Retrieve password securely"""
+        if not username:
+            return None
+
+        try:
+            if self.backend == "keyring":
+                import keyring
+                password = keyring.get_password(self.service_name, username)
+                if password:
+                    logging.info(f"Password retrieved from system keyring for {username}")
+                return password
+            else:
+                # Use encrypted file storage
+                password = self._load_encrypted(username)
+                if password:
+                    logging.info(f"Password retrieved from encrypted storage for {username}")
+                return password
+        except Exception as e:
+            logging.error(f"Failed to retrieve password: {e}")
+            # Try fallback
+            try:
+                return self._load_encrypted(username)
+            except:
+                return None
+
+    def delete_password(self, username):
+        """Delete stored password"""
+        if not username:
+            return
+
+        try:
+            if self.backend == "keyring":
+                import keyring
+                keyring.delete_password(self.service_name, username)
+            else:
+                self._delete_encrypted(username)
+            logging.info(f"Password deleted for {username}")
+        except Exception as e:
+            logging.warning(f"Error deleting password: {e}")
+
+    # ========================================================================
+    # ENCRYPTED FILE STORAGE (Fallback for all platforms)
+    # ========================================================================
+
+    def _get_machine_key(self):
+        """Generate a machine-specific encryption key"""
+        # Use multiple machine-specific attributes for the key
+        machine_id = f"{platform.node()}_{platform.machine()}_{platform.system()}"
+
+        # Derive a key from machine ID using PBKDF2
+        salt = b'Syncra_v2_machine_salt_2025'  # Static salt for this app version
+        key = hashlib.pbkdf2_hmac('sha256', machine_id.encode(), salt, 100000)
+        return key[:32]  # 256-bit key for AES-256
+
+    def _get_credentials_file(self):
+        """Get path to encrypted credentials file"""
+        config_dir = os.path.dirname(os.path.abspath(CONFIG_FILE))
+        return os.path.join(config_dir, ".credentials.enc")
+
+    def _save_encrypted(self, username, password):
+        """Save password to encrypted file using AES-256"""
+        try:
+            from cryptography.fernet import Fernet
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+
+            # Generate encryption key from machine ID
+            machine_key = self._get_machine_key()
+            fernet = Fernet(base64.urlsafe_b64encode(machine_key))
+
+            # Encrypt password
+            encrypted_password = fernet.encrypt(password.encode()).decode()
+
+            # Load existing credentials
+            credentials_file = self._get_credentials_file()
+            credentials = {}
+            if os.path.exists(credentials_file):
+                try:
+                    with open(credentials_file, 'r') as f:
+                        credentials = json.load(f)
+                except:
+                    pass
+
+            # Store encrypted password
+            credentials[username] = encrypted_password
+
+            # Save to file with restricted permissions
+            with open(credentials_file, 'w') as f:
+                json.dump(credentials, f)
+
+            # Set file permissions (read/write for owner only)
+            if self.platform != "Windows":
+                os.chmod(credentials_file, 0o600)
+
+        except ImportError:
+            # Cryptography not available, use base64 as last resort
+            logging.warning("Cryptography library not available, using base64 encoding")
+            credentials_file = self._get_credentials_file()
+            credentials = {}
+            if os.path.exists(credentials_file):
+                try:
+                    with open(credentials_file, 'r') as f:
+                        credentials = json.load(f)
+                except:
+                    pass
+
+            credentials[username] = base64.b64encode(password.encode()).decode()
+
+            with open(credentials_file, 'w') as f:
+                json.dump(credentials, f)
+
+    def _load_encrypted(self, username):
+        """Load password from encrypted file"""
+        credentials_file = self._get_credentials_file()
+
+        if not os.path.exists(credentials_file):
+            return None
+
+        try:
+            with open(credentials_file, 'r') as f:
+                credentials = json.load(f)
+
+            encrypted_password = credentials.get(username)
+            if not encrypted_password:
+                return None
+
+            try:
+                from cryptography.fernet import Fernet
+
+                # Generate decryption key from machine ID
+                machine_key = self._get_machine_key()
+                fernet = Fernet(base64.urlsafe_b64encode(machine_key))
+
+                # Decrypt password
+                password = fernet.decrypt(encrypted_password.encode()).decode()
+                return password
+
+            except ImportError:
+                # Cryptography not available, assume base64
+                logging.warning("Cryptography library not available, using base64 decoding")
+                return base64.b64decode(encrypted_password.encode()).decode()
+
+        except Exception as e:
+            logging.error(f"Error loading encrypted password: {e}")
+            return None
+
+    def _delete_encrypted(self, username):
+        """Delete password from encrypted file"""
+        credentials_file = self._get_credentials_file()
+
+        if not os.path.exists(credentials_file):
+            return
+
+        try:
+            with open(credentials_file, 'r') as f:
+                credentials = json.load(f)
+
+            if username in credentials:
+                del credentials[username]
+
+                with open(credentials_file, 'w') as f:
+                    json.dump(credentials, f)
+        except Exception as e:
+            logging.error(f"Error deleting encrypted password: {e}")
+
+
+# Initialize global credential manager
+credential_manager = SecureCredentialManager()
 SYNC_CONFIG_FILE = "sync_config.json"
 CACHE_FILE = "playlist_cache.json"
 SPOTIFY_LOGGED_IN = False
@@ -5019,6 +5253,192 @@ class LibraryDuplicateManagerDialog(QDialog):
         self.accept()  # Close dialog
 
 
+class UserSelectionDialog(QDialog):
+    """Dialog for selecting a Plex user from available accounts"""
+
+    def __init__(self, account, parent=None):
+        super().__init__(parent)
+        self.account = account
+        self.selected_user = None
+        self.selected_user_token = None
+        self.selected_account = None  # Will hold the switched account for home users
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle("🎭 Select Plex User")
+        self.setMinimumWidth(550)
+        self.setMinimumHeight(450)
+
+        # Apply dark theme
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1a1a1a;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #0D47A1;
+            }
+            QListWidget {
+                background-color: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                border-radius: 5px;
+                padding: 5px;
+                color: #ffffff;
+            }
+            QListWidget::item {
+                padding: 15px;
+                border-radius: 5px;
+                margin: 3px 0;
+            }
+            QListWidget::item:hover {
+                background-color: #3a3a3a;
+            }
+            QListWidget::item:selected {
+                background-color: #2196F3;
+                color: white;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+
+        # Header
+        header = QLabel("👥 Select a User Account")
+        header.setStyleSheet("""
+            font-size: 20px;
+            font-weight: bold;
+            color: #2196F3;
+            padding: 10px;
+        """)
+        layout.addWidget(header)
+
+        # Info text
+        info = QLabel("Choose which user account to manage playlists for:")
+        info.setStyleSheet("color: #aaaaaa; padding: 5px;")
+        layout.addWidget(info)
+
+        # User list
+        self.user_list = QListWidget()
+        self.user_list.itemDoubleClicked.connect(self.on_user_selected)
+        layout.addWidget(self.user_list)
+
+        # Populate users
+        self.populate_users()
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        select_btn = QPushButton("✓ Select User")
+        select_btn.clicked.connect(self.on_user_selected)
+        button_layout.addWidget(select_btn)
+
+        cancel_btn = QPushButton("✗ Cancel")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666666;
+            }
+            QPushButton:hover {
+                background-color: #555555;
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+
+        layout.addLayout(button_layout)
+
+    def populate_users(self):
+        """Populate the user list with available Plex users"""
+        try:
+            # Get main account user
+            main_user_item = QListWidgetItem(f"👤 {self.account.username} (Administrator)")
+            main_user_item.setData(Qt.UserRole, {'user': None, 'is_admin': True, 'username': self.account.username})
+            main_user_item.setToolTip("Administrator account with full access")
+            self.user_list.addItem(main_user_item)
+
+            # Get managed/home users
+            try:
+                users = self.account.users()
+                for user in users:
+                    # Determine user type icon
+                    if hasattr(user, 'home') and user.home:
+                        icon = "🏠"  # Home user
+                        user_type = "Home User"
+                    elif hasattr(user, 'friend') and user.friend:
+                        icon = "👥"  # Friend
+                        user_type = "Friend"
+                    else:
+                        icon = "👤"  # Regular user
+                        user_type = "User"
+
+                    # Get user info
+                    username = user.title if hasattr(user, 'title') else str(user)
+
+                    user_item = QListWidgetItem(f"{icon} {username} ({user_type})")
+                    user_item.setData(Qt.UserRole, {'user': user, 'is_admin': False, 'username': username})
+                    user_item.setToolTip(f"{user_type}: {username}")
+                    self.user_list.addItem(user_item)
+
+            except Exception as user_error:
+                logging.warning(f"Could not load managed users: {user_error}")
+
+            # Select first item by default
+            if self.user_list.count() > 0:
+                self.user_list.setCurrentRow(0)
+
+        except Exception as e:
+            logging.error(f"Error populating users: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to load users: {str(e)}")
+
+    def on_user_selected(self):
+        """Handle user selection"""
+        current_item = self.user_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "No Selection", "Please select a user")
+            return
+
+        user_data = current_item.data(Qt.UserRole)
+        self.selected_user = user_data['user']
+        self.selected_user_name = user_data['username']
+        self.is_admin = user_data['is_admin']
+
+        # Get user-specific token/account if not admin
+        if not self.is_admin and self.selected_user:
+            try:
+                # For home users, switch to their account context
+                # This returns a new MyPlexAccount instance for the home user
+                self.selected_account = self.account.switchHomeUser(self.selected_user)
+                self.selected_user_token = self.selected_account.authenticationToken
+                logging.info(f"Switched to home user: {self.selected_user_name}")
+            except Exception as e:
+                logging.error(f"Could not switch to home user: {e}")
+                QMessageBox.critical(self, "Switch Error",
+                    f"Failed to switch to user '{self.selected_user_name}'.\n\n"
+                    f"This user may require a PIN or may not have proper permissions.\n\n"
+                    f"Error: {str(e)}")
+                return
+        else:
+            # Use main account for admin
+            self.selected_account = self.account
+            self.selected_user_token = self.account.authenticationToken
+
+        self.accept()
+
+
 class PlexPlaylistManager(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5042,6 +5462,13 @@ class PlexPlaylistManager(QMainWindow):
         self.scheduled_sync_timer.start(60000)  # Check every minute
         self.path_mappings = []  # Store user-defined path mappings
         self.plex_library_paths = []  # Cache Plex library root paths
+
+        # User management
+        self.current_user = None  # Currently selected user
+        self.current_user_name = "Administrator"  # Display name of current user
+        self.is_admin = True  # Whether current user is administrator
+        self.plex_account = None  # MyPlexAccount instance for user management
+
         self.initUI()
         self.load_config()
         self.setStyleSheet(self.get_stylesheet())
@@ -6217,9 +6644,30 @@ class PlexPlaylistManager(QMainWindow):
 
         layout.addLayout(form_layout)
 
-        connect_button = ModernButton('Connect to Plex')
+        # Button layout
+        button_layout = QHBoxLayout()
+
+        connect_button = ModernButton('🔌 Connect to Plex')
         connect_button.clicked.connect(self.connect_to_plex)
-        layout.addWidget(connect_button)
+        button_layout.addWidget(connect_button)
+
+        self.switch_user_button = ModernButton('👥 Switch User')
+        self.switch_user_button.clicked.connect(self.switch_user)
+        self.switch_user_button.setToolTip("Switch between Plex users")
+        button_layout.addWidget(self.switch_user_button)
+
+        layout.addLayout(button_layout)
+
+        # Current user label
+        self.current_user_label = QLabel("Not connected")
+        self.current_user_label.setStyleSheet("""
+            color: #aaaaaa;
+            font-style: italic;
+            padding: 10px;
+            font-size: 12px;
+        """)
+        self.current_user_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.current_user_label)
 
         layout.addStretch()
         self.content_stack.addWidget(page)
@@ -7899,38 +8347,246 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 self.cache_info_label.setText("💡 Cache cleared. Track counts will load on-demand.")
 
     def connect_to_plex(self):
-        
+
         self.section_combo.clear()
         self.section_combo.addItem("Library Section")
         self.section_combo.setCurrentIndex(0)
-        
+
         try:
             username = self.plex_username_input.text()
             password = self.plex_password_input.text()
             server_ip = self.server_ip_input.text()
             server_port = self.server_port_input.text()
             token = self.token_input.text()
-        
+
             base_url = f"http://{server_ip}:{server_port}"
-        
+
             if token:
                 # Use the provided token to connect directly
+                # Still create account for user management if credentials provided
+                if username and password:
+                    self.plex_account = MyPlexAccount(username, password)
                 self.plex_server = PlexServer(base_url, token)
             else:
                 # Authenticate with username and password to get the token
                 account = MyPlexAccount(username, password)
+                self.plex_account = account
                 token = account.authenticationToken
                 self.token_input.setText(token)
                 self.plex_server = PlexServer(base_url, token)
-        
+
+            # Auto-select saved user during auto-connect
+            auto_select_user = getattr(self, '_auto_select_user', None)
+            if auto_select_user and self.plex_account:
+                self._auto_select_user = None  # Reset flag
+                logging.info(f"Auto-reconnecting as saved user: {auto_select_user}")
+
+                # Find and switch to the saved user
+                if auto_select_user == self.plex_account.username:
+                    # Admin user - already connected
+                    self.current_user_name = auto_select_user
+                    self.is_admin = True
+                    self.update_window_title()
+                else:
+                    # Home user - need to switch
+                    try:
+                        target_user = None
+                        for user in self.plex_account.users():
+                            user_name = user.title if hasattr(user, 'title') else str(user)
+                            if user_name == auto_select_user:
+                                target_user = user
+                                break
+
+                        if target_user:
+                            # Switch to home user
+                            switched_account = self.plex_account.switchHomeUser(target_user)
+
+                            # Connect via resource
+                            found_server = False
+                            for resource in switched_account.resources():
+                                if resource.provides == 'server':
+                                    self.plex_server = resource.connect()
+                                    found_server = True
+                                    logging.info(f"Auto-reconnected to server as '{auto_select_user}' via resource")
+                                    break
+
+                            if not found_server:
+                                raise Exception("Could not find server resource for home user")
+
+                            self.current_user_name = auto_select_user
+                            self.is_admin = False
+                            self.update_window_title()
+                        else:
+                            logging.warning(f"Saved user '{auto_select_user}' not found, using admin")
+                            self.current_user_name = self.plex_account.username
+                            self.is_admin = True
+                            self.update_window_title()
+
+                    except Exception as switch_error:
+                        logging.error(f"Failed to auto-switch to home user: {switch_error}")
+                        QMessageBox.warning(self, "Auto-Login Failed",
+                            f"Could not auto-login as '{auto_select_user}'.\n"
+                            f"Logged in as administrator instead.\n\n"
+                            f"Error: {str(switch_error)}")
+                        self.current_user_name = self.plex_account.username
+                        self.is_admin = True
+                        self.update_window_title()
+
+            elif self.plex_account:
+                user_dialog = UserSelectionDialog(self.plex_account, self)
+                if user_dialog.exec_() == QDialog.Accepted:
+                    self.current_user = user_dialog.selected_user
+                    self.current_user_name = user_dialog.selected_user_name
+                    self.is_admin = user_dialog.is_admin
+
+                    # If a home user was selected, use their switched account
+                    if not self.is_admin and user_dialog.selected_account:
+                        try:
+                            # Use the switched account to connect to the server
+                            # Find the server resource matching our server IP
+                            found_server = False
+                            for resource in user_dialog.selected_account.resources():
+                                if resource.provides == 'server':
+                                    # Connect to this server with the home user's credentials
+                                    self.plex_server = resource.connect()
+                                    self.token_input.setText(user_dialog.selected_user_token)
+                                    found_server = True
+                                    logging.info(f"Connected to server via home user resource: {resource.name}")
+                                    break
+
+                            if not found_server:
+                                # Fallback: try direct connection with user token
+                                self.plex_server = PlexServer(base_url, user_dialog.selected_user_token)
+                                self.token_input.setText(user_dialog.selected_user_token)
+                                logging.info(f"Connected to server with home user token (fallback)")
+
+                        except Exception as user_error:
+                            logging.error(f"Failed to connect as home user: {user_error}")
+                            QMessageBox.critical(self, "Connection Error",
+                                f"Failed to connect as '{self.current_user_name}'.\n\n"
+                                f"Error: {str(user_error)}")
+                            return
+                    else:
+                        # Admin user - already connected above
+                        pass
+
+                    # Update window title to show current user
+                    self.update_window_title()
+
+                    logging.info(f"Logged in as: {self.current_user_name}")
+                else:
+                    # User cancelled - default to admin
+                    self.current_user = None
+                    self.current_user_name = self.plex_account.username
+                    self.is_admin = True
+
             self.populate_library_sections()
             self.populate_sync_playlist_combo()
-            self.statusBar().showMessage("Successfully connected to Plex.")
+            self.statusBar().showMessage(f"Successfully connected to Plex as {self.current_user_name}")
             self.save_config()
         except Exception as e:
             logging.error(f"Error connecting to Plex: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Connection Error", f"Error connecting to Plex: {str(e)}")
-            
+
+    def update_window_title(self):
+        """Update window title and user label to show current user"""
+        base_title = 'Syncra - Playlist Manager'
+        if self.current_user_name:
+            if self.is_admin:
+                self.setWindowTitle(f"{base_title} - 👤 {self.current_user_name} (Administrator)")
+                user_status = f"✅ Connected as: {self.current_user_name} (Administrator)"
+            else:
+                self.setWindowTitle(f"{base_title} - 👤 {self.current_user_name}")
+                user_status = f"✅ Connected as: {self.current_user_name}"
+
+            # Update label if it exists
+            if hasattr(self, 'current_user_label'):
+                self.current_user_label.setText(user_status)
+                self.current_user_label.setStyleSheet("""
+                    color: #4CAF50;
+                    font-weight: bold;
+                    padding: 10px;
+                    font-size: 12px;
+                """)
+        else:
+            self.setWindowTitle(base_title)
+            if hasattr(self, 'current_user_label'):
+                self.current_user_label.setText("Not connected")
+                self.current_user_label.setStyleSheet("""
+                    color: #aaaaaa;
+                    font-style: italic;
+                    padding: 10px;
+                    font-size: 12px;
+                """)
+
+    def switch_user(self):
+        """Show user selection dialog to switch active user"""
+        # If we don't have plex_account, try to recreate it from saved credentials
+        if not self.plex_account:
+            username = self.plex_username_input.text()
+            password = self.plex_password_input.text()
+
+            if not username or not password:
+                QMessageBox.warning(self, "Authentication Required",
+                    "Please enter your Plex username and password to switch users.\n\n"
+                    "Your credentials are needed to access home user accounts.")
+                return
+
+            try:
+                # Recreate the account for user switching
+                self.plex_account = MyPlexAccount(username, password)
+                logging.info("Recreated Plex account for user switching")
+            except Exception as auth_error:
+                QMessageBox.critical(self, "Authentication Failed",
+                    f"Failed to authenticate with Plex:\n{str(auth_error)}\n\n"
+                    f"Please check your credentials in the Connection tab.")
+                return
+
+        user_dialog = UserSelectionDialog(self.plex_account, self)
+        if user_dialog.exec_() == QDialog.Accepted:
+            self.current_user = user_dialog.selected_user
+            self.current_user_name = user_dialog.selected_user_name
+            self.is_admin = user_dialog.is_admin
+
+            # Reconnect with new user's credentials
+            try:
+                server_ip = self.server_ip_input.text()
+                server_port = self.server_port_input.text()
+                base_url = f"http://{server_ip}:{server_port}"
+
+                # If a home user was selected, use their switched account
+                if not self.is_admin and user_dialog.selected_account:
+                    # Use the switched account to connect to the server
+                    found_server = False
+                    for resource in user_dialog.selected_account.resources():
+                        if resource.provides == 'server':
+                            self.plex_server = resource.connect()
+                            self.token_input.setText(user_dialog.selected_user_token)
+                            found_server = True
+                            logging.info(f"Switched to server via home user resource: {resource.name}")
+                            break
+
+                    if not found_server:
+                        # Fallback: try direct connection with user token
+                        self.plex_server = PlexServer(base_url, user_dialog.selected_user_token)
+                        self.token_input.setText(user_dialog.selected_user_token)
+                        logging.info(f"Switched with home user token (fallback)")
+                else:
+                    # Admin user - use admin token
+                    self.plex_server = PlexServer(base_url, user_dialog.selected_user_token)
+                    self.token_input.setText(user_dialog.selected_user_token)
+
+                # Update UI
+                self.update_window_title()
+                self.fetch_playlists()  # Refresh playlists for new user
+                self.statusBar().showMessage(f"Switched to user: {self.current_user_name}")
+                self.save_config()
+
+                logging.info(f"Switched to user: {self.current_user_name}")
+            except Exception as e:
+                logging.error(f"Error switching user: {str(e)}")
+                QMessageBox.critical(self, "Switch Error", f"Failed to switch user: {str(e)}")
+
     def populate_library_sections(self):
         try:
             self.section_combo.clear()
@@ -9151,197 +9807,6 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         QMessageBox.critical(self, "Import Error", error_message)
 
     def _prompt_track_selection(self, original_title, original_artist, candidates, current_index, total_tracks):
-        """Show dialog for user to manually select the correct track from candidates (modified to return track directly)"""
-        # Remove old massive block of code and replace with simpler version
-        for i, track_info in enumerate(track_infos):
-                try:
-                    # Use Plex search API with improved matching
-                    title = track_info['title']
-                    artist = track_info['artist']
-
-                    # Try multiple search strategies
-                    search_results = library_section.searchTracks(title=title, limit=50)
-
-                    # Strategy 1: Direct title search
-                    if not search_results and title:
-                        # Strategy 2: Remove underscores and special characters
-                        cleaned_title = title.replace('_', ' ').replace('?', '').strip()
-                        if cleaned_title != title:
-                            search_results = library_section.searchTracks(title=cleaned_title, limit=50)
-                            logging.info(f"Trying cleaned title: {cleaned_title}")
-
-                    # Strategy 3: Search by artist if title search fails
-                    if not search_results and artist:
-                        try:
-                            artist_results = library_section.searchTracks(artist=artist, limit=100)
-                            # Filter by title similarity
-                            search_results = []
-                            for track in artist_results:
-                                if any(word.lower() in track.title.lower() for word in title.split() if len(word) > 3):
-                                    search_results.append(track)
-                            if search_results:
-                                logging.info(f"Found via artist search: {len(search_results)} candidates")
-                        except:
-                            pass
-
-                    # Strategy 4: Broad search with just first word of title
-                    if not search_results and title:
-                        first_word = title.split()[0] if ' ' in title else title
-                        if len(first_word) > 3:
-                            broad_results = library_section.searchTracks(title=first_word, limit=50)
-                            # Filter by artist if available
-                            if artist:
-                                search_results = [t for t in broad_results if artist.lower() in (
-                                    t.originalTitle or t.grandparentTitle if hasattr(t, 'grandparentTitle') else ''
-                                ).lower()]
-                            else:
-                                search_results = broad_results
-                            if search_results:
-                                logging.info(f"Found via broad search: {len(search_results)} candidates")
-
-                    if search_results:
-                        # Score and rank matches
-                        scored_matches = []
-
-                        for track in search_results:
-                            try:
-                                track_artist = track.originalTitle or (track.grandparentTitle if hasattr(track, 'grandparentTitle') else '')
-                                if not track_artist and hasattr(track, 'artist'):
-                                    track_artist_obj = track.artist()
-                                    if track_artist_obj:
-                                        track_artist = track_artist_obj.title
-
-                                # Calculate match score (0-100)
-                                score = 0
-
-                                # Title match (40 points max)
-                                title_lower = title.lower()
-                                track_title_lower = track.title.lower()
-                                if track_title_lower == title_lower:
-                                    score += 40  # Exact match
-                                elif title_lower in track_title_lower or track_title_lower in title_lower:
-                                    score += 30  # Partial match
-                                elif any(word in track_title_lower for word in title_lower.split() if len(word) > 3):
-                                    score += 20  # Word match
-
-                                # Artist match (60 points max)
-                                if artist and track_artist:
-                                    artist_lower = artist.lower()
-                                    track_artist_lower = track_artist.lower()
-                                    if track_artist_lower == artist_lower:
-                                        score += 60  # Exact match
-                                    elif artist_lower in track_artist_lower or track_artist_lower in artist_lower:
-                                        score += 50  # Partial match
-                                    elif any(word in track_artist_lower for word in artist_lower.split() if len(word) > 3):
-                                        score += 30  # Word match
-
-                                scored_matches.append((track, score, track_artist))
-
-                            except Exception as score_error:
-                                logging.debug(f"Error scoring track: {score_error}")
-                                continue
-
-                        # Sort by score (highest first)
-                        scored_matches.sort(key=lambda x: x[1], reverse=True)
-
-                        if scored_matches:
-                            best_match, best_score, best_artist = scored_matches[0]
-
-                            # High confidence match (score >= 80)
-                            if best_score >= 80:
-                                matched_tracks.append(best_match)
-                                logging.info(f"✓ High confidence match ({best_score}): {best_match.title} by {best_artist}")
-
-                            # Medium confidence (50-79) - prompt user (unless auto-skip enabled)
-                            elif best_score >= 50:
-                                if self._auto_skip_uncertain:
-                                    # Auto-skip enabled, don't prompt
-                                    not_found.append(f"{title} - {artist}" if artist else title)
-                                    logging.info(f"⏭️ Auto-skipped (medium confidence {best_score}): {title}")
-                                else:
-                                    # Show user selection dialog
-                                    user_choice = self._prompt_track_selection(
-                                        original_title=title,
-                                        original_artist=artist,
-                                        candidates=scored_matches[:5],  # Top 5 matches
-                                        current_index=i + 1,
-                                        total_tracks=len(track_infos)
-                                    )
-
-                                    if user_choice:
-                                        matched_tracks.append(user_choice)
-                                        logging.info(f"✓ User selected: {user_choice.title}")
-                                    else:
-                                        not_found.append(f"{title} - {artist}" if artist else title)
-                                        logging.info(f"✗ User skipped: {title}")
-
-                            # Low confidence (< 50) - prompt user or skip
-                            else:
-                                if self._auto_skip_uncertain:
-                                    # Auto-skip enabled, don't prompt
-                                    not_found.append(f"{title} - {artist}" if artist else title)
-                                    logging.info(f"⏭️ Auto-skipped (low confidence {best_score}): {title}")
-                                else:
-                                    user_choice = self._prompt_track_selection(
-                                        original_title=title,
-                                        original_artist=artist,
-                                        candidates=scored_matches[:5],
-                                        current_index=i + 1,
-                                        total_tracks=len(track_infos)
-                                    )
-
-                                    if user_choice:
-                                        matched_tracks.append(user_choice)
-                                        logging.info(f"✓ User selected: {user_choice.title}")
-                                    else:
-                                        not_found.append(f"{title} - {artist}" if artist else title)
-                                        logging.info(f"✗ User skipped: {title}")
-                        else:
-                            not_found.append(f"{title} - {artist}" if artist else title)
-                            logging.warning(f"Not found: {title} by {artist}")
-                    else:
-                        not_found.append(f"{title} - {artist}" if artist else title)
-                        logging.warning(f"Not found: {title} by {artist}")
-
-                    # Update progress
-                    if (i + 1) % 10 == 0 or i == len(track_infos) - 1:
-                        self.statusBar().showMessage(f"Finding tracks... ({i+1}/{len(track_infos)})")
-
-                except Exception as track_error:
-                    logging.error(f"Error finding track {track_info}: {track_error}")
-                    not_found.append(f"{track_info.get('title', 'Unknown')} - {track_info.get('artist', '')}")
-
-            # Create playlist
-            if matched_tracks:
-                self.statusBar().showMessage(f"Creating playlist with {len(matched_tracks)} tracks...")
-                new_playlist = self.plex_server.createPlaylist(playlist_name, items=matched_tracks)
-                logging.info(f"Created playlist '{playlist_name}' with {len(matched_tracks)} tracks")
-
-                # Show success message
-                success_msg = f"✅ Successfully imported '{playlist_name}' using smart matching!\n\n"
-                success_msg += f"📊 Found: {len(matched_tracks)}/{len(track_infos)} tracks"
-
-                if not_found:
-                    success_msg += f"\n\n⚠️ Could not find {len(not_found)} tracks:\n"
-                    success_msg += "\n".join(not_found[:10])  # Show first 10
-                    if len(not_found) > 10:
-                        success_msg += f"\n...and {len(not_found) - 10} more"
-
-                QMessageBox.information(self, "Import Complete", success_msg)
-                self.statusBar().showMessage(f"'{playlist_name}' imported successfully ({len(matched_tracks)} tracks)")
-
-                # Refresh playlist list
-                self.fetch_playlists()
-            else:
-                raise Exception("No tracks could be matched in your Plex library")
-
-        except Exception as e:
-            error_message = f"Failed to import {os.path.basename(m3u_path)} using smart matching. Error: {str(e)}"
-            self.statusBar().showMessage(error_message)
-            QMessageBox.critical(self, "Import Error", error_message)
-            logging.error(f"Smart M3U upload failed: {str(e)}")
-
-    def _prompt_track_selection(self, original_title, original_artist, candidates, current_index, total_tracks):
         """Show dialog for user to manually select the correct track from candidates
 
         Args:
@@ -10045,7 +10510,28 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self.load_spotify_config()
             return
 
-        self.plex_username_input.setText(config.get('plex_username', ''))
+        username = config.get('plex_username', '')
+        self.plex_username_input.setText(username)
+
+        # Load password from secure credential storage
+        if username:
+            password = credential_manager.get_password(username)
+            if password:
+                self.plex_password_input.setText(password)
+                logging.info("Password loaded from secure credential storage")
+            else:
+                # Migration: Check for old base64-encoded password in config
+                encoded_password = config.get('plex_password_encoded', '')
+                if encoded_password:
+                    try:
+                        decoded_password = base64.b64decode(encoded_password.encode()).decode()
+                        self.plex_password_input.setText(decoded_password)
+                        # Migrate to secure storage
+                        credential_manager.save_password(username, decoded_password)
+                        logging.info("Migrated password from config file to secure storage")
+                    except Exception as decode_error:
+                        logging.error(f"Error decoding old password: {decode_error}")
+
         self.server_ip_input.setText(config.get('server_ip', ''))
         port_value = config.get('server_port', '')
         if port_value is None:
@@ -10054,6 +10540,10 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         token_value = config.get('token', '') or ''
         self.token_input.setText(token_value)
+
+        # Load saved user selection
+        self._saved_user_name = config.get('selected_user_name', None)
+        self._saved_is_admin = config.get('is_admin', True)
 
         self.last_section_id = config.get('last_section') or None
 
@@ -10075,11 +10565,12 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         # Load sync configurations
         self.load_sync_config()
 
+        # Auto-connect if we have a saved token
         if token_value and self.server_ip_input.text() and self.server_port_input.text():
-            logging.info('Auto-connecting to Plex using saved token.')
+            logging.info(f'Auto-connecting to Plex as saved user: {self._saved_user_name}')
+            # Set flag to auto-select saved user during auto-connect
+            self._auto_select_user = self._saved_user_name
             QTimer.singleShot(0, self.connect_to_plex)
-
-
 
     def save_config(self):
         """Save configuration while preserving existing settings"""
@@ -10094,11 +10585,24 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             config = existing_config.copy()  # Start with existing config
             
             # Update Plex settings
+            # Save password securely using platform-specific credential storage
+            admin_token = self.plex_account.authenticationToken if self.plex_account else self.token_input.text()
+            username = self.plex_username_input.text()
+            password = self.plex_password_input.text()
+
+            # Save password to secure storage (Windows Credential Manager, macOS Keychain, etc.)
+            if username and password:
+                credential_manager.save_password(username, password)
+                logging.info("Password saved to secure credential storage")
+
             config.update({
-                "plex_username": self.plex_username_input.text(),
+                "plex_username": username,
+                # Password NOT stored in config file - stored in secure OS keyring/encrypted file
                 "server_ip": self.server_ip_input.text(),
                 "server_port": self.server_port_input.text(),
-                "token": self.token_input.text(),
+                "token": admin_token,  # Save the ADMIN token for auto-reconnect
+                "selected_user_name": self.current_user_name,  # Save which user was selected
+                "is_admin": self.is_admin,  # Save if it's admin or home user
                 "last_section": self.section_combo.currentData(),
                 "path_mappings": self.path_mappings,
                 "m3u_use_smart_matching": self.m3u_smart_matching_radio.isChecked()
