@@ -1,0 +1,135 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Triggers on version tags like v2.14.0
+
+jobs:
+  build-and-release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            ext: .exe
+            archive: zip
+          - os: ubuntu-latest
+            name: Linux
+            ext: ""
+            archive: tar.gz
+          - os: macos-latest
+            name: macOS
+            ext: ""
+            archive: tar.gz
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install system dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtsvg xvfb
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install PyQt5 plexapi requests spotipy fuzzywuzzy python-levenshtein pyotp deezer-python Pillow
+
+    - name: Build executable (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        pyinstaller --onefile --windowed --name="Syncra" --icon="Syncra Icon.ico" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+
+    - name: Build executable (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        xvfb-run -a pyinstaller --onefile --windowed --name="Syncra" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+
+    - name: Build executable (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        pyinstaller --onefile --windowed --name="Syncra" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+
+    - name: Create archive (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        cd dist
+        7z a Syncra-${{ matrix.name }}.zip Syncra.exe
+        cd ..
+
+    - name: Create archive (Linux/macOS)
+      if: matrix.os != 'windows-latest'
+      run: |
+        cd dist
+        tar -czf Syncra-${{ matrix.name }}.tar.gz Syncra
+        cd ..
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Syncra-${{ matrix.name }}
+        path: dist/Syncra-${{ matrix.name }}.*
+        retention-days: 7
+
+  create-release:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: release-artifacts
+
+    - name: Display structure of downloaded files
+      run: ls -R release-artifacts
+
+    - name: Extract version from tag
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Read changelog
+      id: changelog
+      run: |
+        # Extract changelog for this version
+        VERSION="${{ steps.get_version.outputs.VERSION }}"
+        # Read CHANGELOG.md and extract the section for this version
+        awk "/^## ${VERSION}/,/^## /" CHANGELOG.md | sed '$d' > release_notes.md
+
+        # If no specific version found, use a default message
+        if [ ! -s release_notes.md ]; then
+          echo "Release ${VERSION}" > release_notes.md
+          echo "" >> release_notes.md
+          echo "See [CHANGELOG.md](CHANGELOG.md) for details." >> release_notes.md
+        fi
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get_version.outputs.VERSION }}
+        name: ${{ steps.get_version.outputs.VERSION }}
+        body_path: release_notes.md
+        draft: false
+        prerelease: false
+        files: |
+          release-artifacts/Syncra-Windows/Syncra-Windows.zip
+          release-artifacts/Syncra-Linux/Syncra-Linux.tar.gz
+          release-artifacts/Syncra-macOS/Syncra-macOS.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
