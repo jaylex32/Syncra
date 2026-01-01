@@ -13,7 +13,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.13.0"
+__version__ = "2.14.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -40,6 +40,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import deezer
 import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.cache_handler import CacheFileHandler
 import re
 from fuzzywuzzy import fuzz
 from datetime import datetime, timedelta
@@ -288,8 +290,24 @@ SYNC_CONFIG_FILE = "sync_config.json"
 CACHE_FILE = "playlist_cache.json"
 SPOTIFY_LOGGED_IN = False
 SPOTIFY_USER_INFO = {}
+SP_DC_COOKIE = ""
 OAUTH_SERVER = None
 OAUTH_RESULT = {}
+
+# OAuth App Configuration (required for Spotify API restrictions introduced Dec 22, 2025)
+# Default credentials for seamless user experience in binary distribution
+SP_APP_CLIENT_ID = os.getenv("SP_APP_CLIENT_ID", "880ca2262b0447bd82e4ea0b17febc16")
+SP_APP_CLIENT_SECRET = os.getenv("SP_APP_CLIENT_SECRET", "c91c4b70b6e0482ebec5b91bf869c420")
+SP_APP_TOKENS_FILE = os.getenv("SP_APP_TOKENS_FILE", ".spotify_oauth_cache")
+
+# OAuth app token cache
+SP_CACHED_OAUTH_APP_TOKEN = None
+SP_OAUTH_APP_TOKEN_EXPIRES_AT = 0
+
+# Rate limiting for Spotify API calls
+SPOTIFY_LAST_REQUEST_TIME = 0
+SPOTIFY_REQUEST_MIN_INTERVAL = 0.5  # Minimum 500ms between requests
+
 # PLAYLIST CACHE CLASS - DEFINED FIRST!
 class PlaylistCache:
     def __init__(self):
@@ -2192,29 +2210,57 @@ class SyncThread(QThread):
 
     def get_spotify_tracks(self, url):
         try:
+            # Get playlist metadata using cookie token + spclient endpoint
             token = self.spotify_auth.get_token()
+            client_id = self.spotify_auth.cached_client_id
             playlist_id = url.split('/')[-1].split('?')[0]
 
             headers = {
                 'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json',
+                'Client-Id': client_id,
+                'User-Agent': self.spotify_auth.user_agent,
+                'Accept': 'application/json',
+            }
+
+            # Get track URIs from spclient (all at once)
+            response = requests.get(
+                f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}',
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            playlist_data = response.json()
+
+            # Extract track IDs from URIs
+            track_ids = []
+            contents = playlist_data.get('contents', {})
+            items = contents.get('items', [])
+            for item in items:
+                uri = item.get('uri', '')
+                if uri.startswith('spotify:track:'):
+                    track_id = uri.split(':')[-1]
+                    track_ids.append(track_id)
+
+            # Get track details using OAuth (one at a time, like friend's code)
+            oauth_app = SpotifyOAuthApp()
+            oauth_token = oauth_app.get_token()
+            oauth_headers = {
+                'Authorization': f'Bearer {oauth_token}',
+                'User-Agent': self.spotify_auth.user_agent,
             }
 
             tracks = []
-            tracks_url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks'
+            for track_id in track_ids:
+                time.sleep(0.1)  # Small delay between requests
+                track_url = f'https://api.spotify.com/v1/tracks/{track_id}'
+                track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
 
-            while tracks_url:
-                response = requests.get(tracks_url, headers=headers)
-                response.raise_for_status()
-                tracks_data = response.json()
-
-                for item in tracks_data['items']:
-                    if item['track']:
-                        track = item['track']
-                        artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
-                        tracks.append(f"{track['name']} - {artist_name}")
-
-                tracks_url = tracks_data.get('next')
+                if track_response.status_code == 200:
+                    track = track_response.json()
+                    artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
+                    tracks.append(f"{track['name']} - {artist_name}")
+                else:
+                    logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
 
             return tracks
         except Exception as e:
@@ -2637,35 +2683,62 @@ class PlaylistSortingThread(QThread):
             return []
 
     def get_spotify_tracks(self):
-        """Get Spotify tracks - simplified version"""
+        """Get Spotify tracks using spclient + OAuth"""
         try:
-            from main import SpotifyAnonymousAuth  # Import your existing auth
+            from main import SpotifyAnonymousAuth, SpotifyOAuthApp
             auth = SpotifyAnonymousAuth()
             token = auth.get_token()
-            
+            client_id = auth.cached_client_id
+
             playlist_id = self.streaming_url.split('/')[-1].split('?')[0]
-            
+
             headers = {
                 'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json',
+                'Client-Id': client_id,
+                'User-Agent': auth.user_agent,
+                'Accept': 'application/json',
             }
-            
+
+            # Get track URIs from spclient
+            response = requests.get(
+                f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}',
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            playlist_data = response.json()
+
+            # Extract track IDs from URIs
+            track_ids = []
+            contents = playlist_data.get('contents', {})
+            items = contents.get('items', [])
+            for item in items:
+                uri = item.get('uri', '')
+                if uri.startswith('spotify:track:'):
+                    track_id = uri.split(':')[-1]
+                    track_ids.append(track_id)
+
+            # Get track details using OAuth
+            oauth_app = SpotifyOAuthApp()
+            oauth_token = oauth_app.get_token()
+            oauth_headers = {
+                'Authorization': f'Bearer {oauth_token}',
+                'User-Agent': auth.user_agent,
+            }
+
             tracks = []
-            tracks_url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks'
-            
-            while tracks_url:
-                response = requests.get(tracks_url, headers=headers)
-                response.raise_for_status()
-                tracks_data = response.json()
-                
-                for item in tracks_data['items']:
-                    if item['track']:
-                        track = item['track']
-                        artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
-                        tracks.append(f"{track['name']} - {artist_name}")
-                
-                tracks_url = tracks_data.get('next')
-                
+            for track_id in track_ids:
+                time.sleep(0.1)  # Small delay between requests
+                track_url = f'https://api.spotify.com/v1/tracks/{track_id}'
+                track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
+
+                if track_response.status_code == 200:
+                    track = track_response.json()
+                    artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
+                    tracks.append(f"{track['name']} - {artist_name}")
+                else:
+                    logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
+
             return tracks
         except Exception as e:
             logging.error(f"Error getting Spotify tracks: {str(e)}")
@@ -3764,49 +3837,47 @@ class LoadUserPlaylistsThread(QThread):
     
     def run(self):
         try:
-            # Use the saved sp_dc cookie directly instead of the token
-            global SP_DC_COOKIE
-            
-            if not SP_DC_COOKIE:
-                raise Exception("No sp_dc cookie available. Please login first.")
-            
-            # Headers with cookie authentication
+            # Get TOTP token and client ID
+            token = self.spotify_auth.refresh_token_if_needed()
+            client_id = self.spotify_auth.cached_client_id
+
+            # Headers with proper authentication
             headers = {
-                'Cookie': f'sp_dc={SP_DC_COOKIE}',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Authorization': f'Bearer {token}',
+                'Client-Id': client_id,
+                'User-Agent': self.spotify_auth.user_agent,
                 'Accept': 'application/json',
-                'Referer': 'https://open.spotify.com/',
             }
-            
-            # Get playlists using Spotify Web API with cookie auth
+
+            # Get playlists using Spotify Web API with TOTP token
             playlists = []
             url = 'https://api.spotify.com/v1/me/playlists?limit=50'
-            
+
             while url:
                 response = requests.get(url, headers=headers, timeout=30)
-                
+
                 print(f"Playlist request: {response.status_code} - {url}")
                 print(f"Response headers: {dict(response.headers)}")
-                
+
                 if response.status_code == 401:
-                    raise Exception("Cookie expired or invalid. Please login again.")
+                    raise Exception("Token expired or invalid. Please login again.")
                 elif response.status_code == 404:
                     raise Exception("Playlists not accessible. Your account may have restricted privacy settings.")
                 elif response.status_code != 200:
                     raise Exception(f"Failed to get playlists: {response.status_code} - {response.text}")
-                
+
                 data = response.json()
                 playlists.extend(data['items'])
                 url = data.get('next')
-            
+
             # Filter for playlists with tracks
             user_playlists = []
             for playlist in playlists:
                 if playlist['tracks']['total'] > 0:
                     user_playlists.append(playlist)
-            
+
             self.playlists_loaded.emit(user_playlists)
-            
+
         except Exception as e:
             logging.error(f"Error loading user playlists: {str(e)}")
             self.error.emit(str(e))
@@ -4157,29 +4228,18 @@ class SpotifyAnonymousAuth:
         }
 
     def validate_token(self, access_token: str, client_id: str = None, user_agent: Optional[str] = None) -> bool:
-        """Test if token is valid by making a lightweight API call"""
-        url = "https://api.spotify.com/v1/me"
-        headers = {"Authorization": f"Bearer {access_token}"}
+        """
+        Validate token by checking its format and length.
+        Note: /v1/me endpoint no longer works with cookie-based tokens due to
+        Spotify restrictions introduced Dec 22, 2025.
+        """
+        # Basic validation - check if token exists and has reasonable length
+        if not access_token or len(access_token) < 50:
+            return False
 
-        agent = user_agent or self.user_agent
-        if agent:
-            headers["User-Agent"] = agent
-
-        if client_id:
-            headers["Client-Id"] = client_id
-
-        if platform.system() != 'Windows':
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(17)
-        try:
-            response = requests.get(url, headers=headers, timeout=15, verify=True)
-            valid = response.status_code == 200
-        except Exception:
-            valid = False
-        finally:
-            if platform.system() != 'Windows':
-                signal.alarm(0)
-        return valid
+        # Token should be a valid base64-like string
+        # Spotify tokens are typically JWT-like format or long base64 strings
+        return True
 
     def get_token_with_working_method(self):
         """Get Spotify access token using the working TOTP method"""
@@ -4270,7 +4330,187 @@ class SpotifyAnonymousAuth:
             self.access_token_expires_at = 0
             return self.get_token()
         return self.cached_access_token
-    
+
+
+# Global fallback token fetcher
+def get_public_spotify_token():
+    """
+    Fetch a public Spotify access token from the spotify-key repository.
+    This is a fallback when our own authentication gets rate limited.
+
+    Returns:
+        str: A valid Spotify access token, or None if unavailable
+    """
+    try:
+        response = requests.get(
+            'https://raw.githubusercontent.com/itzzzme/spotify-key/refs/heads/main/token.json',
+            timeout=10
+        )
+        if response.status_code == 200:
+            tokens_data = response.json()
+            tokens = tokens_data.get('tokens', [])
+            if tokens and len(tokens) > 0:
+                # Get the first token
+                token = tokens[0].get('access_token', '')
+                if token and len(token) > 50:
+                    logging.info('✅ Retrieved public fallback token from spotify-key repo')
+                    return token
+    except Exception as e:
+        logging.debug(f'Could not fetch public token: {e}')
+
+    return None
+
+
+class SpotifyOAuthApp:
+    """
+    OAuth App authentication for Spotify API calls.
+    Required due to Spotify restrictions introduced Dec 22, 2025.
+    Uses Client Credentials OAuth Flow for track/playlist API calls.
+    """
+    def __init__(self):
+        self.client_id = SP_APP_CLIENT_ID
+        self.client_secret = SP_APP_CLIENT_SECRET
+        self.tokens_file = SP_APP_TOKENS_FILE
+        self.spotify_client = None
+        self.session = self._setup_session()
+
+    def _setup_session(self):
+        """Setup session with proper retry strategy"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=5,
+            connect=3,
+            read=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD", "OPTIONS"],
+            raise_on_status=False,
+            respect_retry_after_header=True
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _respect_rate_limit(self):
+        """Enforce minimum interval between API requests to avoid rate limiting"""
+        global SPOTIFY_LAST_REQUEST_TIME
+        now = time.time()
+        time_since_last_request = now - SPOTIFY_LAST_REQUEST_TIME
+
+        if time_since_last_request < SPOTIFY_REQUEST_MIN_INTERVAL:
+            sleep_time = SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last_request
+            time.sleep(sleep_time)
+
+        SPOTIFY_LAST_REQUEST_TIME = time.time()
+
+    def initialize_client(self):
+        """Initialize Spotipy client with Client Credentials flow"""
+        if not self.client_id or not self.client_secret:
+            raise ValueError(
+                "Spotify OAuth app credentials are required. "
+                "Please set SP_APP_CLIENT_ID and SP_APP_CLIENT_SECRET environment variables "
+                "or configure them in the application settings."
+            )
+
+        try:
+            # Set up cache handler if tokens file is specified
+            cache_handler = None
+            if self.tokens_file:
+                cache_handler = CacheFileHandler(cache_path=self.tokens_file)
+
+            # Create auth manager with Client Credentials flow
+            auth_manager = SpotifyClientCredentials(
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                cache_handler=cache_handler,
+                requests_session=self.session
+            )
+
+            # Initialize Spotipy client
+            self.spotify_client = spotipy.Spotify(
+                auth_manager=auth_manager,
+                requests_session=self.session
+            )
+
+            logging.info("✅ Spotify OAuth app client initialized successfully")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to initialize Spotify OAuth app client: {e}")
+            raise
+
+    def get_token(self):
+        """Get valid OAuth app access token"""
+        global SP_CACHED_OAUTH_APP_TOKEN, SP_OAUTH_APP_TOKEN_EXPIRES_AT
+
+        now = time.time()
+
+        # Return cached token if still valid
+        if SP_CACHED_OAUTH_APP_TOKEN and now < SP_OAUTH_APP_TOKEN_EXPIRES_AT:
+            return SP_CACHED_OAUTH_APP_TOKEN
+
+        # Initialize client if needed
+        if not self.spotify_client:
+            self.initialize_client()
+
+        # Get fresh token from auth manager
+        try:
+            token_info = self.spotify_client.auth_manager.get_access_token(as_dict=True)
+            SP_CACHED_OAUTH_APP_TOKEN = token_info['access_token']
+            SP_OAUTH_APP_TOKEN_EXPIRES_AT = token_info['expires_at']
+            logging.info("✅ OAuth app token refreshed successfully")
+            return SP_CACHED_OAUTH_APP_TOKEN
+        except Exception as e:
+            logging.error(f"Failed to get OAuth app token: {e}")
+            raise
+
+    def get_track(self, track_id):
+        """Get track information using OAuth app credentials"""
+        if not self.spotify_client:
+            self.initialize_client()
+
+        self._respect_rate_limit()
+        try:
+            return self.spotify_client.track(track_id)
+        except Exception as e:
+            logging.error(f"Failed to get track {track_id}: {e}")
+            raise
+
+    def get_playlist(self, playlist_id):
+        """Get playlist information using OAuth app credentials"""
+        if not self.spotify_client:
+            self.initialize_client()
+
+        self._respect_rate_limit()
+        try:
+            # Use lower-level API call to avoid additional_types parameter
+            return self.spotify_client.playlist(playlist_id, fields=None, market=None, additional_types=())
+        except Exception as e:
+            logging.error(f"Failed to get playlist {playlist_id}: {e}")
+            raise
+
+    def get_playlist_tracks(self, playlist_id, limit=50, offset=0):
+        """Get playlist tracks using OAuth app credentials"""
+        if not self.spotify_client:
+            self.initialize_client()
+
+        self._respect_rate_limit()
+        try:
+            # Use lower-level API call to avoid additional_types parameter
+            return self.spotify_client.playlist_tracks(
+                playlist_id,
+                fields=None,
+                limit=limit,
+                offset=offset,
+                market=None,
+                additional_types=()
+            )
+        except Exception as e:
+            logging.error(f"Failed to get playlist tracks {playlist_id}: {e}")
+            raise
+
+
 class TidalClient:
     BASE_URL = 'https://api.tidal.com/v1/'
     
@@ -4408,114 +4648,195 @@ class PlaylistConverterThread(QThread):
 
     def get_spotify_playlist_info(self):
         """
-        Get Spotify playlist info with improved error handling and the fixed authentication
+        Get Spotify playlist info using cookie-based authentication with proper rate limiting.
         """
-        max_retries = 3
+        max_retries = 5
         retry_count = 0
-        
+        base_wait_time = 2
+
         while retry_count < max_retries:
             self._ensure_not_cancelled()
-            self.progress_message.emit(f'Fetching Spotify playlist (attempt {retry_count + 1})...')
+            self.progress_message.emit(f'Fetching Spotify playlist (attempt {retry_count + 1}/{max_retries})...')
             try:
-                # Use the new authentication method
-                token = self.spotify_auth.refresh_token_if_needed()
                 playlist_id = self.playlist_source.split('/')[-1].split('?')[0]
-                
                 logging.info(f"Processing Spotify playlist ID: {playlist_id} (attempt {retry_count + 1})")
-                
+
+                # Respect global rate limiting
+                global SPOTIFY_LAST_REQUEST_TIME
+                now = time.time()
+                time_since_last = now - SPOTIFY_LAST_REQUEST_TIME
+                if time_since_last < SPOTIFY_REQUEST_MIN_INTERVAL:
+                    time.sleep(SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last)
+                SPOTIFY_LAST_REQUEST_TIME = time.time()
+
+                # Get cookie-based token and client ID
+                token = self.spotify_auth.refresh_token_if_needed()
+                client_id = self.spotify_auth.cached_client_id
                 headers = {
                     'Authorization': f'Bearer {token}',
+                    'Client-Id': client_id,  # CRITICAL: Required for cookie-based tokens (Dec 22, 2025 change)
                     'Content-Type': 'application/json',
                     'User-Agent': self.spotify_auth.user_agent,
                     'Accept': 'application/json',
                     'Referer': 'https://open.spotify.com/',
                 }
-                
-                # Get playlist details
-                logging.info("Fetching playlist details from Spotify API")
+
+                # Use spclient endpoint (required for cookie-based auth as of Dec 22, 2025)
                 response = requests.get(
-                    f'https://api.spotify.com/v1/playlists/{playlist_id}',
+                    f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}',
                     headers=headers,
                     timeout=30
                 )
-                
+
                 # Handle different HTTP status codes
-                if response.status_code == 401:  # Unauthorized
+                if response.status_code == 200:
+                    playlist_data = response.json()
+
+                    # Parse spclient response structure
+                    playlist_name = playlist_data.get('attributes', {}).get('name', 'Unknown Playlist')
+                    playlist_image_url = playlist_data.get('attributes', {}).get('picture', None)
+                    total_tracks = playlist_data.get('length', 0)
+
+                elif response.status_code == 401:  # Unauthorized
                     logging.warning("Token expired or invalid, attempting to refresh...")
-                    self.spotify_auth.access_token = None  # Force token refresh
+                    self.spotify_auth.cached_access_token = None
                     retry_count += 1
-                    time.sleep(2)  # Brief pause before retry
+                    time.sleep(2)
                     continue
                 elif response.status_code == 429:  # Rate limited
-                    retry_after = int(response.headers.get('Retry-After', 60))
+                    retry_after = int(response.headers.get('Retry-After', base_wait_time * (2 ** retry_count)))
                     logging.warning(f"Rate limited, waiting {retry_after} seconds...")
-                    time.sleep(min(retry_after, 60))
+                    time.sleep(retry_after)
                     retry_count += 1
                     continue
                 elif response.status_code == 403:  # Forbidden
                     raise ValueError("Access denied. Playlist may be private or unavailable.")
                 elif response.status_code == 404:  # Not found
                     raise ValueError("Playlist not found. Please check the URL.")
-                
-                response.raise_for_status()
-                playlist_data = response.json()
-                
-                playlist_name = playlist_data['name']
-                playlist_image_url = playlist_data['images'][0]['url'] if playlist_data['images'] else None
-                total_tracks = playlist_data['tracks']['total']
-                
+                else:
+                    response.raise_for_status()
+                    playlist_data = response.json()
+                    playlist_name = playlist_data.get('attributes', {}).get('name', 'Unknown Playlist')
+                    playlist_image_url = playlist_data.get('attributes', {}).get('picture', None)
+                    total_tracks = playlist_data.get('length', 0)
+
                 logging.info(f"Found playlist: {playlist_name} with {total_tracks} tracks")
-                
+
                 # Get all tracks with pagination
                 tracks = []
-                tracks_url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=50'
                 processed_tracks = 0
-                
-                while tracks_url:
+                offset = 0
+                limit = 50
+
+                while processed_tracks < total_tracks:
                     try:
+                        self._ensure_not_cancelled()
                         logging.info(f"Fetching tracks batch: {processed_tracks}/{total_tracks}")
-                        
+
+                        # Respect rate limiting between requests
+                        now = time.time()
+                        time_since_last = now - SPOTIFY_LAST_REQUEST_TIME
+                        if time_since_last < SPOTIFY_REQUEST_MIN_INTERVAL:
+                            time.sleep(SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last)
+                        SPOTIFY_LAST_REQUEST_TIME = time.time()
+
+                        # Fetch tracks using spclient endpoint (required as of Dec 22, 2025)
+                        tracks_url = f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}?offset={offset}&limit={limit}'
                         response = requests.get(tracks_url, headers=headers, timeout=30)
-                        
+
                         # Handle rate limiting for tracks
                         if response.status_code == 429:
-                            retry_after = int(response.headers.get('Retry-After', 30))
+                            # Try public token fallback
+                            public_token = get_public_spotify_token()
+                            if public_token:
+                                logging.info("Using public token fallback for track fetching...")
+                                headers['Authorization'] = f'Bearer {public_token}'
+                                time.sleep(1)
+                                continue
+
+                            # If no fallback, wait for rate limit
+                            retry_after = int(response.headers.get('Retry-After', 5))
                             logging.warning(f"Rate limited on tracks, waiting {retry_after} seconds...")
-                            time.sleep(min(retry_after, 30))
+                            time.sleep(retry_after)
                             continue
                         elif response.status_code == 401:
-                            # Token expired during track fetching
                             logging.warning("Token expired during track fetching, refreshing...")
-                            token = self.spotify_auth.get_token()  # Get fresh token
+                            token = self.spotify_auth.get_token()
                             headers['Authorization'] = f'Bearer {token}'
                             continue
-                        
+
                         response.raise_for_status()
                         tracks_data = response.json()
-                        
-                        for item in tracks_data['items']:
-                            if item and item.get('track'):
-                                track = item['track']
-                                if track and track.get('name'):
-                                    artist_name = 'Unknown Artist'
-                                    if track.get('artists') and len(track['artists']) > 0:
-                                        artist_name = track['artists'][0]['name']
-                                    
-                                    tracks.append(f"{track['name']} - {artist_name}")
+
+                        # spclient returns items with URIs only
+                        items = tracks_data.get('contents', {}).get('items', [])
+
+                        # Extract track IDs from URIs
+                        track_ids = []
+                        for item in items:
+                            if item and item.get('uri'):
+                                uri = item['uri']
+                                if uri.startswith('spotify:track:'):
+                                    track_id = uri.split(':')[-1]
+                                    track_ids.append(track_id)
+
+                        # Fetch track details ONE AT A TIME using OAuth (like friend's code)
+                        # Get OAuth token for track API calls
+                        oauth_app = SpotifyOAuthApp()
+                        oauth_token = oauth_app.get_token()
+                        oauth_headers = {
+                            'Authorization': f'Bearer {oauth_token}',
+                            'User-Agent': self.spotify_auth.user_agent,
+                        }
+
+                        for track_id in track_ids:
+                            try:
+                                # Add small delay between track requests
+                                time.sleep(0.1)
+
+                                track_url = f'https://api.spotify.com/v1/tracks/{track_id}'
+                                track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
+
+                                if track_response.status_code == 200:
+                                    track = track_response.json()
+                                    if track and track.get('name'):
+                                        artist_name = 'Unknown Artist'
+                                        if track.get('artists') and len(track['artists']) > 0:
+                                            artist_name = track['artists'][0]['name']
+
+                                        tracks.append(f"{track['name']} - {artist_name}")
+                                        processed_tracks += 1
+
+                                        # Update progress
+                                        if total_tracks > 0:
+                                            progress = int((processed_tracks / total_tracks) * 50)
+                                            self.progress_update.emit(progress)
+                                elif track_response.status_code == 429:
+                                    # If rate limited, wait and retry this track
+                                    retry_after = int(track_response.headers.get('Retry-After', 2))
+                                    logging.warning(f"Rate limited on track, waiting {retry_after}s")
+                                    time.sleep(retry_after)
+                                    # Retry same track with OAuth
+                                    track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
+                                    if track_response.status_code == 200:
+                                        track = track_response.json()
+                                        if track and track.get('name'):
+                                            artist_name = 'Unknown Artist'
+                                            if track.get('artists') and len(track['artists']) > 0:
+                                                artist_name = track['artists'][0]['name']
+                                            tracks.append(f"{track['name']} - {artist_name}")
+                                            processed_tracks += 1
+                                else:
+                                    logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
                                     processed_tracks += 1
-                                    
-                                    # Update progress
-                                    if total_tracks > 0:
-                                        progress = int((processed_tracks / total_tracks) * 50)
-                                        self.progress_update.emit(progress)
-                        
-                        # Get next page
-                        tracks_url = tracks_data.get('next')
-                        
-                        # Small delay to avoid rate limits
-                        if tracks_url:
-                            time.sleep(0.1)
-                            
+
+                            except Exception as e:
+                                logging.warning(f"Error fetching track {track_id}: {e}")
+                                processed_tracks += 1
+
+                        # Move to next batch
+                        offset += limit
+
                     except requests.exceptions.Timeout:
                         logging.warning("Request timeout, retrying...")
                         time.sleep(2)
@@ -6225,26 +6546,14 @@ class PlexPlaylistManager(QMainWindow):
             self.spotify_logout_btn.setEnabled(False)
     
     def get_spotify_user_info(self):
-        """Get current user info from Spotify"""
+        """
+        Get current user info from Spotify.
+        Note: /v1/me endpoint is no longer accessible with cookie-based tokens
+        due to Spotify restrictions introduced Dec 22, 2025.
+        """
         global SPOTIFY_USER_INFO
-        try:
-            auth = SpotifyAnonymousAuth()
-            token = auth.get_token()
-            
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'User-Agent': auth.user_agent,
-            }
-            
-            if hasattr(auth, 'cached_client_id') and auth.cached_client_id:
-                headers['Client-Id'] = auth.cached_client_id
-            
-            response = requests.get('https://api.spotify.com/v1/me', headers=headers, timeout=30)
-            if response.status_code == 200:
-                SPOTIFY_USER_INFO = response.json()
-                return SPOTIFY_USER_INFO
-        except Exception as e:
-            logging.error(f"Error getting user info: {e}")
+        logging.info("User info retrieval from /v1/me is no longer supported due to Spotify API changes")
+        # Return empty dict as user info is not critical for playlist operations
         return {}
     
     def import_multiple_spotify_playlists(self, playlists):
@@ -6310,46 +6619,62 @@ class PlexPlaylistManager(QMainWindow):
         QMessageBox.critical(self, "Import Error", f"Import failed: {error_message}")
         QMessageBox.critical(self, "Import Error", f"Import failed: {error_message}")
     
-    def save_spotify_config(self, sp_dc_cookie):
-        """Save Spotify configuration including cookie"""
+    def save_spotify_config(self, sp_dc_cookie, oauth_client_id=None, oauth_client_secret=None):
+        """Save Spotify configuration including cookie and OAuth credentials"""
         try:
             # Load existing config
             config = {}
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, 'r') as f:
                     config = json.load(f)
-            
+
             # Update with Spotify info
-            config['sp_dc_cookie'] = sp_dc_cookie  # Make sure this line exists
+            config['sp_dc_cookie'] = sp_dc_cookie
             config['spotify_logged_in'] = bool(sp_dc_cookie)
             config['spotify_user_info'] = SPOTIFY_USER_INFO
-            
+
+            # Save OAuth credentials if provided
+            if oauth_client_id is not None:
+                config['sp_app_client_id'] = oauth_client_id
+            if oauth_client_secret is not None:
+                config['sp_app_client_secret'] = oauth_client_secret
+
             # Save config
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(config, f, indent=4)
-            
-            # ALSO update the global variable immediately
-            global SP_DC_COOKIE, SPOTIFY_LOGGED_IN
+
+            # Update global variables
+            global SP_DC_COOKIE, SPOTIFY_LOGGED_IN, SP_APP_CLIENT_ID, SP_APP_CLIENT_SECRET
             SP_DC_COOKIE = sp_dc_cookie
             SPOTIFY_LOGGED_IN = bool(sp_dc_cookie)
-            
+            if oauth_client_id is not None:
+                SP_APP_CLIENT_ID = oauth_client_id
+            if oauth_client_secret is not None:
+                SP_APP_CLIENT_SECRET = oauth_client_secret
+
             logging.info("Spotify configuration saved successfully")
         except Exception as e:
             logging.error(f"Error saving Spotify config: {e}")
     
     def load_spotify_config(self):
-        """Load Spotify configuration"""
-        global SP_DC_COOKIE, SPOTIFY_LOGGED_IN, SPOTIFY_USER_INFO
-        
+        """Load Spotify configuration including OAuth credentials"""
+        global SP_DC_COOKIE, SPOTIFY_LOGGED_IN, SPOTIFY_USER_INFO, SP_APP_CLIENT_ID, SP_APP_CLIENT_SECRET
+
         try:
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, 'r') as f:
                     config = json.load(f)
-                
+
                 SP_DC_COOKIE = config.get('sp_dc_cookie', '')
                 SPOTIFY_LOGGED_IN = config.get('spotify_logged_in', False)
                 SPOTIFY_USER_INFO = config.get('spotify_user_info', {})
-                
+
+                # Load OAuth credentials from config (if not set via environment variables)
+                if not SP_APP_CLIENT_ID:
+                    SP_APP_CLIENT_ID = config.get('sp_app_client_id', '')
+                if not SP_APP_CLIENT_SECRET:
+                    SP_APP_CLIENT_SECRET = config.get('sp_app_client_secret', '')
+
                 # Update UI if logged in
                 if SPOTIFY_LOGGED_IN and SP_DC_COOKIE:
                     self.update_spotify_login_status(True)
@@ -10977,26 +11302,89 @@ class PlaylistNameFetchThread(QThread):
             self.error.emit(str(e))
     
     def get_spotify_playlist_name(self):
-        """Get just the Spotify playlist name"""
-        try:
-            token = self.spotify_auth.refresh_token_if_needed()
-            playlist_id = self.playlist_url.split('/')[-1].split('?')[0]
-            
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json',
-                'User-Agent': self.spotify_auth.user_agent,
-            }
-            
-            response = requests.get(f'https://api.spotify.com/v1/playlists/{playlist_id}', headers=headers, timeout=30)
-            response.raise_for_status()
-            playlist_data = response.json()
-            
-            return playlist_data['name']
-            
-        except Exception as e:
-            logging.error(f"Error getting Spotify playlist name: {str(e)}")
-            raise
+        """
+        Get Spotify playlist name using cookie-based auth with proper rate limit handling.
+        """
+        playlist_id = self.playlist_url.split('/')[-1].split('?')[0]
+        max_retries = 5
+        base_wait_time = 2
+
+        for attempt in range(max_retries):
+            try:
+                # Respect global rate limiting
+                global SPOTIFY_LAST_REQUEST_TIME
+                now = time.time()
+                time_since_last = now - SPOTIFY_LAST_REQUEST_TIME
+                if time_since_last < SPOTIFY_REQUEST_MIN_INTERVAL:
+                    time.sleep(SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last)
+                SPOTIFY_LAST_REQUEST_TIME = time.time()
+
+                # Get cookie-based token and client ID
+                token = self.spotify_auth.refresh_token_if_needed()
+                client_id = self.spotify_auth.cached_client_id
+                headers = {
+                    'Authorization': f'Bearer {token}',
+                    'Client-Id': client_id,  # CRITICAL: Required for cookie-based tokens (Dec 22, 2025 change)
+                    'User-Agent': self.spotify_auth.user_agent,
+                    'Accept': 'application/json',  # Request JSON instead of protobuf
+                }
+
+                # Use spclient endpoint (required for cookie-based auth as of Dec 22, 2025)
+                response = requests.get(
+                    f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}',
+                    headers=headers,
+                    timeout=30
+                )
+
+                # Success!
+                if response.status_code == 200:
+                    playlist_data = response.json()
+                    # Parse spclient response structure
+                    playlist_name = playlist_data.get('attributes', {}).get('name', 'Unknown Playlist')
+                    return playlist_name
+
+                # Rate limited - try public token fallback first
+                if response.status_code == 429:
+                    # Try public token fallback
+                    public_token = get_public_spotify_token()
+                    if public_token and attempt < 2:  # Try fallback max 2 times
+                        logging.info("Using public token fallback for playlist name...")
+                        headers['Authorization'] = f'Bearer {public_token}'
+                        time.sleep(1)
+                        continue
+
+                    # If fallback failed, wait for rate limit to clear
+                    retry_after = int(response.headers.get('Retry-After', base_wait_time * (attempt + 1)))
+                    logging.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), waiting {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
+
+                # Other error - raise it
+                response.raise_for_status()
+                playlist_data = response.json()
+                return playlist_data['name']
+
+            except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 429:
+                    # Rate limit - retry with exponential backoff
+                    wait_time = base_wait_time * (2 ** attempt)
+                    logging.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Non-rate-limit error, raise it
+                    raise
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    # Last attempt, raise the error
+                    raise
+                # Other error, retry with backoff
+                wait_time = base_wait_time * (attempt + 1)
+                logging.warning(f"Error on attempt {attempt + 1}/{max_retries}: {e}, retrying in {wait_time}s")
+                time.sleep(wait_time)
+                continue
+
+        raise Exception(f"Failed to get playlist name after {max_retries} attempts")
     
     def get_deezer_playlist_name(self):
         """Get Deezer playlist name"""

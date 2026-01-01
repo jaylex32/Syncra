@@ -1,0 +1,19 @@
+{
+  "plex_username": "",
+  "server_ip": "127.0.0.1",
+  "server_port": "32400",
+  "token": "",
+  "last_section": null,
+  "auto_backup": true,
+  "backup_interval": 24,
+
+  "_comment_spotify": "=== SPOTIFY AUTHENTICATION ===",
+  "_comment_sp_dc": "REQUIRED: Get your sp_dc cookie from https://open.spotify.com (see README)",
+  "sp_dc_cookie": "",
+
+  "_comment_oauth": "OPTIONAL: Create your own Spotify OAuth app for unlimited rate limits",
+  "_comment_oauth_guide": "See SPOTIFY_OAUTH_SETUP_GUIDE.md for step-by-step instructions",
+  "_comment_oauth_free": "Creating an OAuth app is FREE and takes 5 minutes",
+  "sp_app_client_id": "",
+  "sp_app_client_secret": ""
+}

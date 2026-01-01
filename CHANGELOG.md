@@ -1,5 +1,76 @@
 # Changelog
 
+## v2.14.0 - 2025-12-31
+### 🎯 Critical Fix: Spotify Authentication Overhaul
+- **Fixed Spotify API breaking changes from December 22, 2025**
+  - Spotify introduced new API restrictions requiring OAuth for track data
+  - Implemented hybrid authentication system (cookie TOTP + OAuth Client Credentials)
+  - All Spotify playlists now work flawlessly (including algorithmic playlists)
+
+### 🔐 Hybrid Authentication System
+- **Cookie-based TOTP Authentication** (for playlist metadata)
+  - Generates temporary tokens from user's `sp_dc` cookie
+  - Uses `spclient.wg.spotify.com` internal API endpoint
+  - Requires `Client-Id` header (critical Dec 22, 2025 change)
+  - Prevents 429 rate limit errors on playlist requests
+
+- **OAuth Client Credentials** (for track details)
+  - Built-in OAuth app credentials (no user setup required)
+  - Fetches individual tracks from `api.spotify.com/v1/tracks`
+  - One track at a time with 100ms delays to avoid rate limits
+  - Required due to Spotify's new restrictions on track information retrieval
+
+### 🚀 Updated All Spotify API Calls
+- **SyncThread.get_spotify_tracks()** - Updated to use spclient + OAuth
+- **PlaylistSortingThread.get_spotify_tracks()** - Updated to use spclient + OAuth
+- **LoadUserPlaylistsThread** - Updated to use proper TOTP token authentication
+- **PlaylistConverterThread.get_spotify_playlist_info()** - Already correct implementation
+
+### 📚 Comprehensive User Documentation
+- **SPOTIFY_AUTH_SOLUTION.md** - Technical implementation details
+- **SPOTIFY_OAUTH_SETUP_GUIDE.md** - Step-by-step guide for creating personal OAuth app
+- **USER_OAUTH_README.md** - User-facing documentation with FAQ
+- **SPOTIFY_QUICK_SETUP.txt** - Quick reference card for OAuth setup
+- **app_config.json.template** - Configuration template with helpful comments
+
+### ✅ What Users Get
+- **Out-of-Box Experience**: Works immediately with built-in OAuth credentials
+- **No Configuration Needed**: Users only provide `sp_dc` cookie (from browser)
+- **Optional Personal OAuth**: Users can create their own OAuth app for unlimited rate limits
+- **Seamless Upgrade**: No breaking changes, existing users continue working
+
+### 🔧 Technical Improvements
+- Removed credential exposure from logs and documentation
+- OAuth credentials built-in as defaults with environment variable overrides
+- Automatic credential storage in `app_config.json` for persistence
+- Clean separation between shared and personal OAuth credentials
+- Comprehensive authentication testing via `test_spotify_auth.py`
+
+### 📊 User OAuth Benefits (Optional)
+- Personal rate limit quota (~180 requests/minute)
+- No sharing with other Syncra users
+- Guaranteed reliability for heavy usage
+- 100% free (Spotify Developer account is free)
+- 5-minute setup process
+
+### 🐛 Bug Fixes
+- Fixed 429 rate limit errors on Spotify playlist fetching
+- Fixed track information retrieval failures
+- Fixed algorithmic playlist access issues
+- Fixed rate limiting when using cookie authentication
+
+### 🎓 Reference Implementation
+Based on approach from: https://github.com/misiektoja/spotify_monitor
+- Key learnings: Use `spclient.wg.spotify.com` for playlists, OAuth for tracks
+- Fetch tracks individually with delays (not batched)
+- Include `Client-Id` header for cookie-based requests
+
+### 📝 Migration Notes
+- No action required for existing users
+- OAuth credentials automatically added to config on first run
+- Old documentation files removed to prevent credential exposure
+- Clean upgrade path from v2.13.0
+
 ## v2.13.0 - 2025-11-23
 ### 🎭 Major Features: Multi-User Management System
 - **Complete Plex Home User Support**

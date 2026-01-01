@@ -1,0 +1,68 @@
+╔════════════════════════════════════════════════════════════════════════╗
+║           SPOTIFY OAUTH APP - QUICK SETUP (5 MINUTES)                  ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+WHY DO THIS?
+  • Get your own rate limit quota (no sharing with other users)
+  • Avoid "429 Rate Limited" errors
+  • 100% FREE - No payment required
+
+────────────────────────────────────────────────────────────────────────
+
+STEP 1: CREATE SPOTIFY DEVELOPER APP
+  1. Go to: https://developer.spotify.com/dashboard
+  2. Click "Create app"
+  3. Fill in:
+     • App name: Syncra Personal
+     • Description: Personal playlist sync
+     • Redirect URI: http://localhost:8888/callback
+  4. Click "Save"
+
+────────────────────────────────────────────────────────────────────────
+
+STEP 2: GET YOUR CREDENTIALS
+  1. Click on your new app
+  2. Click "Settings"
+  3. Copy:
+     • Client ID (visible by default)
+     • Client Secret (click "View client secret")
+
+────────────────────────────────────────────────────────────────────────
+
+STEP 3: ADD TO SYNCRA
+  Open: app_config.json
+
+  Add these lines (replace with YOUR credentials):
+
+  {
+    "sp_dc_cookie": "YOUR_SP_DC_COOKIE",
+    "sp_app_client_id": "YOUR_CLIENT_ID_HERE",
+    "sp_app_client_secret": "YOUR_CLIENT_SECRET_HERE"
+  }
+
+────────────────────────────────────────────────────────────────────────
+
+STEP 4: RESTART SYNCRA
+  Close and reopen Syncra - Done! ✓
+
+────────────────────────────────────────────────────────────────────────
+
+VERIFICATION:
+  Run: python test_spotify_auth.py
+
+  Should see:
+    ✓ [SUCCESS] Token obtained
+    ✓ [SUCCESS] AUTHENTICATION WORKS!
+
+────────────────────────────────────────────────────────────────────────
+
+TROUBLESHOOTING:
+  • "Invalid client" → Double-check credentials (no extra spaces)
+  • "Redirect URI mismatch" → Add http://localhost:8888/callback in Settings
+  • Still rate limited → Delete .spotify_oauth_cache and restart
+
+────────────────────────────────────────────────────────────────────────
+
+DETAILED GUIDE: See SPOTIFY_OAUTH_SETUP_GUIDE.md
+
+╚════════════════════════════════════════════════════════════════════════╝
