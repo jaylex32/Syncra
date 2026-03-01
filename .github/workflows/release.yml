@@ -21,7 +21,11 @@ jobs:
             ext: ""
             archive: tar.gz
           - os: macos-latest
-            name: macOS
+            name: macOS-AppleSilicon
+            ext: ""
+            archive: tar.gz
+          - os: macos-13
+            name: macOS-Intel
             ext: ""
             archive: tar.gz
 
@@ -57,7 +61,7 @@ jobs:
         xvfb-run -a pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (macOS)
-      if: matrix.os == 'macos-latest'
+      if: contains(matrix.os, 'macos')
       run: |
         pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
@@ -130,6 +134,7 @@ jobs:
         files: |
           release-artifacts/Syncra-Windows/Syncra-Windows.zip
           release-artifacts/Syncra-Linux/Syncra-Linux.tar.gz
-          release-artifacts/Syncra-macOS/Syncra-macOS.tar.gz
+          release-artifacts/Syncra-macOS-AppleSilicon/Syncra-macOS-AppleSilicon.tar.gz
+          release-artifacts/Syncra-macOS-Intel/Syncra-macOS-Intel.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

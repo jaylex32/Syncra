@@ -19,7 +19,10 @@ jobs:
             name: Linux
             ext: ""
           - os: macos-latest
-            name: macOS
+            name: macOS-AppleSilicon
+            ext: ""
+          - os: macos-13
+            name: macOS-Intel
             ext: ""
 
     steps:
@@ -57,10 +60,15 @@ jobs:
       run: |
         xvfb-run -a pyinstaller --onefile --windowed --name="Syncra-Linux" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
-    - name: Build executable (macOS)
-      if: matrix.os == 'macos-latest'
+    - name: Build executable (macOS Apple Silicon)
+      if: matrix.name == 'macOS-AppleSilicon'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra-macOS" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        pyinstaller --onefile --windowed --name="Syncra-macOS-AppleSilicon" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+
+    - name: Build executable (macOS Intel)
+      if: matrix.name == 'macOS-Intel'
+      run: |
+        pyinstaller --onefile --windowed --name="Syncra-macOS-Intel" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: List build output (Windows)
       if: matrix.os == 'windows-latest'
