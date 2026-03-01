@@ -14,7 +14,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.18.0"
+__version__ = "2.18.1"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer

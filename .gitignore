@@ -89,6 +89,9 @@ tmp/
 
 # Local configuration
 config/
+!syncra/config/
+!syncra/config/__init__.py
+!syncra/config/defaults.py
 local/
 secrets/
 

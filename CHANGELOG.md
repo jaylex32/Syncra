@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.18.1 - 2026-03-01
+### 🛠️ Hotfix
+- Fixed packaged app startup crash on Windows release builds:
+  - `ModuleNotFoundError: No module named 'syncra.config'`
+- Root cause was repository ignore rules excluding `syncra/config`.
+- Added package config files (`syncra/config/__init__.py`, `syncra/config/defaults.py`) to source control and adjusted `.gitignore` exceptions.
+- Rebuilt and republished binaries with the corrected package contents.
+
 ## v2.18.0 - 2026-03-01
 ### 🎨 UI Refresh and UX Improvements
 - Delivered a full modernized dark UI pass with consistent section headers, cards, spacing, and action hierarchy.
