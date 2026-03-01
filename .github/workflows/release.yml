@@ -24,7 +24,7 @@ jobs:
             name: macOS-AppleSilicon
             ext: ""
             archive: tar.gz
-          - os: macos-13
+          - os: macos-15-intel
             name: macOS-Intel
             ext: ""
             archive: tar.gz

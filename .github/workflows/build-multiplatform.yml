@@ -21,7 +21,7 @@ jobs:
           - os: macos-latest
             name: macOS-AppleSilicon
             ext: ""
-          - os: macos-13
+          - os: macos-15-intel
             name: macOS-Intel
             ext: ""
 
