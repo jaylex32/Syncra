@@ -3,6 +3,10 @@
   "server_ip": "127.0.0.1",
   "server_port": "32400",
   "token": "",
+  "listenbrainz_token": "",
+  "listenbrainz_user": "",
+  "apple_music_xml_path": "",
+  "apple_music_import_ratings": true,
   "last_section": null,
   "auto_backup": true,
   "backup_interval": 24,
@@ -15,5 +19,21 @@
   "_comment_oauth_guide": "See SPOTIFY_OAUTH_SETUP_GUIDE.md for step-by-step instructions",
   "_comment_oauth_free": "Creating an OAuth app is FREE and takes 5 minutes",
   "sp_app_client_id": "",
-  "sp_app_client_secret": ""
+  "sp_app_client_secret": "",
+
+  "_comment_features": "=== RUNTIME FEATURE FLAGS ===",
+  "features": {
+    "metadata_fixer": false,
+    "ui_refresh_v2": false,
+    "auto_fetch_playlists_on_startup": false
+  },
+
+  "_comment_metadata": "=== METADATA FIXER SETTINGS ===",
+  "metadata": {
+    "user_agent": "Syncra/2.18.0 (metadata-fixer; contact: github.com/jaylex32/syncra)",
+    "rate_limit_rps": 1.0,
+    "cache_ttl_hours": 168,
+    "auto_apply_threshold": 95,
+    "review_threshold": 80
+  }
 }

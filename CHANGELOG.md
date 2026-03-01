@@ -1,5 +1,64 @@
 # Changelog
 
+## v2.18.0 - 2026-03-01
+### 🎨 UI Refresh and UX Improvements
+- Delivered a full modernized dark UI pass with consistent section headers, cards, spacing, and action hierarchy.
+- Replaced sidebar/action emoji navigation with packaged icon assets from `assets/icons`.
+- Added themed scrollbars and improved visual consistency across pages and dialogs.
+- Reskinned the playlist editor dialog to match the new application design language.
+- Updated labels and copy polish across key screens (for example `Tools & Utilities`, `Import & Export`).
+
+### 🔐 Plex Auth and User Management
+- Added explicit Plex 2FA code input to the Connection flow.
+- Implemented token-first reconnect to prevent repeated 2FA prompts on app startup.
+- Improved `Switch User` fallback behavior to use token-based account context first, then credential + 2FA fallback only when necessary.
+- Fixed PyQt6 enum migration crash in user-switch dialog/window flags and header behaviors.
+
+### 🧠 Streaming and Integrations
+- Added ListenBrainz tabbed integration workflow for cleaner import/export controls.
+- Fixed ListenBrainz export payload handling to prevent `400 BAD REQUEST` on playlist creation.
+- Added progress feedback and non-blocking threading for ListenBrainz operations.
+- Fixed ListenBrainz playlist loading issues (untitled names and incorrect track count reporting).
+
+### 🍎 Apple Music XML Import
+- Added new `Apple Music XML` tab under Streaming Import.
+- Implemented parser for Apple Music/iTunes XML (plist) exports, including static and exported smart-playlist snapshots.
+- Added optional Plex rating import mapping from Apple ratings.
+- Added **Dry Run Preview** with per-playlist match statistics (`Tracks`, `Matched`, `Missing`, `Match %`, `Rating Candidates`) and missing-track samples before import.
+- Reused existing path-mapping system for cross-platform/media-root matching compatibility.
+
+### 🧬 Metadata Workflow Update
+- Transitioned metadata tooling to a file-first metadata editing model using local audio tags.
+- Updated metadata-related UI labels/tooltips to reflect file-tag behavior and configuration.
+- Added `mutagen` dependency for local tag read/write support.
+
+### ⚙️ Packaging and Build
+- Completed PyQt6 packaging updates in CI/release workflows, including `PyQt6.QtSvg` and `PyQt6.QtSvgWidgets` hidden imports.
+- Added bundled assets in PyInstaller commands so icons/theme resources are included in binaries.
+- Updated runtime requirements to `PyQt6>=6.10.2,<6.11`.
+
+## v2.15.0 - 2026-02-28
+### 🚀 Modernization Baseline
+- Migrated runtime and packaging from **PyQt5** to **PyQt6**.
+- Introduced a thin bootstrap `main.py` and moved the legacy application module to `syncra/app/legacy_main.py`.
+- Added package structure for staged refactor: `app`, `ui`, `workers`, `services`, `models`, `config`, and `theme`.
+- Added centralized theme module (`syncra/theme/styles.py`) and switched main stylesheet loading to shared theme tokens.
+
+### 🧠 Metadata Fixer Foundation
+- Added **Metadata Fixer** dialog and workflow scaffold in Tools & Utilities.
+- Added MusicBrainz + Cover Art Archive provider with cache and rate limiting.
+- Added metadata proposal/apply service with audit logging to `temp/metadata_audit_log.jsonl`.
+- Added runtime feature flag `features.metadata_fixer` (disabled by default).
+
+### ⚙️ Config and Logging
+- Added config defaults merge logic for app/sync/cache files.
+- Added structured logging utilities with flow IDs and timing helpers.
+- Added log instrumentation for fetch/sync/import workflows.
+
+### ✅ Tests
+- Added smoke harness test (`tests/test_smoke_harness.py`) for critical GUI entrypoint surfaces.
+- Added metadata fixer service test (`tests/test_metadata_fixer_service.py`).
+
 ## v2.14.0 - 2025-12-31
 ### 🎯 Critical Fix: Spotify Authentication Overhaul
 - **Fixed Spotify API breaking changes from December 22, 2025**

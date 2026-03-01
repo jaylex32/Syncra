@@ -38,28 +38,28 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
-        sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtsvg xvfb
+        sudo apt-get install -y xvfb
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
-        pip install PyQt5 plexapi requests spotipy fuzzywuzzy python-levenshtein pyotp deezer-python Pillow
+        pip install -r requirements.txt
 
     - name: Build executable (Windows)
       if: matrix.os == 'windows-latest'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra" --icon="Syncra Icon.ico" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+        pyinstaller --onefile --windowed --name="Syncra" --icon="Syncra Icon.ico" --add-data "assets;assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (Linux)
       if: matrix.os == 'ubuntu-latest'
       run: |
-        xvfb-run -a pyinstaller --onefile --windowed --name="Syncra" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+        xvfb-run -a pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (macOS)
       if: matrix.os == 'macos-latest'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt5.QtSvg main.py
+        pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Create archive (Windows)
       if: matrix.os == 'windows-latest'

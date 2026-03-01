@@ -19,9 +19,11 @@
 ## ✨ Features
 
 - 🎛️ **Advanced Playlist Editor** with search, filtering, and drag-and-drop reordering
-- 🔄 **Auto-Sync** from Spotify, Deezer, and Tidal playlists
+- 🔄 **Auto-Sync** from Spotify, Deezer, Tidal, and ListenBrainz playlists
 - 🔀 **Playlist Merger** with intelligent duplicate detection
 - 🛠️ **Tools & Utilities** including backup, restore, and library analysis
+- 🧬 **File Metadata Fixer** (feature-flagged) using MusicBrainz + Cover Art Archive proposals
+- 🍎 **Apple Music XML Import** with playlist preview and optional rating sync
 - ⚡ **Lightning-fast performance** with smart caching system
 - 🎯 **Precise track positioning** - move any track to any position instantly
 - 🔍 **Duplicate track finder** across your entire library
@@ -47,7 +49,7 @@ Get the latest version for your platform from the [Releases](https://github.com/
 1. **Connect to Plex**: Enter your server details in the Connection tab
 2. **Fetch Playlists**: Click "Fetch Playlists" to load your collection
 3. **Edit Playlists**: Double-click any playlist to open the advanced editor
-4. **Sync from Streaming**: Paste Spotify/Deezer/Tidal URLs to auto-sync
+4. **Sync from Streaming**: Paste Spotify/Deezer/Tidal/ListenBrainz URLs to auto-sync
 5. **Explore Tools**: Check out the Tools & Utilities for advanced features
 
 ## 🔄 Auto-Sync Setup
@@ -57,6 +59,13 @@ Get the latest version for your platform from the [Releases](https://github.com/
 3. Enter a **Spotify/Deezer/Tidal URL**
 4. Set **sync interval** (hourly, daily, etc.)
 5. **Enable auto-sync** and let Syncra keep your playlists updated!
+
+## 🧬 Metadata Fixer
+
+- File Metadata Fixer uses MusicBrainz + Cover Art Archive suggestions and writes selected changes to local audio file tags.
+- It never modifies local files unless you explicitly apply reviewed proposals.
+- It is feature-flagged by default. Enable it in `app_config.json`:
+  - `features.metadata_fixer = true`
 
 ### 📋 System Requirements
 - **Windows**: Windows 10/11 (64-bit)
@@ -69,12 +78,14 @@ Get the latest version for your platform from the [Releases](https://github.com/
 - 🎵 **Spotify** (playlists, albums, tracks)
 - 🎶 **Deezer** (playlists, albums, tracks)  
 - 🎧 **Tidal** (playlists, albums, tracks)
+- 🧠 **ListenBrainz** (import/export playlists)
+- 🍎 **Apple Music XML exports** (library/playlists snapshot import)
 - 📁 **M3U/M3U8 files** (local and remote)
 
 ## 🏗️ Development
 
 Built with:
-- **Python 3.11** with PyQt5 for the interface
+- **Python 3.11** with PyQt6 for the interface
 - **PlexAPI** for Plex server communication
 - **Spotipy** for Spotify integration
 - **Advanced fuzzy matching** for cross-platform track identification
