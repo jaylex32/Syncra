@@ -14,7 +14,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.18.1"
+__version__ = "2.19.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -795,7 +795,9 @@ class ListenBrainzPlaylistLoadThread(QThread):
 
             needs_count = [
                 p for p in playlists
-                if p.get("playlist_id") and not isinstance(p.get("track_count"), int)
+                if p.get("playlist_id") and (
+                    not isinstance(p.get("track_count"), int) or int(p.get("track_count", 0)) <= 0
+                )
             ]
             total_needs = len(needs_count)
             for idx, playlist in enumerate(needs_count, start=1):
@@ -2248,16 +2250,10 @@ class SyncThread(QThread):
             self._ensure_not_cancelled()
             clear_before_sync = bool(config.get('clear_before_sync', False))
 
-            # Capture current playlist state for duplicate detection/clearing
+            # Capture current playlist state for duplicate detection/rebuild
             current_items = list(plex_playlist.items())
-            plex_tracks = set()
-            plex_track_keys = set()  # Store track rating keys for exact duplicate detection
-            if not clear_before_sync:
-                for track in current_items:
-                    signature = f"{track.title}_{track.originalTitle or (track.artist().title if hasattr(track, 'artist') and track.artist() else '')}"
-                    plex_tracks.add(signature.lower())
-                    # Also store the unique Plex rating key for exact duplicate detection
-                    plex_track_keys.add(track.ratingKey)
+            current_keys = [track.ratingKey for track in current_items]
+            current_key_set = set(current_keys)
 
             # Resolve source tracks from the configured URL
             source_tracks = []
@@ -2277,29 +2273,27 @@ class SyncThread(QThread):
             # Store for downstream reporting
             config['tracks'] = source_tracks
 
-            missing_tracks = []
-            seen_signatures = set()
+            matched_source_tracks = []
+            matched_source_keys = []
+            seen_m3u_signatures = set()
+            added_count = 0
             library_section = self.plex_server.library.sectionByID(config.get('library_section'))
             total_tracks = max(len(source_tracks), 1)
 
             for i, track_info in enumerate(source_tracks):
                 self._ensure_not_cancelled()
-
-                # Handle both old format (string) and new format (dict with 'path' and 'parsed')
-                if isinstance(track_info, dict):
-                    track_path = track_info.get('path')
-                    parsed_info = track_info.get('parsed', '')
-                else:
-                    # Old format for Spotify/Deezer/Tidal
-                    track_path = None
-                    parsed_info = track_info
-
+                source_track = self.normalize_source_track(track_info)
+                track_path = source_track.get('path')
+                parsed_info = source_track.get('parsed', '')
+                track_title = source_track.get('title', '')
+                artist_name = source_track.get('artist', '')
                 track_signature = parsed_info.lower()
 
-                # Skip duplicate entries in the M3U source file itself
-                if track_signature in seen_signatures:
+                # Skip duplicate entries only for file-based M3U rows.
+                if track_path and track_signature in seen_m3u_signatures:
                     continue
-                seen_signatures.add(track_signature)
+                if track_path:
+                    seen_m3u_signatures.add(track_signature)
 
                 plex_track = None
 
@@ -2312,15 +2306,11 @@ class SyncThread(QThread):
                 if track_path:
                     if use_smart_matching:
                         # Smart matching mode: Use Plex API search instead of path matching
-                        # Extract title and artist from parsed info
-                        if ' - ' in parsed_info:
-                            parts = parsed_info.split(' - ', 1)
-                            track_title = parts[0].strip()
-                            artist_name = parts[1].strip()
+                        if track_title:
                             plex_track = self.find_track_by_plex_search(library_section, track_title, artist_name)
                             if plex_track:
                                 logging.info(f"Smart matching found: {plex_track.title} (from M3U)")
-                        else:
+                        elif parsed_info:
                             plex_track = self.find_track_by_plex_search(library_section, parsed_info)
                     else:
                         # Path matching mode: Use exact file paths (original behavior)
@@ -2330,45 +2320,42 @@ class SyncThread(QThread):
                         if not plex_track:
                             logging.warning(f"Path match failed for: {track_path}, falling back to fuzzy matching")
 
-                    # If we found a track, check if it's already in the playlist
-                    if plex_track and not clear_before_sync:
-                        if plex_track.ratingKey in plex_track_keys:
-                            logging.debug(f"Track already in playlist, skipping: {plex_track.title}")
-                            continue
-
                 # Fall back to fuzzy matching if other methods failed
                 if not plex_track:
-                    # For fuzzy matching, use the old signature-based duplicate check
-                    # This prevents adding multiple versions of the same song when using fuzzy matching
-                    if not clear_before_sync and track_signature in plex_tracks:
-                        continue
-
-                    plex_track = self.find_best_match(library_section, parsed_info)
-
-                    # Also check by ratingKey for fuzzy matches
-                    if plex_track and not clear_before_sync:
-                        if plex_track.ratingKey in plex_track_keys:
-                            logging.debug(f"Track (by fuzzy match) already in playlist, skipping: {plex_track.title}")
-                            continue
+                    plex_track = self.find_best_match(library_section, source_track)
 
                 if plex_track:
-                    missing_tracks.append(plex_track)
+                    matched_source_tracks.append(plex_track)
+                    matched_source_keys.append(plex_track.ratingKey)
+                    if plex_track.ratingKey not in current_key_set:
+                        added_count += 1
 
                 progress = int((i + 1) / total_tracks * 100)
                 self.progress_update.emit(f"Checking {playlist_name}... ({i+1}/{len(source_tracks)})", progress)
 
-            if clear_before_sync and current_items:
-                self._ensure_not_cancelled()
-                try:
-                    plex_playlist.removeItems(current_items)
-                except Exception as removal_error:
-                    logging.warning(f"Failed to clear playlist '{playlist_name}': {removal_error}")
+            if clear_before_sync:
+                final_tracks = matched_source_tracks
+            else:
+                source_key_set = set(matched_source_keys)
+                # Keep non-source extras, but always place source tracks first in source order.
+                extras = [track for track in current_items if track.ratingKey not in source_key_set]
+                final_tracks = matched_source_tracks + extras
 
-            if missing_tracks and (not self.stop_requested or not clear_before_sync):
-                self._ensure_not_cancelled()
-                plex_playlist.addItems(missing_tracks)
+            final_keys = [track.ratingKey for track in final_tracks]
+            should_rebuild = clear_before_sync or (final_keys != current_keys)
 
-            return len(missing_tracks)
+            if should_rebuild:
+                self._ensure_not_cancelled()
+                if current_items:
+                    try:
+                        plex_playlist.removeItems(current_items)
+                    except Exception as removal_error:
+                        logging.warning(f"Failed to clear playlist '{playlist_name}': {removal_error}")
+                if final_tracks:
+                    self._ensure_not_cancelled()
+                    plex_playlist.addItems(final_tracks)
+
+            return added_count
 
         except SyncCancelled:
             raise
@@ -2426,8 +2413,20 @@ class SyncThread(QThread):
 
                 if track_response.status_code == 200:
                     track = track_response.json()
-                    artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
-                    tracks.append(f"{track['name']} - {artist_name}")
+                    title = (track.get('name') or '').strip()
+                    if not title:
+                        continue
+                    artist_name = track['artists'][0]['name'] if track.get('artists') else ''
+                    album_name = ((track.get('album') or {}).get('name') or '').strip()
+                    parsed = f"{title} - {artist_name}" if artist_name else title
+                    tracks.append({
+                        "title": title,
+                        "artist": artist_name,
+                        "album": album_name,
+                        "parsed": parsed,
+                        "path": None,
+                        "source": "spotify",
+                    })
                 else:
                     logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
 
@@ -2442,7 +2441,20 @@ class SyncThread(QThread):
             playlist = self.deezer_client.get_playlist(playlist_id)
             tracks = []
             for track in playlist.tracks:
-                tracks.append(f"{track.title} - {track.artist.name}")
+                title = (getattr(track, "title", "") or "").strip()
+                if not title:
+                    continue
+                artist_name = (getattr(getattr(track, "artist", None), "name", "") or "").strip()
+                album_name = (getattr(getattr(track, "album", None), "title", "") or "").strip()
+                parsed = f"{title} - {artist_name}" if artist_name else title
+                tracks.append({
+                    "title": title,
+                    "artist": artist_name,
+                    "album": album_name,
+                    "parsed": parsed,
+                    "path": None,
+                    "source": "deezer",
+                })
             return tracks
         except Exception as e:
             logging.error(f"Error getting Deezer tracks: {str(e)}")
@@ -2454,7 +2466,20 @@ class SyncThread(QThread):
             tracks_data = self.tidal_client.get_playlist_tracks(playlist_uuid)
             tracks = []
             for item in tracks_data['items']:
-                tracks.append(f"{item['title']} - {item['artist']['name']}")
+                title = (item.get("title") or "").strip()
+                if not title:
+                    continue
+                artist_name = ((item.get("artist") or {}).get("name") or "").strip()
+                album_name = ((item.get("album") or {}).get("title") or "").strip()
+                parsed = f"{title} - {artist_name}" if artist_name else title
+                tracks.append({
+                    "title": title,
+                    "artist": artist_name,
+                    "album": album_name,
+                    "parsed": parsed,
+                    "path": None,
+                    "source": "tidal",
+                })
             return tracks
         except Exception as e:
             logging.error(f"Error getting Tidal tracks: {str(e)}")
@@ -2477,10 +2502,20 @@ class SyncThread(QThread):
                     continue
                 title = (entry.get("title") or "").strip()
                 artist = (entry.get("creator") or "").strip()
-                if title and artist:
-                    tracks.append(f"{title} - {artist}")
-                elif title:
-                    tracks.append(title)
+                album = (entry.get("album") or "").strip()
+                recording_mbid = self._extract_recording_mbid(entry)
+                if not title:
+                    continue
+                parsed = f"{title} - {artist}" if artist else title
+                tracks.append({
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "recording_mbid": recording_mbid,
+                    "parsed": parsed,
+                    "path": None,
+                    "source": "listenbrainz",
+                })
             return tracks
         except Exception as e:
             logging.error(f"Error getting ListenBrainz tracks: {str(e)}")
@@ -2583,8 +2618,11 @@ class SyncThread(QThread):
     def find_best_match(self, library_section, track):
         try:
             self._ensure_not_cancelled()
-            title, artist = self.parse_track_info(track)
+            title, artist, album, recording_mbid = self.parse_track_info(track)
+            if not title:
+                return None
             all_tracks = library_section.searchTracks(title=title)
+            parent = self.parent()
 
             # Filter and score tracks with filtering logic
             scored_tracks = []
@@ -2593,6 +2631,8 @@ class SyncThread(QThread):
                 self._ensure_not_cancelled()
                 plex_title = plex_track.title if plex_track.title else ''
                 title_score = fuzz.token_set_ratio(title.lower(), plex_title.lower())
+                if title_score < 50:
+                    continue
 
                 artist_score = 0
                 if artist and plex_track.originalTitle:
@@ -2600,32 +2640,46 @@ class SyncThread(QThread):
                 elif plex_track.artist():
                     artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.artist().title.lower())
 
-                combined_score = (title_score * 0.7) + (artist_score * 0.3)
-
-                # Initialize album_title
                 album_title = ''
+                album_score = 0
+                try:
+                    album_title = plex_track.album().title.lower() if plex_track.album() else ''
+                except Exception:
+                    album_title = ''
+                if album and album_title:
+                    album_score = fuzz.token_set_ratio(album.lower(), album_title)
+
+                if artist and album:
+                    combined_score = (title_score * 0.58) + (artist_score * 0.30) + (album_score * 0.12)
+                elif artist:
+                    combined_score = (title_score * 0.68) + (artist_score * 0.32)
+                else:
+                    combined_score = title_score
+
+                if artist and artist_score < 40:
+                    combined_score -= 18
+                if album and album_title and album_score < 35:
+                    combined_score -= 8
 
                 # Apply smart filtering if enabled
-                if hasattr(self, 'enable_filters_checkbox') and self.enable_filters_checkbox.isChecked():
+                if parent and hasattr(parent, 'enable_filters_checkbox') and parent.enable_filters_checkbox.isChecked():
                     try:
-                        album_title = plex_track.album().title.lower() if plex_track.album() else ''
-
                         # Apply penalties for unwanted album types
                         penalty = 0
 
-                        if hasattr(self, 'filter_live_checkbox') and self.filter_live_checkbox.isChecked():
+                        if hasattr(parent, 'filter_live_checkbox') and parent.filter_live_checkbox.isChecked():
                             if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
                                 penalty += 15
 
-                        if hasattr(self, 'filter_compilation_checkbox') and self.filter_compilation_checkbox.isChecked():
+                        if hasattr(parent, 'filter_compilation_checkbox') and parent.filter_compilation_checkbox.isChecked():
                             if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
                                 penalty += 12
 
-                        if hasattr(self, 'filter_remaster_checkbox') and self.filter_remaster_checkbox.isChecked():
+                        if hasattr(parent, 'filter_remaster_checkbox') and parent.filter_remaster_checkbox.isChecked():
                             if any(keyword in album_title for keyword in ['remaster', 'remastered']):
                                 penalty += 8
 
-                        if hasattr(self, 'filter_deluxe_checkbox') and self.filter_deluxe_checkbox.isChecked():
+                        if hasattr(parent, 'filter_deluxe_checkbox') and parent.filter_deluxe_checkbox.isChecked():
                             if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
                                 penalty += 6
 
@@ -2634,17 +2688,27 @@ class SyncThread(QThread):
                     except Exception as filter_error:
                         logging.warning(f"Could not apply filters to track: {str(filter_error)}")
 
-                scored_tracks.append((plex_track, combined_score, album_title))
+                if recording_mbid:
+                    plex_mbid = self._extract_recording_mbid_from_plex_track(plex_track)
+                    if plex_mbid and plex_mbid == recording_mbid:
+                        combined_score = 100
+
+                scored_tracks.append((plex_track, combined_score, album_title, title_score, artist_score))
 
             # Sort by score (highest first)
             scored_tracks.sort(key=lambda x: x[1], reverse=True)
 
-            if scored_tracks and scored_tracks[0][1] >= 70:
+            if not scored_tracks:
+                return None
+
+            min_score = 78 if artist else 90
+            if scored_tracks[0][1] >= min_score:
+                if artist and scored_tracks[0][4] < 40 and scored_tracks[0][1] < 100:
+                    return None
                 best_track = scored_tracks[0][0]
                 logging.debug(f"Best match for '{title}': {best_track.title} from '{scored_tracks[0][2]}' (score: {scored_tracks[0][1]:.1f})")
                 return best_track
-            else:
-                return None
+            return None
 
         except SyncCancelled:
             raise
@@ -2797,16 +2861,106 @@ class SyncThread(QThread):
             logging.error(f'Error finding track by Plex search: {str(e)}')
             return None
 
+    def _extract_recording_mbid(self, source_track):
+        candidates = []
+        if isinstance(source_track, dict):
+            if source_track.get("recording_mbid"):
+                candidates.append(str(source_track.get("recording_mbid")))
+            identifier = source_track.get("identifier")
+            if isinstance(identifier, str):
+                candidates.append(identifier)
+            elif isinstance(identifier, list):
+                candidates.extend(str(value) for value in identifier if value)
+
+        mbid_pattern = re.compile(
+            r"(?:musicbrainz\.org/recording/|musicbrainz://recording/|recording/)([0-9a-fA-F-]{36})",
+            re.IGNORECASE,
+        )
+        uuid_pattern = re.compile(
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            re.IGNORECASE,
+        )
+        for candidate in candidates:
+            match = mbid_pattern.search(candidate)
+            if match:
+                return match.group(1).lower()
+            uuid_match = uuid_pattern.search(candidate)
+            if uuid_match:
+                return uuid_match.group(1).lower()
+        return ""
+
+    def _extract_recording_mbid_from_plex_track(self, plex_track):
+        guid_candidates = []
+        for attr in ("guid",):
+            value = getattr(plex_track, attr, None)
+            if value:
+                guid_candidates.append(str(value))
+        for guid_obj in getattr(plex_track, "guids", []) or []:
+            guid_id = getattr(guid_obj, "id", None)
+            if guid_id:
+                guid_candidates.append(str(guid_id))
+
+        mbid_pattern = re.compile(
+            r"(?:musicbrainz\.org/recording/|musicbrainz://recording/|recording/)([0-9a-fA-F-]{36})",
+            re.IGNORECASE,
+        )
+        for candidate in guid_candidates:
+            match = mbid_pattern.search(candidate)
+            if match:
+                return match.group(1).lower()
+        return ""
+
+    def normalize_source_track(self, track_info):
+        if isinstance(track_info, dict):
+            track = dict(track_info)
+            title = str(track.get("title", "") or "").strip()
+            artist = str(track.get("artist", "") or "").strip()
+            album = str(track.get("album", "") or "").strip()
+            parsed = str(track.get("parsed", "") or "").strip()
+            if not parsed and title:
+                parsed = f"{title} - {artist}" if artist else title
+            if not title and parsed:
+                if " - " in parsed:
+                    parts = parsed.split(" - ", 1)
+                    title = parts[0].strip()
+                    if not artist:
+                        artist = parts[1].strip()
+                else:
+                    title = parsed
+
+            track["title"] = title
+            track["artist"] = artist
+            track["album"] = album
+            track["parsed"] = parsed
+            track["path"] = track.get("path")
+            if not track.get("recording_mbid"):
+                track["recording_mbid"] = self._extract_recording_mbid(track)
+            return track
+
+        parsed = self.parse_track_info_smart(str(track_info or ""))
+        title = parsed
+        artist = ""
+        if " - " in parsed:
+            parts = parsed.split(" - ", 1)
+            title = parts[0].strip()
+            artist = parts[1].strip()
+        return {
+            "title": title.strip(),
+            "artist": artist.strip(),
+            "album": "",
+            "recording_mbid": "",
+            "parsed": parsed.strip(),
+            "path": None,
+        }
+
     def parse_track_info(self, track):
-        """Legacy method - now just calls the smart parser"""
-        parsed = self.parse_track_info_smart(track)
-        
-        # Return title, artist tuple for compatibility
-        if ' - ' in parsed:
-            parts = parsed.split(' - ', 1)
-            return parts[0].strip(), parts[1].strip()
-        else:
-            return parsed.strip(), ''
+        normalized = self.normalize_source_track(track)
+        return (
+            normalized.get("title", ""),
+            normalized.get("artist", ""),
+            normalized.get("album", ""),
+            normalized.get("recording_mbid", ""),
+        )
 
     def stop(self):
         self.stop_requested = True
@@ -3069,6 +3223,18 @@ class TrackMatchConfirmationDialog(QDialog):
         self.match_score = match_score
         self.user_choice = None
         self.setup_ui()
+
+    def _source_track_display(self):
+        if isinstance(self.source_track, dict):
+            title = str(self.source_track.get("title", "") or "").strip()
+            artist = str(self.source_track.get("artist", "") or "").strip()
+            album = str(self.source_track.get("album", "") or "").strip()
+            if title and artist and album:
+                return f"{title} - {artist}\nAlbum: {album}"
+            if title and artist:
+                return f"{title} - {artist}"
+            return title or str(self.source_track)
+        return str(self.source_track)
         
     def setup_ui(self):
         self.setWindowTitle("Confirm Track Match")
@@ -3209,7 +3375,7 @@ class TrackMatchConfirmationDialog(QDialog):
         layout.addWidget(header)
         
         # Content box
-        content_box = QLabel(str(self.source_track))
+        content_box = QLabel(self._source_track_display())
         content_box.setWordWrap(True)
         content_box.setAlignment(Qt.AlignTop)
         content_box.setMinimumHeight(80)
@@ -4739,10 +4905,10 @@ class PlaylistConverterThread(QThread):
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
     # NEW: Signal for track match confirmation
-    track_match_confirmation_needed = pyqtSignal(str, object, float)  # source_track, plex_track, score
+    track_match_confirmation_needed = pyqtSignal(object, object, float)  # source_track, plex_track, score
 
-    def __init__(self, playlist_source, plex_server, library_section, listenbrainz_token=None):
-        super().__init__()
+    def __init__(self, playlist_source, plex_server, library_section, listenbrainz_token=None, parent=None):
+        super().__init__(parent)
         self.playlist_source = playlist_source
         self.plex_server = plex_server
         self.library_section = library_section
@@ -4842,7 +5008,7 @@ class PlaylistConverterThread(QThread):
         client = ListenBrainzClient(token=self.listenbrainz_token)
         playlist = client.get_playlist(self.playlist_source)
         playlist_name = playlist.get("title") or "ListenBrainz Playlist"
-        playlist_image_url = None
+        playlist_image_url = self._extract_image_url_from_listenbrainz_playlist(playlist)
 
         track_entries = playlist.get("track") or []
         if not isinstance(track_entries, list):
@@ -4856,10 +5022,21 @@ class PlaylistConverterThread(QThread):
                 continue
             title = (entry.get("title") or "").strip()
             artist = (entry.get("creator") or "").strip()
-            if title and artist:
-                tracks.append(f"{title} - {artist}")
-            elif title:
-                tracks.append(title)
+            album = (entry.get("album") or "").strip()
+            recording_mbid = self._extract_recording_mbid(entry)
+            if not title:
+                continue
+            parsed = f"{title} - {artist}" if artist else title
+            tracks.append({
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "recording_mbid": recording_mbid,
+                "identifier": entry.get("identifier"),
+                "parsed": parsed,
+                "path": None,
+                "source": "listenbrainz",
+            })
             self.progress_update.emit(int(((idx + 1) / total) * 50))
             self.progress_message.emit(f"Processing ListenBrainz track {idx + 1}/{total}")
 
@@ -4871,7 +5048,20 @@ class PlaylistConverterThread(QThread):
 
     def process_tidal_track(self, item):
         try:
-            return f"{item['title']} - {item['artist']['name']}"
+            title = (item.get("title") or "").strip()
+            if not title:
+                return None
+            artist_name = ((item.get("artist") or {}).get("name") or "").strip()
+            album_name = ((item.get("album") or {}).get("title") or "").strip()
+            parsed = f"{title} - {artist_name}" if artist_name else title
+            return {
+                "title": title,
+                "artist": artist_name,
+                "album": album_name,
+                "parsed": parsed,
+                "path": None,
+                "source": "tidal",
+            }
         except Exception as e:
             logging.error(f"Error processing Tidal track: {str(e)}")
             return None
@@ -5030,11 +5220,20 @@ class PlaylistConverterThread(QThread):
                                 if track_response.status_code == 200:
                                     track = track_response.json()
                                     if track and track.get('name'):
-                                        artist_name = 'Unknown Artist'
+                                        title = (track.get('name') or '').strip()
+                                        artist_name = ''
                                         if track.get('artists') and len(track['artists']) > 0:
                                             artist_name = track['artists'][0]['name']
-
-                                        tracks.append(f"{track['name']} - {artist_name}")
+                                        album_name = ((track.get('album') or {}).get('name') or '').strip()
+                                        parsed = f"{title} - {artist_name}" if artist_name else title
+                                        tracks.append({
+                                            "title": title,
+                                            "artist": artist_name,
+                                            "album": album_name,
+                                            "parsed": parsed,
+                                            "path": None,
+                                            "source": "spotify",
+                                        })
                                         processed_tracks += 1
 
                                         # Update progress
@@ -5051,10 +5250,20 @@ class PlaylistConverterThread(QThread):
                                     if track_response.status_code == 200:
                                         track = track_response.json()
                                         if track and track.get('name'):
-                                            artist_name = 'Unknown Artist'
+                                            title = (track.get('name') or '').strip()
+                                            artist_name = ''
                                             if track.get('artists') and len(track['artists']) > 0:
                                                 artist_name = track['artists'][0]['name']
-                                            tracks.append(f"{track['name']} - {artist_name}")
+                                            album_name = ((track.get('album') or {}).get('name') or '').strip()
+                                            parsed = f"{title} - {artist_name}" if artist_name else title
+                                            tracks.append({
+                                                "title": title,
+                                                "artist": artist_name,
+                                                "album": album_name,
+                                                "parsed": parsed,
+                                                "path": None,
+                                                "source": "spotify",
+                                            })
                                             processed_tracks += 1
                                 else:
                                     logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
@@ -5107,7 +5316,20 @@ class PlaylistConverterThread(QThread):
         total = getattr(playlist, 'nb_tracks', None) or len(getattr(playlist, 'tracks', [])) or 1
         for track in playlist.tracks:
             self._ensure_not_cancelled()
-            tracks.append(f"{track.title} - {track.artist.name}")
+            title = (getattr(track, "title", "") or "").strip()
+            if not title:
+                continue
+            artist_name = (getattr(getattr(track, "artist", None), "name", "") or "").strip()
+            album_name = (getattr(getattr(track, "album", None), "title", "") or "").strip()
+            parsed = f"{title} - {artist_name}" if artist_name else title
+            tracks.append({
+                "title": title,
+                "artist": artist_name,
+                "album": album_name,
+                "parsed": parsed,
+                "path": None,
+                "source": "deezer",
+            })
             self.progress_update.emit(int(len(tracks) / total * 50))
             self.progress_message.emit(f"Processing Deezer track {len(tracks)}/{total}")
 
@@ -5138,12 +5360,14 @@ class PlaylistConverterThread(QThread):
             total_tracks = len(tracks)
             for i, track in enumerate(tracks):
                 self._ensure_not_cancelled()
-                self.progress_message.emit(f"Matching track {i + 1}/{total_tracks}: {track}")
+                title, artist, _, _ = self.parse_track_info(track)
+                track_label = f"{title} - {artist}" if artist else title
+                self.progress_message.emit(f"Matching track {i + 1}/{total_tracks}: {track_label}")
                 plex_track = self.find_best_match(library_section, track)
                 if plex_track:
                     plex_tracks.append(plex_track)
                 else:
-                    not_found_tracks.append(track)
+                    not_found_tracks.append(track_label)
                 self.progress_update.emit(50 + int((i + 1) / total_tracks * 50))
             
             self._ensure_not_cancelled()
@@ -5220,8 +5444,11 @@ class PlaylistConverterThread(QThread):
     def find_best_match(self, library_section, track):
         """Enhanced find_best_match with user confirmation for low scores"""
         self._ensure_not_cancelled()
-        title, artist = self.parse_track_info(track)
+        title, artist, album, recording_mbid = self.parse_track_info(track)
+        if not title:
+            return None
         all_tracks = library_section.searchTracks(title=title)
+        parent = self.parent()
 
         # Filter and score tracks with filtering logic
         scored_tracks = []
@@ -5231,6 +5458,8 @@ class PlaylistConverterThread(QThread):
             # Calculate similarity score for title
             plex_title = plex_track.title if plex_track.title else ""
             title_score = fuzz.token_set_ratio(title.lower(), plex_title.lower())
+            if title_score < 50:
+                continue
 
             # Calculate similarity score for artist if available
             artist_score = 0
@@ -5239,30 +5468,46 @@ class PlaylistConverterThread(QThread):
             elif plex_track.artist():
                 artist_score = fuzz.token_set_ratio(artist.lower(), plex_track.artist().title.lower())
 
-            # Weighted average of title and artist scores
-            combined_score = (title_score * 0.7) + (artist_score * 0.3)
+            album_title = ""
+            album_score = 0
+            try:
+                album_title = plex_track.album().title.lower() if plex_track.album() else ""
+            except Exception:
+                album_title = ""
+            if album and album_title:
+                album_score = fuzz.token_set_ratio(album.lower(), album_title)
+
+            if artist and album:
+                combined_score = (title_score * 0.58) + (artist_score * 0.30) + (album_score * 0.12)
+            elif artist:
+                combined_score = (title_score * 0.68) + (artist_score * 0.32)
+            else:
+                combined_score = title_score
+
+            if artist and artist_score < 40:
+                combined_score -= 18
+            if album and album_title and album_score < 35:
+                combined_score -= 8
 
             # Apply smart filtering if enabled (same as other find_best_match)
-            if hasattr(self.parent, 'enable_filters_checkbox') and self.parent.enable_filters_checkbox.isChecked():
+            if parent and hasattr(parent, 'enable_filters_checkbox') and parent.enable_filters_checkbox.isChecked():
                 try:
-                    album_title = plex_track.album().title.lower() if plex_track.album() else ''
-
                     # Apply penalties for unwanted album types
                     penalty = 0
 
-                    if hasattr(self.parent, 'filter_live_checkbox') and self.parent.filter_live_checkbox.isChecked():
+                    if hasattr(parent, 'filter_live_checkbox') and parent.filter_live_checkbox.isChecked():
                         if any(keyword in album_title for keyword in ['live', 'concert', 'tour']):
                             penalty += 15
 
-                    if hasattr(self.parent, 'filter_compilation_checkbox') and self.parent.filter_compilation_checkbox.isChecked():
+                    if hasattr(parent, 'filter_compilation_checkbox') and parent.filter_compilation_checkbox.isChecked():
                         if any(keyword in album_title for keyword in ['best of', 'greatest hits', 'collection', 'anthology']):
                             penalty += 12
 
-                    if hasattr(self.parent, 'filter_remaster_checkbox') and self.parent.filter_remaster_checkbox.isChecked():
+                    if hasattr(parent, 'filter_remaster_checkbox') and parent.filter_remaster_checkbox.isChecked():
                         if any(keyword in album_title for keyword in ['remaster', 'remastered']):
                             penalty += 8
 
-                    if hasattr(self.parent, 'filter_deluxe_checkbox') and self.parent.filter_deluxe_checkbox.isChecked():
+                    if hasattr(parent, 'filter_deluxe_checkbox') and parent.filter_deluxe_checkbox.isChecked():
                         if any(keyword in album_title for keyword in ['deluxe', 'special', 'extended', 'expanded', 'anniversary']):
                             penalty += 6
 
@@ -5271,23 +5516,33 @@ class PlaylistConverterThread(QThread):
                 except Exception as filter_error:
                     logging.warning(f"Could not apply filters to track: {str(filter_error)}")
 
-            scored_tracks.append((plex_track, combined_score))
+            if recording_mbid:
+                plex_mbid = self._extract_recording_mbid_from_plex_track(plex_track)
+                if plex_mbid and plex_mbid == recording_mbid:
+                    combined_score = 100
+
+            scored_tracks.append((plex_track, combined_score, title_score, artist_score))
 
         # Find the best match
         best_match = None
         best_score = 0
+        best_artist_score = 0
 
         if scored_tracks:
             scored_tracks.sort(key=lambda x: x[1], reverse=True)
             best_match = scored_tracks[0][0]
             best_score = scored_tracks[0][1]
+            best_artist_score = scored_tracks[0][3]
 
         # NEW: Handle different score ranges
-        if best_score >= 80:
+        high_score_threshold = 82 if artist else 88
+        medium_score_threshold = 70 if artist else 78
+
+        if best_score >= high_score_threshold and (not artist or best_artist_score >= 40 or best_score >= 100):
             # High confidence - auto accept
             logging.info(f"High confidence match for '{track}' to '{best_match.title}' (score: {best_score})")
             return best_match
-        elif best_score >= 60 and not self.skip_all_low_matches:
+        elif best_score >= medium_score_threshold and not self.skip_all_low_matches:
             # Medium confidence - ask user
             logging.info(f"Medium confidence match for '{track}' to '{best_match.title}' (score: {best_score}) - asking user")
             
@@ -5307,7 +5562,7 @@ class PlaylistConverterThread(QThread):
                 logging.info(f"User chose to skip all remaining low matches")
                 self.skip_all_low_matches = True
                 return None
-        elif best_score >= 60 and self.skip_all_low_matches:
+        elif best_score >= medium_score_threshold and self.skip_all_low_matches:
             # User previously chose to skip all low matches
             logging.info(f"Skipping low confidence match for '{track}' (score: {best_score}) - user chose skip all")
             return None
@@ -5316,12 +5571,129 @@ class PlaylistConverterThread(QThread):
             logging.warning(f"Very low confidence match for '{track}' (best score: {best_score}) - auto skipping")
             return None
 
+    def _extract_recording_mbid(self, source_track):
+        candidates = []
+        if isinstance(source_track, dict):
+            if source_track.get("recording_mbid"):
+                candidates.append(str(source_track.get("recording_mbid")))
+            identifier = source_track.get("identifier")
+            if isinstance(identifier, str):
+                candidates.append(identifier)
+            elif isinstance(identifier, list):
+                candidates.extend(str(value) for value in identifier if value)
+
+        mbid_pattern = re.compile(
+            r"(?:musicbrainz\.org/recording/|musicbrainz://recording/|recording/)([0-9a-fA-F-]{36})",
+            re.IGNORECASE,
+        )
+        uuid_pattern = re.compile(
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            re.IGNORECASE,
+        )
+        for candidate in candidates:
+            match = mbid_pattern.search(candidate)
+            if match:
+                return match.group(1).lower()
+            uuid_match = uuid_pattern.search(candidate)
+            if uuid_match:
+                return uuid_match.group(1).lower()
+        return ""
+
+    def _extract_recording_mbid_from_plex_track(self, plex_track):
+        guid_candidates = []
+        for attr in ("guid",):
+            value = getattr(plex_track, attr, None)
+            if value:
+                guid_candidates.append(str(value))
+        for guid_obj in getattr(plex_track, "guids", []) or []:
+            guid_id = getattr(guid_obj, "id", None)
+            if guid_id:
+                guid_candidates.append(str(guid_id))
+
+        mbid_pattern = re.compile(
+            r"(?:musicbrainz\.org/recording/|musicbrainz://recording/|recording/)([0-9a-fA-F-]{36})",
+            re.IGNORECASE,
+        )
+        for candidate in guid_candidates:
+            match = mbid_pattern.search(candidate)
+            if match:
+                return match.group(1).lower()
+        return ""
+
+    def _extract_image_url_from_text(self, text):
+        if not text:
+            return None
+        match = re.search(r"https?://\S+", str(text), re.IGNORECASE)
+        if not match:
+            return None
+
+        candidate = match.group(0).strip().rstrip(").,;")
+        lowered = candidate.lower()
+        image_extensions = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+        if any(ext in lowered for ext in image_extensions):
+            return candidate
+        return None
+
+    def _extract_image_url_from_listenbrainz_playlist(self, playlist):
+        if not isinstance(playlist, dict):
+            return None
+
+        direct_url = (
+            playlist.get("image")
+            or playlist.get("image_url")
+            or playlist.get("thumbnail")
+            or playlist.get("cover_art")
+            or playlist.get("picture")
+        )
+        if isinstance(direct_url, str):
+            image_url = self._extract_image_url_from_text(direct_url)
+            if image_url:
+                return image_url
+
+        fields_to_scan = [
+            playlist.get("annotation"),
+            playlist.get("description"),
+            playlist.get("notes"),
+        ]
+
+        extension = playlist.get("extension")
+        if isinstance(extension, dict):
+            for _, ext_payload in extension.items():
+                fields_to_scan.append(ext_payload)
+
+        while fields_to_scan:
+            value = fields_to_scan.pop(0)
+            if isinstance(value, str):
+                image_url = self._extract_image_url_from_text(value)
+                if image_url:
+                    return image_url
+            elif isinstance(value, dict):
+                fields_to_scan.extend(value.values())
+            elif isinstance(value, list):
+                fields_to_scan.extend(value)
+        return None
+
     def parse_track_info(self, track):
-        parts = track.split(' - ', 1)
+        if isinstance(track, dict):
+            title = str(track.get("title", "") or "").strip()
+            artist = str(track.get("artist", "") or "").strip()
+            album = str(track.get("album", "") or "").strip()
+            if not title:
+                parsed = str(track.get("parsed", "") or "").strip()
+                if " - " in parsed:
+                    parts = parsed.split(" - ", 1)
+                    title = parts[0].strip()
+                    if not artist:
+                        artist = parts[1].strip()
+                else:
+                    title = parsed
+            return title, artist, album, self._extract_recording_mbid(track)
+
+        text = str(track or "").strip()
+        parts = text.split(' - ', 1)
         if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-        else:
-            return track.strip(), ''
+            return parts[0].strip(), parts[1].strip(), "", ""
+        return text, '', "", ""
 
 class ModernButton(QPushButton):
     def __init__(self, *args, **kwargs):
@@ -12542,6 +12914,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 self.plex_server, 
                 self.section_combo.currentData(),
                 listenbrainz_token=listenbrainz_token,
+                parent=self,
             )
             
             # Store the decision for the converter thread

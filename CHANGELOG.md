@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.19.0 - 2026-03-02
+### ✅ Matching Accuracy, Ordering, and ListenBrainz Reliability
+- Fixed smart matching filters not being applied in worker-thread matching paths (sync/import), which could previously prefer live/acoustic/compilation variants.
+- Upgraded source-track normalization to include structured metadata (`title`, `artist`, `album`, optional MBID) across Spotify, Deezer, Tidal, and ListenBrainz import/sync flows.
+- Improved confidence scoring with stronger title/artist gating, album-aware weighting, and safer fallback thresholds to reduce unrelated auto-matches.
+- Added MusicBrainz recording MBID-aware preference when available (especially from ListenBrainz payloads) to improve deterministic track resolution.
+- Fixed playlist sync ordering fidelity: source tracks now preserve source order instead of appending newly matched tracks at the end.
+- Refined duplicate handling so de-duplication-by-signature is scoped to M3U path flows and does not incorrectly suppress or mis-route streaming track matches.
+- Fixed ListenBrainz playlist list reliability by re-fetching track counts when API responses return missing/placeholder values.
+- Added optional ListenBrainz playlist artwork import support by detecting direct image URLs inside playlist annotation/description payloads and applying poster art to Plex playlists on import.
+- Improved low-confidence confirmation dialog rendering for structured source-track metadata.
+
 ## v2.18.1 - 2026-03-01
 ### 🛠️ Hotfix
 - Fixed packaged app startup crash on Windows release builds:
