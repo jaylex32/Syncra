@@ -22,7 +22,7 @@ class ListenBrainzClient:
             {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "Syncra/2.15.0 (+https://github.com/jaylex32/syncra)",
+                "User-Agent": "Syncra/2.20.1 (+https://github.com/jaylex32/syncra)",
             }
         )
         if self.token:

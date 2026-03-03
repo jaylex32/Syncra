@@ -25,7 +25,7 @@ APP_CONFIG_DEFAULTS = {
         "auto_fetch_playlists_on_startup": False,
     },
     "metadata": {
-        "user_agent": "Syncra/2.19.0 (metadata-fixer; contact: github.com/jaylex32/syncra)",
+        "user_agent": "Syncra/2.20.1 (metadata-fixer; contact: github.com/jaylex32/syncra)",
         "rate_limit_rps": 1.0,
         "cache_ttl_hours": 168,
         "auto_apply_threshold": 95,

@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.20.1 - 2026-03-03
+### 🛠️ Portable Backup + Local Tracks Fixes
+- Added a new **Portable Backup** option to preserve Plex server folder hierarchy (relative to the library root), so exported media can keep paths like `Artist/Album/Track.ext`.
+- Applied hierarchy-preserving path handling to both local-copy and remote-download backup flows.
+- Updated portable M3U placement rules to avoid conflicting layout modes when hierarchy preservation is enabled.
+- Fixed **Local Tracks** `Select All` behavior under PyQt6 so it correctly checks every discovered track.
+- Fixed Local Tracks rescans to keep new results aligned with the current `Select All` toggle state.
+
 ## v2.20.0 - 2026-03-02
 ### 🚀 Portable Backup + Editor Overhaul + UX Polish
 - Added **Portable Backup** as a dedicated Tools dialog to export playlists together with actual audio media files.

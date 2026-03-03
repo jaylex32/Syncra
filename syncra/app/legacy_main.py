@@ -16,7 +16,7 @@ import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.20.0"
+__version__ = "2.20.1"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -685,6 +685,7 @@ class PortableBackupThread(QThread):
         write_manifest=True,
         dedupe_tracks=True,
         organize_by_playlist=True,
+        preserve_server_hierarchy=False,
         create_zip=False,
         parent=None,
     ):
@@ -697,8 +698,10 @@ class PortableBackupThread(QThread):
         self.write_manifest = bool(write_manifest)
         self.dedupe_tracks = bool(dedupe_tracks)
         self.organize_by_playlist = bool(organize_by_playlist)
+        self.preserve_server_hierarchy = bool(preserve_server_hierarchy)
         self.create_zip = bool(create_zip)
         self._stop_requested = False
+        self._section_locations_cache = {}
 
     def stop(self):
         self._stop_requested = True
@@ -777,6 +780,68 @@ class PortableBackupThread(QThread):
     def _emit_log(self, message):
         self.log_update.emit(message)
 
+    def _normalize_path_for_compare(self, value):
+        return str(value or "").strip().replace("\\", "/").rstrip("/").lower()
+
+    def _get_track_section_locations(self, track):
+        section_id = getattr(track, "librarySectionID", None)
+        if section_id is None:
+            return []
+        cache_key = str(section_id)
+        if cache_key in self._section_locations_cache:
+            return self._section_locations_cache[cache_key]
+        locations = []
+        try:
+            section = self.plex_server.library.sectionByID(section_id)
+            raw_locations = list(getattr(section, "locations", []) or [])
+            locations = [str(loc or "").strip() for loc in raw_locations if str(loc or "").strip()]
+        except Exception:
+            locations = []
+        self._section_locations_cache[cache_key] = locations
+        return locations
+
+    def _build_preserved_relative_path(self, track, source_path):
+        source_path = str(source_path or "").strip()
+        if not source_path:
+            return ""
+
+        source_cmp = self._normalize_path_for_compare(source_path)
+        matched_prefix = ""
+        matched_prefix_cmp = ""
+        for location in self._get_track_section_locations(track):
+            location_cmp = self._normalize_path_for_compare(location)
+            if not location_cmp:
+                continue
+            exact_match = source_cmp == location_cmp
+            child_match = source_cmp.startswith(location_cmp + "/")
+            if exact_match or child_match:
+                if len(location_cmp) > len(matched_prefix_cmp):
+                    matched_prefix = location
+                    matched_prefix_cmp = location_cmp
+
+        rel_raw = source_path
+        if matched_prefix:
+            rel_raw = source_path[len(matched_prefix):].lstrip("\\/")
+        else:
+            rel_raw = re.sub(r"^[a-zA-Z]:[\\/]*", "", rel_raw)
+            rel_raw = rel_raw.lstrip("\\/")
+
+        if not rel_raw:
+            rel_raw = os.path.basename(source_path)
+        parts = [self._sanitize_name(part, max_length=170) for part in re.split(r"[\\/]+", rel_raw) if part]
+        parts = [part for part in parts if part]
+        if not parts:
+            return ""
+        return os.path.join("media", *parts)
+
+    def _build_backup_rel_candidate(self, track, source_path, playlist_folder_rel, fallback_filename):
+        if self.preserve_server_hierarchy and source_path:
+            preserved = self._build_preserved_relative_path(track, source_path)
+            if preserved:
+                return preserved
+        safe_name = self._sanitize_name(fallback_filename, max_length=170)
+        return os.path.join(playlist_folder_rel, safe_name)
+
     def run(self):
         try:
             if not self.destination_dir:
@@ -835,6 +900,7 @@ class PortableBackupThread(QThread):
                     "write_manifest": self.write_manifest,
                     "dedupe_tracks": self.dedupe_tracks,
                     "organize_by_playlist": self.organize_by_playlist,
+                    "preserve_server_hierarchy": self.preserve_server_hierarchy,
                     "create_zip": self.create_zip,
                 },
                 "summary": {},
@@ -864,7 +930,7 @@ class PortableBackupThread(QThread):
                     f"# Playlist: {playlist_title}",
                     f"# Backup Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 ]
-                if self.include_m3u and self.m3u_beside_media and self.organize_by_playlist:
+                if self.include_m3u and self.m3u_beside_media and self.organize_by_playlist and not self.preserve_server_hierarchy:
                     m3u_dir_abs = os.path.join(backup_folder, playlist_folder_rel)
                     m3u_dir_rel = playlist_folder_rel
                 else:
@@ -907,9 +973,8 @@ class PortableBackupThread(QThread):
                     else:
                         file_copied = False
                         if source_path and os.path.exists(source_path):
-                            base_name = os.path.basename(source_path)
-                            safe_name = self._sanitize_name(base_name, max_length=170)
-                            rel_candidate = os.path.join(playlist_folder_rel, safe_name)
+                            base_name = os.path.basename(source_path) or f"{artist} - {title}.audio"
+                            rel_candidate = self._build_backup_rel_candidate(track, source_path, playlist_folder_rel, base_name)
                             rel_candidate = self._ensure_unique_relpath(rel_candidate, used_rel_paths)
                             backup_rel_path = rel_candidate
                             backup_abs_path = os.path.join(backup_folder, backup_rel_path)
@@ -931,8 +996,7 @@ class PortableBackupThread(QThread):
                                 downloaded_file = self._download_track_from_plex(track, temp_download_dir)
                                 if downloaded_file:
                                     base_name = os.path.basename(downloaded_file)
-                                    safe_name = self._sanitize_name(base_name, max_length=170)
-                                    rel_candidate = os.path.join(playlist_folder_rel, safe_name)
+                                    rel_candidate = self._build_backup_rel_candidate(track, source_path, playlist_folder_rel, base_name)
                                     rel_candidate = self._ensure_unique_relpath(rel_candidate, used_rel_paths)
                                     backup_rel_path = rel_candidate
                                     backup_abs_path = os.path.join(backup_folder, backup_rel_path)
@@ -1174,16 +1238,20 @@ class PortableBackupDialog(QDialog):
         self.dedupe_cb.setChecked(True)
         self.organize_playlist_cb = QCheckBox("Organize copied files by playlist folder")
         self.organize_playlist_cb.setChecked(True)
+        self.preserve_hierarchy_cb = QCheckBox("Preserve server folder hierarchy (relative to library root)")
+        self.preserve_hierarchy_cb.setChecked(False)
         self.include_m3u_cb.toggled.connect(self._sync_option_states)
         self.organize_playlist_cb.toggled.connect(self._sync_option_states)
+        self.preserve_hierarchy_cb.toggled.connect(self._sync_option_states)
         self.create_zip_cb = QCheckBox("Create ZIP archive after backup")
         self.create_zip_cb.setChecked(False)
         options_layout.addWidget(self.include_m3u_cb, 0, 0)
         options_layout.addWidget(self.m3u_beside_media_cb, 0, 1)
         options_layout.addWidget(self.write_manifest_cb, 1, 0)
         options_layout.addWidget(self.dedupe_cb, 1, 1)
-        options_layout.addWidget(self.organize_playlist_cb, 2, 0)
-        options_layout.addWidget(self.create_zip_cb, 2, 1)
+        options_layout.addWidget(self.preserve_hierarchy_cb, 2, 0)
+        options_layout.addWidget(self.organize_playlist_cb, 2, 1)
+        options_layout.addWidget(self.create_zip_cb, 3, 1)
         layout.addWidget(options_group)
 
         progress_group = QGroupBox("Progress")
@@ -1260,7 +1328,15 @@ class PortableBackupDialog(QDialog):
     def _sync_option_states(self):
         include_m3u = self.include_m3u_cb.isChecked()
         organize = self.organize_playlist_cb.isChecked()
-        self.m3u_beside_media_cb.setEnabled(include_m3u and organize and not (self.backup_thread and self.backup_thread.isRunning()))
+        preserve = self.preserve_hierarchy_cb.isChecked()
+        if preserve and self.m3u_beside_media_cb.isChecked():
+            self.m3u_beside_media_cb.setChecked(False)
+        self.m3u_beside_media_cb.setEnabled(
+            include_m3u
+            and organize
+            and not preserve
+            and not (self.backup_thread and self.backup_thread.isRunning())
+        )
 
     def _set_playlist_loading_state(self, loading, message=None):
         self.refresh_playlists_btn.setEnabled(not loading and not (self.backup_thread and self.backup_thread.isRunning()))
@@ -1323,6 +1399,7 @@ class PortableBackupDialog(QDialog):
         self.m3u_beside_media_cb.setEnabled(not running and self.include_m3u_cb.isChecked() and self.organize_playlist_cb.isChecked())
         self.write_manifest_cb.setEnabled(not running)
         self.dedupe_cb.setEnabled(not running)
+        self.preserve_hierarchy_cb.setEnabled(not running)
         self.organize_playlist_cb.setEnabled(not running)
         self.create_zip_cb.setEnabled(not running)
         self.start_btn.setEnabled(not running)
@@ -1361,6 +1438,7 @@ class PortableBackupDialog(QDialog):
             write_manifest=self.write_manifest_cb.isChecked(),
             dedupe_tracks=self.dedupe_cb.isChecked(),
             organize_by_playlist=self.organize_playlist_cb.isChecked(),
+            preserve_server_hierarchy=self.preserve_hierarchy_cb.isChecked(),
             create_zip=self.create_zip_cb.isChecked(),
             parent=self,
         )
@@ -10375,6 +10453,10 @@ class PlexPlaylistManager(QMainWindow):
                             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                             item.setCheckState(Qt.Unchecked)
                             self.track_listwidget.addItem(item)
+
+            # Keep newly scanned items in sync with the current "Select All" toggle.
+            if self.select_all_tracks_checkbox.isChecked():
+                self.select_all_tracks(Qt.CheckState.Checked)
             
             self.statusBar().showMessage(f"Found {self.track_listwidget.count()} audio files.")
         except Exception as e:
@@ -10382,9 +10464,16 @@ class PlexPlaylistManager(QMainWindow):
             QMessageBox.warning(self, "Scan Error", f"Error scanning folder: {str(e)}")
     
     def select_all_tracks(self, state):
+        try:
+            state_value = state.value if isinstance(state, Qt.CheckState) else int(state)
+            is_checked = state_value == Qt.CheckState.Checked.value
+        except Exception:
+            is_checked = bool(state == Qt.Checked)
+
+        target_state = Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked
         for index in range(self.track_listwidget.count()):
             item = self.track_listwidget.item(index)
-            item.setCheckState(Qt.Checked if state == Qt.Checked else Qt.Unchecked)
+            item.setCheckState(target_state)
     
     def get_selected_tracks(self):
         selected_tracks = []
