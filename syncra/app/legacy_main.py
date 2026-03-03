@@ -9,12 +9,14 @@ import logging
 import plistlib
 import pyotp
 import tempfile
+import shutil
+import zipfile
 import platform
 import signal
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.19.0"
+__version__ = "2.20.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -37,7 +39,6 @@ import time
 import random
 import webbrowser
 import urllib.parse
-from urllib.parse import quote
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import deezer
@@ -667,6 +668,768 @@ class BackupThread(QThread):
             logging.error(f"Error during backup: {str(e)}")
             self.error.emit(str(e))
 
+
+class PortableBackupThread(QThread):
+    progress_update = pyqtSignal(str, int)  # message, percentage
+    log_update = pyqtSignal(str)
+    backup_complete = pyqtSignal(dict)  # backup summary
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        plex_server,
+        destination_dir,
+        playlist_ids=None,
+        include_m3u=True,
+        m3u_beside_media=True,
+        write_manifest=True,
+        dedupe_tracks=True,
+        organize_by_playlist=True,
+        create_zip=False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.plex_server = plex_server
+        self.destination_dir = destination_dir
+        self.playlist_ids = set(str(pid) for pid in (playlist_ids or []))
+        self.include_m3u = bool(include_m3u)
+        self.m3u_beside_media = bool(m3u_beside_media)
+        self.write_manifest = bool(write_manifest)
+        self.dedupe_tracks = bool(dedupe_tracks)
+        self.organize_by_playlist = bool(organize_by_playlist)
+        self.create_zip = bool(create_zip)
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def _sanitize_name(self, value, max_length=120):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return "Untitled"
+        replacements = {
+            "/": "_",
+            "\\": "_",
+            ":": " -",
+            "*": "",
+            "?": "",
+            '"': "'",
+            "<": "(",
+            ">": ")",
+            "|": "-",
+            "\n": " ",
+            "\r": " ",
+            "\t": " ",
+        }
+        for bad, repl in replacements.items():
+            cleaned = cleaned.replace(bad, repl)
+        cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
+        if not cleaned:
+            cleaned = "Untitled"
+        return cleaned[:max_length]
+
+    def _ensure_unique_relpath(self, rel_path, used_paths):
+        base, ext = os.path.splitext(rel_path)
+        candidate = rel_path
+        idx = 2
+        while os.path.normcase(candidate) in used_paths:
+            candidate = f"{base}_{idx}{ext}"
+            idx += 1
+        return candidate
+
+    def _extract_track_file_path(self, track):
+        try:
+            media_items = getattr(track, "media", None) or []
+            for media in media_items:
+                parts = getattr(media, "parts", None) or []
+                for part in parts:
+                    file_path = str(getattr(part, "file", "") or "").strip()
+                    if file_path:
+                        return file_path
+        except Exception:
+            return ""
+        return ""
+
+    def _track_artist(self, track):
+        artist = str(getattr(track, "originalTitle", "") or "").strip()
+        if artist:
+            return artist
+        try:
+            artist_obj = track.artist() if hasattr(track, "artist") else None
+            if artist_obj:
+                return str(getattr(artist_obj, "title", "") or "").strip() or "Unknown Artist"
+        except Exception:
+            pass
+        return "Unknown Artist"
+
+    def _download_track_from_plex(self, track, temp_dir):
+        os.makedirs(temp_dir, exist_ok=True)
+        # Use Plex-generated filename/container to avoid odd source filenames on remote servers.
+        downloaded = track.download(savepath=temp_dir, keep_original_name=False)
+        if not downloaded:
+            return ""
+        for path in downloaded:
+            if path and os.path.exists(path):
+                return path
+        return ""
+
+    def _emit_log(self, message):
+        self.log_update.emit(message)
+
+    def run(self):
+        try:
+            if not self.destination_dir:
+                raise ValueError("Select a destination folder first.")
+
+            os.makedirs(self.destination_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_folder = os.path.join(self.destination_dir, f"syncra_portable_backup_{timestamp}")
+            media_root = os.path.join(backup_folder, "media")
+            playlists_root = os.path.join(backup_folder, "playlists")
+            os.makedirs(media_root, exist_ok=True)
+            if self.include_m3u:
+                os.makedirs(playlists_root, exist_ok=True)
+
+            self.progress_update.emit("Loading playlists from Plex...", 2)
+            all_playlists = list(self.plex_server.playlists())
+            if self.playlist_ids:
+                selected = [p for p in all_playlists if str(getattr(p, "ratingKey", "") or "") in self.playlist_ids]
+            else:
+                selected = all_playlists
+            if not selected:
+                raise ValueError("No playlists selected for portable backup.")
+
+            selected_payload = []
+            total_tracks = 0
+            total_playlists = len(selected)
+            for idx, playlist in enumerate(selected, start=1):
+                if self._stop_requested:
+                    raise RuntimeError("Portable backup cancelled.")
+                self.progress_update.emit(
+                    f"Reading playlist {idx}/{total_playlists}: {playlist.title}",
+                    min(8, 2 + int((idx / max(total_playlists, 1)) * 6)),
+                )
+                items = list(playlist.items())
+                selected_payload.append((playlist, items))
+                total_tracks += len(items)
+
+            copied_files = 0
+            copied_bytes = 0
+            deduped_refs = 0
+            remote_downloaded = 0
+            missing_tracks = 0
+            failed_tracks = 0
+            processed_tracks = 0
+            source_map = {}
+            used_rel_paths = set()
+            backup_playlists = []
+
+            manifest = {
+                "version": "1.0",
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "backup_folder": backup_folder,
+                "settings": {
+                    "include_m3u": self.include_m3u,
+                    "m3u_beside_media": self.m3u_beside_media,
+                    "write_manifest": self.write_manifest,
+                    "dedupe_tracks": self.dedupe_tracks,
+                    "organize_by_playlist": self.organize_by_playlist,
+                    "create_zip": self.create_zip,
+                },
+                "summary": {},
+                "playlists": backup_playlists,
+            }
+
+            for playlist_idx, (playlist, items) in enumerate(selected_payload, start=1):
+                if self._stop_requested:
+                    raise RuntimeError("Portable backup cancelled.")
+                playlist_title = str(getattr(playlist, "title", "Unnamed Playlist") or "Unnamed Playlist")
+                safe_playlist_name = self._sanitize_name(playlist_title)
+                playlist_folder_rel = os.path.join("media", safe_playlist_name) if self.organize_by_playlist else "media"
+
+                self._emit_log(f"Processing playlist {playlist_idx}/{total_playlists}: {playlist_title} ({len(items)} tracks)")
+                playlist_manifest = {
+                    "title": playlist_title,
+                    "track_count": len(items),
+                    "copied_tracks": 0,
+                    "deduped_tracks": 0,
+                    "missing_tracks": 0,
+                    "failed_tracks": 0,
+                    "m3u_file": "",
+                    "tracks": [],
+                }
+                m3u_lines = [
+                    "#EXTM3U",
+                    f"# Playlist: {playlist_title}",
+                    f"# Backup Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                ]
+                if self.include_m3u and self.m3u_beside_media and self.organize_by_playlist:
+                    m3u_dir_abs = os.path.join(backup_folder, playlist_folder_rel)
+                    m3u_dir_rel = playlist_folder_rel
+                else:
+                    m3u_dir_abs = playlists_root
+                    m3u_dir_rel = "playlists"
+                if self.include_m3u:
+                    os.makedirs(m3u_dir_abs, exist_ok=True)
+
+                for track in items:
+                    processed_tracks += 1
+                    title = str(getattr(track, "title", "") or "Unknown Title")
+                    artist = self._track_artist(track)
+                    album = str(getattr(track, "parentTitle", "") or "")
+                    duration_ms = int(getattr(track, "duration", 0) or 0)
+                    rating_key = str(getattr(track, "ratingKey", "") or "").strip()
+
+                    source_path = self._extract_track_file_path(track)
+                    track_entry = {
+                        "title": title,
+                        "artist": artist,
+                        "album": album,
+                        "duration_ms": duration_ms,
+                        "source_path": source_path,
+                        "backup_path": "",
+                        "status": "pending",
+                    }
+
+                    backup_rel_path = ""
+                    dedupe_key = ""
+                    if source_path:
+                        dedupe_key = f"path:{os.path.normcase(os.path.normpath(source_path))}"
+                    elif rating_key:
+                        dedupe_key = f"rk:{rating_key}"
+
+                    if self.dedupe_tracks and dedupe_key and dedupe_key in source_map:
+                        backup_rel_path = source_map[dedupe_key]
+                        deduped_refs += 1
+                        playlist_manifest["deduped_tracks"] += 1
+                        track_entry["status"] = "deduped"
+                    else:
+                        file_copied = False
+                        if source_path and os.path.exists(source_path):
+                            base_name = os.path.basename(source_path)
+                            safe_name = self._sanitize_name(base_name, max_length=170)
+                            rel_candidate = os.path.join(playlist_folder_rel, safe_name)
+                            rel_candidate = self._ensure_unique_relpath(rel_candidate, used_rel_paths)
+                            backup_rel_path = rel_candidate
+                            backup_abs_path = os.path.join(backup_folder, backup_rel_path)
+                            os.makedirs(os.path.dirname(backup_abs_path), exist_ok=True)
+                            try:
+                                shutil.copy2(source_path, backup_abs_path)
+                                file_copied = True
+                                copied_files += 1
+                                copied_bytes += int(os.path.getsize(backup_abs_path))
+                                used_rel_paths.add(os.path.normcase(backup_rel_path))
+                                playlist_manifest["copied_tracks"] += 1
+                                track_entry["status"] = "copied_local"
+                            except Exception as copy_error:
+                                self._emit_log(f"Local copy failed, trying remote: {title} - {artist} | {copy_error}")
+
+                        if not file_copied:
+                            temp_download_dir = os.path.join(backup_folder, "_tmp_downloads")
+                            try:
+                                downloaded_file = self._download_track_from_plex(track, temp_download_dir)
+                                if downloaded_file:
+                                    base_name = os.path.basename(downloaded_file)
+                                    safe_name = self._sanitize_name(base_name, max_length=170)
+                                    rel_candidate = os.path.join(playlist_folder_rel, safe_name)
+                                    rel_candidate = self._ensure_unique_relpath(rel_candidate, used_rel_paths)
+                                    backup_rel_path = rel_candidate
+                                    backup_abs_path = os.path.join(backup_folder, backup_rel_path)
+                                    os.makedirs(os.path.dirname(backup_abs_path), exist_ok=True)
+                                    shutil.move(downloaded_file, backup_abs_path)
+                                    file_copied = True
+                                    copied_files += 1
+                                    remote_downloaded += 1
+                                    copied_bytes += int(os.path.getsize(backup_abs_path))
+                                    used_rel_paths.add(os.path.normcase(backup_rel_path))
+                                    playlist_manifest["copied_tracks"] += 1
+                                    track_entry["status"] = "copied_remote"
+                                else:
+                                    if source_path:
+                                        missing_tracks += 1
+                                        playlist_manifest["missing_tracks"] += 1
+                                        track_entry["status"] = "missing_file"
+                                    else:
+                                        missing_tracks += 1
+                                        playlist_manifest["missing_tracks"] += 1
+                                        track_entry["status"] = "missing_source_path"
+                            except Exception as remote_error:
+                                failed_tracks += 1
+                                playlist_manifest["failed_tracks"] += 1
+                                track_entry["status"] = f"remote_download_failed: {remote_error}"
+                                backup_rel_path = ""
+                                self._emit_log(f"Remote download failed: {title} - {artist} | {remote_error}")
+
+                        if file_copied and self.dedupe_tracks and dedupe_key:
+                            source_map[dedupe_key] = backup_rel_path
+                        elif file_copied and self.dedupe_tracks and not dedupe_key and rating_key:
+                            source_map[f"rk:{rating_key}"] = backup_rel_path
+
+                        if not file_copied and not track_entry["status"].startswith(("missing_", "remote_download_failed")):
+                            failed_tracks += 1
+                            playlist_manifest["failed_tracks"] += 1
+                            track_entry["status"] = "copy_failed"
+                            backup_rel_path = ""
+                            self._emit_log(f"Failed to back up track: {title} - {artist}")
+
+                    if backup_rel_path:
+                        backup_rel_path = backup_rel_path.replace("\\", "/")
+                        track_entry["backup_path"] = backup_rel_path
+                        if self.include_m3u:
+                            m3u_track_path = os.path.relpath(
+                                os.path.join(backup_folder, backup_rel_path.replace("/", os.sep)),
+                                m3u_dir_abs,
+                            ).replace("\\", "/")
+                            m3u_lines.append(f"#EXTINF:-1,{artist} - {title}")
+                            m3u_lines.append(m3u_track_path)
+                    playlist_manifest["tracks"].append(track_entry)
+
+                    if total_tracks > 0:
+                        progress = 10 + int((processed_tracks / total_tracks) * 85)
+                    else:
+                        progress = 95
+                    self.progress_update.emit(
+                        f"Copying media files ({processed_tracks}/{max(total_tracks, 1)})...",
+                        min(progress, 95),
+                    )
+
+                if self.include_m3u:
+                    m3u_name = f"{safe_playlist_name}.m3u"
+                    m3u_counter = 2
+                    while os.path.exists(os.path.join(m3u_dir_abs, m3u_name)):
+                        m3u_name = f"{safe_playlist_name}_{m3u_counter}.m3u"
+                        m3u_counter += 1
+                    m3u_abs = os.path.join(m3u_dir_abs, m3u_name)
+                    with open(m3u_abs, "w", encoding="utf-8") as m3u_file:
+                        m3u_file.write("\n".join(m3u_lines) + "\n")
+                    playlist_manifest["m3u_file"] = os.path.join(m3u_dir_rel, m3u_name).replace("\\", "/")
+                backup_playlists.append(playlist_manifest)
+
+            temp_download_dir = os.path.join(backup_folder, "_tmp_downloads")
+            if os.path.isdir(temp_download_dir):
+                try:
+                    shutil.rmtree(temp_download_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+            manifest["summary"] = {
+                "playlists": total_playlists,
+                "tracks_total": total_tracks,
+                "files_copied": copied_files,
+                "remote_downloaded": remote_downloaded,
+                "deduped_references": deduped_refs,
+                "missing_tracks": missing_tracks,
+                "failed_tracks": failed_tracks,
+                "bytes_copied": copied_bytes,
+            }
+
+            manifest_path = ""
+            if self.write_manifest:
+                manifest_path = os.path.join(backup_folder, "backup_manifest.json")
+                with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+                    json.dump(manifest, manifest_file, indent=2)
+
+            zip_path = ""
+            if self.create_zip:
+                self.progress_update.emit("Creating ZIP archive...", 97)
+                zip_path = f"{backup_folder}.zip"
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for root, _, files in os.walk(backup_folder):
+                        for filename in files:
+                            abs_file = os.path.join(root, filename)
+                            arc_name = os.path.relpath(abs_file, backup_folder)
+                            zf.write(abs_file, arc_name)
+
+            self.progress_update.emit("Portable backup complete.", 100)
+            self.backup_complete.emit(
+                {
+                    "backup_folder": backup_folder,
+                    "manifest_path": manifest_path,
+                    "zip_path": zip_path,
+                    "playlists": total_playlists,
+                    "tracks_total": total_tracks,
+                    "files_copied": copied_files,
+                    "remote_downloaded": remote_downloaded,
+                    "deduped_references": deduped_refs,
+                    "missing_tracks": missing_tracks,
+                    "failed_tracks": failed_tracks,
+                    "bytes_copied": copied_bytes,
+                }
+            )
+        except Exception as e:
+            logging.error(f"Portable backup failed: {e}")
+            self.error.emit(str(e))
+
+
+class PortableBackupPlaylistLoadThread(QThread):
+    progress_update = pyqtSignal(str, int)
+    playlists_loaded = pyqtSignal(list)  # [{"id": str, "title": str, "count": int}]
+    error = pyqtSignal(str)
+
+    def __init__(self, plex_server, parent=None):
+        super().__init__(parent)
+        self.plex_server = plex_server
+
+    def run(self):
+        try:
+            self.progress_update.emit("Loading playlists...", 5)
+            playlists = list(self.plex_server.playlists())
+            total = len(playlists)
+            payload = []
+            for idx, playlist in enumerate(playlists, start=1):
+                title = str(getattr(playlist, "title", "Untitled") or "Untitled")
+                playlist_id = str(getattr(playlist, "ratingKey", "") or "")
+                leaf_count = getattr(playlist, "leafCount", None)
+                try:
+                    count = int(leaf_count) if leaf_count is not None else 0
+                except Exception:
+                    count = 0
+                payload.append({"id": playlist_id, "title": title, "count": count})
+                progress = 5 + int((idx / max(total, 1)) * 95)
+                self.progress_update.emit(f"Loading playlists... ({idx}/{total})", min(progress, 100))
+            self.playlists_loaded.emit(payload)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class PortableBackupDialog(QDialog):
+    def __init__(self, plex_server, parent=None):
+        super().__init__(parent)
+        self.plex_server = plex_server
+        self.backup_thread = None
+        self.playlist_load_thread = None
+        self.last_backup_folder = ""
+        self.last_zip_path = ""
+        self._build_ui()
+        self._load_playlists()
+
+    def _build_ui(self):
+        self.setWindowTitle("Portable Backup - Playlists + Audio")
+        self.resize(940, 680)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel("Portable Backup")
+        header.setStyleSheet("font-size: 20px; font-weight: 700; color: #f5f7fb;")
+        layout.addWidget(header)
+
+        subtitle = QLabel("Back up playlist files and copy the actual audio files to a portable folder.")
+        subtitle.setStyleSheet("color: #a8b9cf;")
+        layout.addWidget(subtitle)
+
+        scope_group = QGroupBox("Scope")
+        scope_layout = QVBoxLayout(scope_group)
+
+        scope_row = QHBoxLayout()
+        self.scope_all_radio = QRadioButton("All playlists")
+        self.scope_selected_radio = QRadioButton("Selected playlists only")
+        self.scope_all_radio.setChecked(True)
+        self.scope_all_radio.toggled.connect(self._update_scope_state)
+        self.scope_selected_radio.toggled.connect(self._update_scope_state)
+        scope_row.addWidget(self.scope_all_radio)
+        scope_row.addWidget(self.scope_selected_radio)
+        scope_row.addStretch()
+        self.refresh_playlists_btn = ModernButton("Refresh")
+        self.refresh_playlists_btn.clicked.connect(self._load_playlists)
+        scope_row.addWidget(self.refresh_playlists_btn)
+        scope_layout.addLayout(scope_row)
+
+        picker_row = QHBoxLayout()
+        self.playlist_list = QListWidget()
+        self.playlist_list.setMinimumHeight(180)
+        picker_row.addWidget(self.playlist_list, 1)
+        picker_actions = QVBoxLayout()
+        self.select_all_btn = ModernButton("Select All")
+        self.select_all_btn.clicked.connect(self._select_all_playlists)
+        self.select_none_btn = ModernButton("Select None")
+        self.select_none_btn.clicked.connect(self._select_no_playlists)
+        picker_actions.addWidget(self.select_all_btn)
+        picker_actions.addWidget(self.select_none_btn)
+        picker_actions.addStretch()
+        picker_row.addLayout(picker_actions)
+        scope_layout.addLayout(picker_row)
+        layout.addWidget(scope_group)
+
+        destination_group = QGroupBox("Destination")
+        destination_layout = QHBoxLayout(destination_group)
+        self.destination_input = QLineEdit()
+        self.destination_input.setPlaceholderText("Select backup destination folder...")
+        destination_layout.addWidget(self.destination_input, 1)
+        self.browse_btn = ModernButton("Browse")
+        self.browse_btn.clicked.connect(self._browse_destination)
+        destination_layout.addWidget(self.browse_btn)
+        layout.addWidget(destination_group)
+
+        options_group = QGroupBox("Options")
+        options_layout = QGridLayout(options_group)
+        self.include_m3u_cb = QCheckBox("Include M3U playlist files")
+        self.include_m3u_cb.setChecked(True)
+        self.m3u_beside_media_cb = QCheckBox("Write M3U beside playlist media (portable)")
+        self.m3u_beside_media_cb.setChecked(True)
+        self.write_manifest_cb = QCheckBox("Create backup_manifest.json")
+        self.write_manifest_cb.setChecked(True)
+        self.dedupe_cb = QCheckBox("Deduplicate shared tracks across playlists")
+        self.dedupe_cb.setChecked(True)
+        self.organize_playlist_cb = QCheckBox("Organize copied files by playlist folder")
+        self.organize_playlist_cb.setChecked(True)
+        self.include_m3u_cb.toggled.connect(self._sync_option_states)
+        self.organize_playlist_cb.toggled.connect(self._sync_option_states)
+        self.create_zip_cb = QCheckBox("Create ZIP archive after backup")
+        self.create_zip_cb.setChecked(False)
+        options_layout.addWidget(self.include_m3u_cb, 0, 0)
+        options_layout.addWidget(self.m3u_beside_media_cb, 0, 1)
+        options_layout.addWidget(self.write_manifest_cb, 1, 0)
+        options_layout.addWidget(self.dedupe_cb, 1, 1)
+        options_layout.addWidget(self.organize_playlist_cb, 2, 0)
+        options_layout.addWidget(self.create_zip_cb, 2, 1)
+        layout.addWidget(options_group)
+
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.progress_label = QLabel("Ready.")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(160)
+        progress_layout.addWidget(self.progress_label)
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.log_text)
+        layout.addWidget(progress_group)
+
+        button_row = QHBoxLayout()
+        self.open_folder_btn = ModernButton("Open Backup Folder")
+        self.open_folder_btn.clicked.connect(self._open_last_backup_folder)
+        self.open_folder_btn.setEnabled(False)
+        button_row.addWidget(self.open_folder_btn)
+        self.open_zip_btn = ModernButton("Open ZIP")
+        self.open_zip_btn.clicked.connect(self._open_last_zip)
+        self.open_zip_btn.setEnabled(False)
+        button_row.addWidget(self.open_zip_btn)
+        button_row.addStretch()
+        self.start_btn = ModernButton("Start Portable Backup")
+        self.start_btn.clicked.connect(self._start_backup)
+        button_row.addWidget(self.start_btn)
+        self.close_btn = ModernButton("Close")
+        self.close_btn.clicked.connect(self.reject)
+        button_row.addWidget(self.close_btn)
+        layout.addLayout(button_row)
+
+        self._update_scope_state()
+        self._sync_option_states()
+
+    def _load_playlists(self):
+        if self.playlist_load_thread and self.playlist_load_thread.isRunning():
+            return
+        self.playlist_list.clear()
+        self._set_playlist_loading_state(True, "Loading playlists...")
+        self._append_log("Loading playlists...")
+        self.playlist_load_thread = PortableBackupPlaylistLoadThread(self.plex_server, self)
+        self.playlist_load_thread.progress_update.connect(self._on_playlist_load_progress)
+        self.playlist_load_thread.playlists_loaded.connect(self._on_playlists_loaded)
+        self.playlist_load_thread.error.connect(self._on_playlists_error)
+        self.playlist_load_thread.finished.connect(self._on_playlists_load_finished)
+        self.playlist_load_thread.start()
+
+    def _update_scope_state(self):
+        selected_mode = self.scope_selected_radio.isChecked()
+        self.playlist_list.setEnabled(selected_mode)
+        self.select_all_btn.setEnabled(selected_mode)
+        self.select_none_btn.setEnabled(selected_mode)
+
+    def _select_all_playlists(self):
+        for idx in range(self.playlist_list.count()):
+            self.playlist_list.item(idx).setCheckState(Qt.CheckState.Checked)
+
+    def _select_no_playlists(self):
+        for idx in range(self.playlist_list.count()):
+            self.playlist_list.item(idx).setCheckState(Qt.CheckState.Unchecked)
+
+    def _browse_destination(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Backup Destination")
+        if folder:
+            self.destination_input.setText(folder)
+
+    def _append_log(self, message):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{stamp}] {message}")
+
+    def _sync_option_states(self):
+        include_m3u = self.include_m3u_cb.isChecked()
+        organize = self.organize_playlist_cb.isChecked()
+        self.m3u_beside_media_cb.setEnabled(include_m3u and organize and not (self.backup_thread and self.backup_thread.isRunning()))
+
+    def _set_playlist_loading_state(self, loading, message=None):
+        self.refresh_playlists_btn.setEnabled(not loading and not (self.backup_thread and self.backup_thread.isRunning()))
+        self.scope_all_radio.setEnabled(not loading and not (self.backup_thread and self.backup_thread.isRunning()))
+        self.scope_selected_radio.setEnabled(not loading and not (self.backup_thread and self.backup_thread.isRunning()))
+        self.playlist_list.setEnabled(not loading and self.scope_selected_radio.isChecked() and not (self.backup_thread and self.backup_thread.isRunning()))
+        self.select_all_btn.setEnabled(not loading and self.scope_selected_radio.isChecked() and not (self.backup_thread and self.backup_thread.isRunning()))
+        self.select_none_btn.setEnabled(not loading and self.scope_selected_radio.isChecked() and not (self.backup_thread and self.backup_thread.isRunning()))
+        self.start_btn.setEnabled(not loading and not (self.backup_thread and self.backup_thread.isRunning()))
+        if message:
+            self.progress_label.setText(message)
+
+    def _on_playlist_load_progress(self, message, percentage):
+        self.progress_label.setText(message)
+        self.progress_bar.setValue(max(0, min(100, int(percentage))))
+
+    def _on_playlists_loaded(self, playlists):
+        self.playlist_list.clear()
+        for playlist in playlists:
+            title = str(playlist.get("title", "Untitled") or "Untitled")
+            playlist_id = str(playlist.get("id", "") or "")
+            count = int(playlist.get("count", 0) or 0)
+            item = QListWidgetItem(f"{title} ({count} tracks)")
+            item.setData(Qt.ItemDataRole.UserRole, playlist_id)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.playlist_list.addItem(item)
+        self._append_log(f"Loaded {len(playlists)} playlists.")
+        self.progress_label.setText("Ready.")
+        self.progress_bar.setValue(0)
+
+    def _on_playlists_error(self, message):
+        self._append_log(f"Failed to load playlists: {message}")
+        self.progress_label.setText("Failed to load playlists.")
+
+    def _on_playlists_load_finished(self):
+        self.playlist_load_thread = None
+        self._set_playlist_loading_state(False, "Ready.")
+        self._update_scope_state()
+
+    def _selected_playlist_ids(self):
+        ids = []
+        for idx in range(self.playlist_list.count()):
+            item = self.playlist_list.item(idx)
+            if item.checkState() == Qt.CheckState.Checked:
+                playlist_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                if playlist_id:
+                    ids.append(playlist_id)
+        return ids
+
+    def _set_running_state(self, running):
+        self.scope_all_radio.setEnabled(not running)
+        self.scope_selected_radio.setEnabled(not running)
+        self.refresh_playlists_btn.setEnabled(not running and not (self.playlist_load_thread and self.playlist_load_thread.isRunning()))
+        self.select_all_btn.setEnabled(not running and self.scope_selected_radio.isChecked())
+        self.select_none_btn.setEnabled(not running and self.scope_selected_radio.isChecked())
+        self.playlist_list.setEnabled(not running and self.scope_selected_radio.isChecked() and not (self.playlist_load_thread and self.playlist_load_thread.isRunning()))
+        self.destination_input.setEnabled(not running)
+        self.browse_btn.setEnabled(not running)
+        self.include_m3u_cb.setEnabled(not running)
+        self.m3u_beside_media_cb.setEnabled(not running and self.include_m3u_cb.isChecked() and self.organize_playlist_cb.isChecked())
+        self.write_manifest_cb.setEnabled(not running)
+        self.dedupe_cb.setEnabled(not running)
+        self.organize_playlist_cb.setEnabled(not running)
+        self.create_zip_cb.setEnabled(not running)
+        self.start_btn.setEnabled(not running)
+        self.close_btn.setEnabled(not running)
+        self._sync_option_states()
+
+    def _start_backup(self):
+        if self.playlist_load_thread and self.playlist_load_thread.isRunning():
+            QMessageBox.information(self, "Loading Playlists", "Please wait for playlists to finish loading.")
+            return
+        destination = self.destination_input.text().strip()
+        if not destination:
+            QMessageBox.warning(self, "Missing Destination", "Select a destination folder first.")
+            return
+        playlist_ids = []
+        if self.scope_selected_radio.isChecked():
+            playlist_ids = self._selected_playlist_ids()
+            if not playlist_ids:
+                QMessageBox.warning(self, "No Playlists Selected", "Select at least one playlist to back up.")
+                return
+
+        self.progress_label.setText("Starting portable backup...")
+        self.progress_bar.setValue(0)
+        self._append_log("Starting portable backup job...")
+        self.last_backup_folder = ""
+        self.last_zip_path = ""
+        self.open_folder_btn.setEnabled(False)
+        self.open_zip_btn.setEnabled(False)
+
+        self.backup_thread = PortableBackupThread(
+            plex_server=self.plex_server,
+            destination_dir=destination,
+            playlist_ids=playlist_ids,
+            include_m3u=self.include_m3u_cb.isChecked(),
+            m3u_beside_media=self.m3u_beside_media_cb.isChecked(),
+            write_manifest=self.write_manifest_cb.isChecked(),
+            dedupe_tracks=self.dedupe_cb.isChecked(),
+            organize_by_playlist=self.organize_playlist_cb.isChecked(),
+            create_zip=self.create_zip_cb.isChecked(),
+            parent=self,
+        )
+        self.backup_thread.progress_update.connect(self._on_progress_update)
+        self.backup_thread.log_update.connect(self._append_log)
+        self.backup_thread.backup_complete.connect(self._on_backup_complete)
+        self.backup_thread.error.connect(self._on_backup_error)
+        self.backup_thread.finished.connect(self._on_backup_finished)
+
+        self._set_running_state(True)
+        self.backup_thread.start()
+
+    def _on_progress_update(self, message, percentage):
+        self.progress_label.setText(message)
+        self.progress_bar.setValue(max(0, min(100, int(percentage))))
+
+    def _on_backup_complete(self, result):
+        self.last_backup_folder = str(result.get("backup_folder", "") or "")
+        self.last_zip_path = str(result.get("zip_path", "") or "")
+        self.open_folder_btn.setEnabled(bool(self.last_backup_folder and os.path.exists(self.last_backup_folder)))
+        self.open_zip_btn.setEnabled(bool(self.last_zip_path and os.path.exists(self.last_zip_path)))
+
+        self._append_log(
+            f"Complete: {result.get('files_copied', 0)} files copied "
+            f"({result.get('remote_downloaded', 0)} remote), "
+            f"{result.get('missing_tracks', 0)} missing, {result.get('failed_tracks', 0)} failed."
+        )
+        summary = (
+            f"Portable backup complete.\n\n"
+            f"Playlists: {result.get('playlists', 0)}\n"
+            f"Tracks scanned: {result.get('tracks_total', 0)}\n"
+            f"Audio files copied: {result.get('files_copied', 0)}\n"
+            f"Downloaded from server: {result.get('remote_downloaded', 0)}\n"
+            f"Deduped references: {result.get('deduped_references', 0)}\n"
+            f"Missing files: {result.get('missing_tracks', 0)}\n"
+            f"Failed copies: {result.get('failed_tracks', 0)}\n\n"
+            f"Folder:\n{self.last_backup_folder}"
+        )
+        if self.last_zip_path:
+            summary += f"\n\nZIP:\n{self.last_zip_path}"
+        QMessageBox.information(self, "Portable Backup Complete", summary)
+
+    def _on_backup_error(self, message):
+        self._append_log(f"Error: {message}")
+        QMessageBox.critical(self, "Portable Backup Error", message)
+
+    def _on_backup_finished(self):
+        self._set_running_state(False)
+        self.backup_thread = None
+
+    def _open_last_backup_folder(self):
+        if self.last_backup_folder and os.path.exists(self.last_backup_folder):
+            webbrowser.open(Path(self.last_backup_folder).resolve().as_uri())
+
+    def _open_last_zip(self):
+        if self.last_zip_path and os.path.exists(self.last_zip_path):
+            webbrowser.open(Path(self.last_zip_path).resolve().as_uri())
+
+    def closeEvent(self, event):
+        if self.playlist_load_thread and self.playlist_load_thread.isRunning():
+            QMessageBox.information(self, "Loading Playlists", "Please wait for playlist loading to finish.")
+            event.ignore()
+            return
+        if self.backup_thread and self.backup_thread.isRunning():
+            QMessageBox.information(self, "Backup Running", "Wait for the portable backup to finish before closing this window.")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
 class BatchTrackCountThread(QThread):
     progress_update = pyqtSignal(str, int)  # message, percentage
     all_complete = pyqtSignal()
@@ -1181,6 +1944,473 @@ class LoadingDialog(QDialog):
         else:
             self.detail_label.setText("Almost done...")
 
+
+class PlexServerPlaylistLoadThread(QThread):
+    progress_update = pyqtSignal(str, int)
+    playlists_loaded = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, profile, parent=None):
+        super().__init__(parent)
+        self.profile = profile or {}
+
+    def run(self):
+        try:
+            profile_name = str(self.profile.get("name", "Source server") or "Source server").strip()
+            base_url = str(self.profile.get("base_url", "") or "").strip()
+            token = str(self.profile.get("token", "") or "").strip()
+            if not base_url or not token:
+                raise ValueError("Selected server profile is missing base URL or token.")
+
+            self.progress_update.emit(f"Connecting to {profile_name}...", 10)
+            source_server = PlexServer(base_url, token)
+
+            self.progress_update.emit("Loading source playlists...", 45)
+            raw_playlists = list(source_server.playlists())
+
+            payload = []
+            total = max(len(raw_playlists), 1)
+            for idx, playlist in enumerate(raw_playlists, start=1):
+                title = str(getattr(playlist, "title", "") or "").strip()
+                if not title:
+                    continue
+                payload.append(
+                    {
+                        "title": title,
+                        "rating_key": str(getattr(playlist, "ratingKey", "") or ""),
+                        "leaf_count": getattr(playlist, "leafCount", None),
+                    }
+                )
+                pct = 45 + int((idx / total) * 45)
+                self.progress_update.emit(f"Reading playlists ({idx}/{total})...", min(90, pct))
+
+            payload.sort(key=lambda item: item.get("title", "").lower())
+            self.progress_update.emit("Source playlists ready.", 100)
+            self.playlists_loaded.emit(payload)
+        except Exception as e:
+            logging.error(f"Error loading source Plex playlists: {e}", exc_info=True)
+            self.error.emit(str(e))
+
+
+class PlexServerPlaylistTransferThread(QThread):
+    progress_update = pyqtSignal(str, int)
+    transfer_complete = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        source_profile,
+        source_playlist_title,
+        target_server,
+        target_section_id,
+        target_profile=None,
+        target_section_title="",
+        target_mode="overwrite",
+        sync_policy="keep_extras",
+        target_name_override=None,
+        filter_settings=None,
+        dry_run=False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.source_profile = source_profile or {}
+        self.source_playlist_title = str(source_playlist_title or "").strip()
+        self.target_server = target_server
+        self.target_section_id = target_section_id
+        self.target_profile = target_profile or {}
+        self.target_section_title = str(target_section_title or "").strip()
+        self.target_mode = str(target_mode or "overwrite").strip().lower()
+        self.sync_policy = str(sync_policy or "keep_extras").strip().lower()
+        self.target_name_override = str(target_name_override or "").strip()
+        self.filter_settings = filter_settings or {}
+        self.dry_run = bool(dry_run)
+
+    def _track_artist_name(self, track):
+        artist_name = ""
+        try:
+            artist_name = (getattr(track, "originalTitle", "") or "").strip()
+            if not artist_name and hasattr(track, "artist") and track.artist():
+                artist_name = (track.artist().title or "").strip()
+        except Exception:
+            artist_name = ""
+        if not artist_name:
+            artist_name = (getattr(track, "grandparentTitle", "") or "").strip()
+        return artist_name
+
+    def _extract_recording_mbid_from_plex_track(self, plex_track):
+        candidates = []
+        guid_value = getattr(plex_track, "guid", None)
+        if guid_value:
+            candidates.append(str(guid_value))
+        for guid_obj in getattr(plex_track, "guids", []) or []:
+            guid_id = getattr(guid_obj, "id", None)
+            if guid_id:
+                candidates.append(str(guid_id))
+
+        mbid_pattern = re.compile(
+            r"(?:musicbrainz\.org/recording/|musicbrainz://recording/|recording/)([0-9a-fA-F-]{36})",
+            re.IGNORECASE,
+        )
+        for value in candidates:
+            match = mbid_pattern.search(value)
+            if match:
+                return match.group(1).lower()
+        return ""
+
+    def _build_source_track_identity(self, source_track):
+        title = str(getattr(source_track, "title", "") or "").strip()
+        artist = self._track_artist_name(source_track)
+        album = ""
+        try:
+            if hasattr(source_track, "album") and source_track.album():
+                album = str(source_track.album().title or "").strip()
+        except Exception:
+            album = ""
+
+        return {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "recording_mbid": self._extract_recording_mbid_from_plex_track(source_track),
+        }
+
+    def _score_candidate(self, source_track, target_track):
+        src_title = source_track.get("title", "")
+        src_artist = source_track.get("artist", "")
+        src_album = source_track.get("album", "")
+        src_mbid = source_track.get("recording_mbid", "")
+
+        target_title = str(getattr(target_track, "title", "") or "").strip()
+        if not src_title or not target_title:
+            return -1.0
+
+        title_score = float(fuzz.token_set_ratio(src_title.lower(), target_title.lower()))
+        if title_score < 50:
+            return -1.0
+
+        target_artist = self._track_artist_name(target_track)
+        artist_score = float(fuzz.token_set_ratio(src_artist.lower(), target_artist.lower())) if (src_artist and target_artist) else 0.0
+
+        target_album = ""
+        try:
+            if hasattr(target_track, "album") and target_track.album():
+                target_album = str(target_track.album().title or "").strip()
+        except Exception:
+            target_album = ""
+        album_score = float(fuzz.token_set_ratio(src_album.lower(), target_album.lower())) if (src_album and target_album) else 0.0
+
+        if src_artist and src_album:
+            combined_score = (title_score * 0.58) + (artist_score * 0.30) + (album_score * 0.12)
+        elif src_artist:
+            combined_score = (title_score * 0.68) + (artist_score * 0.32)
+        else:
+            combined_score = title_score
+
+        if src_artist and artist_score < 40:
+            combined_score -= 18
+        if src_album and target_album and album_score < 35:
+            combined_score -= 8
+
+        if self.filter_settings.get("enabled", False):
+            album_title = target_album.lower()
+            penalty = 0
+            if self.filter_settings.get("avoid_live", False) and any(k in album_title for k in ["live", "concert", "tour"]):
+                penalty += 15
+            if self.filter_settings.get("avoid_compilation", False) and any(k in album_title for k in ["best of", "greatest hits", "collection", "anthology"]):
+                penalty += 12
+            if self.filter_settings.get("deprioritize_remaster", False) and any(k in album_title for k in ["remaster", "remastered"]):
+                penalty += 8
+            if self.filter_settings.get("deprioritize_deluxe", False) and any(k in album_title for k in ["deluxe", "special", "extended", "expanded", "anniversary"]):
+                penalty += 6
+            combined_score = max(0.0, combined_score - penalty)
+
+        if src_mbid:
+            target_mbid = self._extract_recording_mbid_from_plex_track(target_track)
+            if target_mbid and target_mbid == src_mbid:
+                return 100.0
+
+        return combined_score
+
+    def _find_best_match(self, library_section, source_track):
+        title = source_track.get("title", "")
+        artist = source_track.get("artist", "")
+        if not title:
+            return None
+
+        try:
+            candidates = list(library_section.searchTracks(title=title) or [])
+        except Exception:
+            candidates = []
+        if not candidates:
+            return None
+
+        best_track = None
+        best_score = -1.0
+        best_artist_score = 0.0
+        for candidate in candidates:
+            score = self._score_candidate(source_track, candidate)
+            if score < 0:
+                continue
+
+            candidate_artist = self._track_artist_name(candidate)
+            artist_score = float(fuzz.token_set_ratio(artist.lower(), candidate_artist.lower())) if (artist and candidate_artist) else 0.0
+            if score > best_score:
+                best_score = score
+                best_track = candidate
+                best_artist_score = artist_score
+
+        if not best_track:
+            return None
+
+        min_score = 78.0 if artist else 90.0
+        if best_score < min_score:
+            return None
+        if artist and best_artist_score < 40.0 and best_score < 100.0:
+            return None
+        return best_track
+
+    def _find_playlist_by_title(self, server, title):
+        for playlist in server.playlists():
+            if str(getattr(playlist, "title", "") or "").strip().lower() == title.lower():
+                return playlist
+        return None
+
+    def _resolve_target_name(self, target_server, requested_name):
+        if self.target_mode == "overwrite":
+            return requested_name
+
+        # create_copy mode - find an available copy name
+        existing = {str(getattr(p, "title", "") or "").strip().lower() for p in target_server.playlists()}
+        if requested_name.lower() not in existing:
+            return requested_name
+        index = 1
+        while True:
+            candidate = f"{requested_name} (Copy {index})"
+            if candidate.lower() not in existing:
+                return candidate
+            index += 1
+
+    def _track_display(self, track):
+        artist = self._track_artist_name(track)
+        title = str(getattr(track, "title", "") or "Unknown Title").strip()
+        if artist:
+            return f"{artist} - {title}"
+        return title
+
+    def _dedupe_tracks(self, tracks):
+        unique = []
+        seen = set()
+        for track in tracks:
+            rating_key = str(getattr(track, "ratingKey", "") or "")
+            if not rating_key:
+                continue
+            if rating_key in seen:
+                continue
+            seen.add(rating_key)
+            unique.append(track)
+        return unique
+
+    def _build_final_tracks(self, existing_playlist, matched_tracks):
+        existing_items = list(existing_playlist.items()) if existing_playlist else []
+        matched_tracks = self._dedupe_tracks(matched_tracks)
+        matched_key_set = {str(getattr(track, "ratingKey", "") or "") for track in matched_tracks}
+
+        # Policy is only meaningful when overwriting an existing playlist.
+        if not existing_playlist:
+            return matched_tracks
+        if self.sync_policy == "add_only":
+            result = list(existing_items)
+            existing_key_set = {str(getattr(track, "ratingKey", "") or "") for track in existing_items}
+            for track in matched_tracks:
+                key = str(getattr(track, "ratingKey", "") or "")
+                if key and key not in existing_key_set:
+                    result.append(track)
+                    existing_key_set.add(key)
+            return self._dedupe_tracks(result)
+        if self.sync_policy == "mirror":
+            return matched_tracks
+
+        # keep_extras (default): source order first, then keep target extras.
+        extras = [track for track in existing_items if str(getattr(track, "ratingKey", "") or "") not in matched_key_set]
+        return self._dedupe_tracks(matched_tracks + extras)
+
+    def _compute_diff(self, existing_playlist, final_tracks):
+        existing_items = list(existing_playlist.items()) if existing_playlist else []
+        final_tracks = self._dedupe_tracks(final_tracks)
+        existing_keys = [str(getattr(track, "ratingKey", "") or "") for track in existing_items]
+        final_keys = [str(getattr(track, "ratingKey", "") or "") for track in final_tracks]
+        existing_set = set(existing_keys)
+        final_set = set(final_keys)
+
+        to_add = [track for track in final_tracks if str(getattr(track, "ratingKey", "") or "") not in existing_set]
+        to_remove = [track for track in existing_items if str(getattr(track, "ratingKey", "") or "") not in final_set]
+        will_reorder = bool(existing_items) and existing_keys != final_keys
+
+        return {
+            "will_add": len(to_add),
+            "will_remove": len(to_remove),
+            "will_reorder": will_reorder,
+            "add_samples": [self._track_display(track) for track in to_add[:8]],
+            "remove_samples": [self._track_display(track) for track in to_remove[:8]],
+            "existing_count": len(existing_items),
+        }
+
+    def run(self):
+        try:
+            base_url = str(self.source_profile.get("base_url", "") or "").strip()
+            token = str(self.source_profile.get("token", "") or "").strip()
+            profile_name = str(self.source_profile.get("name", "Source server") or "Source server").strip()
+            if not base_url or not token:
+                raise ValueError("Source profile is missing base URL or token.")
+            if not self.source_playlist_title:
+                raise ValueError("No source playlist selected.")
+
+            self.progress_update.emit(f"Connecting to source server '{profile_name}'...", 5)
+            source_server = PlexServer(base_url, token)
+
+            target_server = self.target_server
+            if not target_server:
+                target_base_url = str(self.target_profile.get("base_url", "") or "").strip()
+                target_token = str(self.target_profile.get("token", "") or "").strip()
+                target_name = str(self.target_profile.get("name", "Target server") or "Target server").strip()
+                if not target_base_url or not target_token:
+                    raise ValueError("Target profile is missing base URL or token.")
+                self.progress_update.emit(f"Connecting to target server '{target_name}'...", 9)
+                target_server = PlexServer(target_base_url, target_token)
+
+            self.progress_update.emit("Resolving source playlist...", 12)
+            source_playlist = self._find_playlist_by_title(source_server, self.source_playlist_title)
+            if not source_playlist:
+                raise ValueError(f"Source playlist '{self.source_playlist_title}' was not found.")
+
+            source_tracks = list(source_playlist.items())
+            total = len(source_tracks)
+            if total == 0:
+                raise ValueError("Selected source playlist has no tracks.")
+
+            self.progress_update.emit("Preparing target library...", 18)
+            try:
+                target_section = target_server.library.sectionByID(self.target_section_id)
+            except Exception:
+                target_section = None
+                if self.target_section_title:
+                    for section in target_server.library.sections():
+                        if str(getattr(section, "title", "") or "").strip().lower() == self.target_section_title.lower():
+                            target_section = section
+                            break
+                if not target_section:
+                    raise ValueError("Target library section was not found on target server.")
+
+            matched_tracks = []
+            seen_target_keys = set()
+            missing_tracks = []
+            for idx, source_track in enumerate(source_tracks, start=1):
+                identity = self._build_source_track_identity(source_track)
+                matched = self._find_best_match(target_section, identity)
+                if matched:
+                    rating_key = str(getattr(matched, "ratingKey", "") or "")
+                    if rating_key and rating_key in seen_target_keys:
+                        continue
+                    if rating_key:
+                        seen_target_keys.add(rating_key)
+                    matched_tracks.append(matched)
+                else:
+                    display = f"{identity.get('artist', 'Unknown Artist')} - {identity.get('title', 'Unknown Title')}"
+                    missing_tracks.append(display)
+
+                progress = 18 + int((idx / max(total, 1)) * 72)
+                self.progress_update.emit(f"Matching tracks ({idx}/{total})...", min(progress, 90))
+
+            if not matched_tracks:
+                raise ValueError("No matching tracks were found on the target server.")
+
+            target_name = self.target_name_override or str(getattr(source_playlist, "title", "Imported Playlist") or "Imported Playlist")
+            target_name = self._resolve_target_name(target_server, target_name)
+
+            existing_target = self._find_playlist_by_title(target_server, target_name)
+            final_tracks = matched_tracks
+            if self.target_mode == "overwrite":
+                final_tracks = self._build_final_tracks(existing_target, matched_tracks)
+            diff = self._compute_diff(existing_target, final_tracks)
+
+            if self.dry_run:
+                self.progress_update.emit("Dry run complete.", 100)
+                self.transfer_complete.emit(
+                    {
+                        "dry_run": True,
+                        "source_playlist": self.source_playlist_title,
+                        "target_playlist": target_name,
+                        "target_exists": bool(existing_target),
+                        "total_tracks": total,
+                        "matched_tracks": len(matched_tracks),
+                        "final_tracks": len(final_tracks),
+                        "missing_tracks": len(missing_tracks),
+                        "missing_samples": missing_tracks[:15],
+                        "mode": self.target_mode,
+                        "sync_policy": self.sync_policy,
+                        **diff,
+                    }
+                )
+                return
+
+            if existing_target and self.target_mode == "overwrite":
+                existing_items = list(existing_target.items())
+                existing_keys = [str(getattr(track, "ratingKey", "") or "") for track in existing_items]
+                final_keys = [str(getattr(track, "ratingKey", "") or "") for track in final_tracks]
+                if existing_keys != final_keys:
+                    self.progress_update.emit("Applying policy changes to target playlist...", 94)
+                if existing_items:
+                    existing_target.removeItems(existing_items)
+                if final_tracks:
+                    existing_target.addItems(final_tracks)
+                created_playlist = existing_target
+            else:
+                self.progress_update.emit("Creating target playlist...", 97)
+                created_playlist = target_server.createPlaylist(target_name, items=final_tracks)
+
+            self.progress_update.emit("Transfer complete.", 100)
+            self.transfer_complete.emit(
+                {
+                    "source_playlist": self.source_playlist_title,
+                    "target_playlist": str(getattr(created_playlist, "title", target_name) or target_name),
+                    "total_tracks": total,
+                    "matched_tracks": len(matched_tracks),
+                    "final_tracks": len(final_tracks),
+                    "missing_tracks": len(missing_tracks),
+                    "missing_samples": missing_tracks[:15],
+                    "mode": self.target_mode,
+                    "sync_policy": self.sync_policy,
+                    **diff,
+                }
+            )
+        except Exception as e:
+            logging.error(f"Error transferring playlist between Plex servers: {e}", exc_info=True)
+            self.error.emit(str(e))
+
+
+class PlaylistCoverLoadThread(QThread):
+    cover_loaded = pyqtSignal(bytes)
+    error = pyqtSignal(str)
+
+    def __init__(self, image_url, parent=None):
+        super().__init__(parent)
+        self.image_url = str(image_url or "").strip()
+
+    def run(self):
+        try:
+            if not self.image_url:
+                raise ValueError("No playlist cover URL available.")
+            response = requests.get(
+                self.image_url,
+                headers={"User-Agent": f"Syncra/{__version__}"},
+                timeout=25,
+            )
+            response.raise_for_status()
+            self.cover_loaded.emit(response.content)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class PlaylistEditorDialog(QDialog):
     def __init__(self, playlist, plex_server, parent=None):
         super().__init__(parent)
@@ -1190,14 +2420,19 @@ class PlaylistEditorDialog(QDialog):
         self.tracks = []
         self.track_lookup = {}  # Maps identifiers to Plex track objects
         self.load_tracks_thread = None
+        self.cover_load_thread = None
+        self.pending_cover_path = ""
+        self.current_cover_url = ""
         self.setWindowTitle(f"Edit Playlist: {playlist.title}")
         self.setObjectName("playlistEditorDialog")
         self.setModal(True)
-        self.resize(800, 600)
+        self.resize(980, 680)
+        self.setMinimumSize(900, 620)
         self.setStyleSheet(self._dialog_stylesheet())
         
         # Setup UI immediately (non-blocking)
         self.setup_ui()
+        self.load_cover_preview()
         
         # Start loading tracks immediately but asynchronously
         self.start_background_loading()
@@ -1218,6 +2453,27 @@ class PlaylistEditorDialog(QDialog):
                 color: #9db4d7;
                 font-size: 13px;
             }
+            QDialog#playlistEditorDialog QFrame#editorCoverCard {
+                background-color: #152236;
+                border: 1px solid #35527a;
+                border-radius: 10px;
+            }
+            QDialog#playlistEditorDialog QLabel#editorCoverPreview {
+                background-color: #0f1a2b;
+                border: 1px solid #3a5a86;
+                border-radius: 8px;
+                color: #a8c0e1;
+                font-size: 12px;
+            }
+            QDialog#playlistEditorDialog QLabel#editorCoverTitle {
+                color: #dce9fb;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QDialog#playlistEditorDialog QLabel#editorCoverStatus {
+                color: #a8c0e1;
+                font-size: 11px;
+            }
             QDialog#playlistEditorDialog QLabel#editorSearchLabel {
                 color: #dbe7fb;
                 font-weight: 650;
@@ -1225,13 +2481,24 @@ class PlaylistEditorDialog(QDialog):
             }
             QDialog#playlistEditorDialog QLabel#editorLoadingLabel {
                 color: #b6c9e6;
-                font-size: 14px;
-                padding: 12px;
+                font-size: 15px;
+                font-weight: 700;
+                padding: 6px 4px;
+            }
+            QDialog#playlistEditorDialog QLabel#editorLoadingSub {
+                color: #8ca3c6;
+                font-size: 12px;
+                padding: 0 4px 8px 4px;
             }
             QDialog#playlistEditorDialog QLabel#editorLoadingDetail {
                 color: #8ca3c6;
                 font-size: 12px;
                 padding: 8px;
+            }
+            QDialog#playlistEditorDialog QFrame#editorLoadingCard {
+                background-color: #132136;
+                border: 1px solid #355078;
+                border-radius: 12px;
             }
             QDialog#playlistEditorDialog QProgressBar#editorLoadingProgress {
                 background-color: #16243a;
@@ -1280,6 +2547,10 @@ class PlaylistEditorDialog(QDialog):
                 border: 1px solid #3a577f;
                 padding: 8px;
                 font-weight: 800;
+            }
+            QDialog#playlistEditorDialog QTableWidget#editorTracksTable QTableCornerButton::section {
+                background: #213651;
+                border: 1px solid #3a577f;
             }
             QDialog#playlistEditorDialog QPushButton#editorBtnNeutral {
                 background-color: #22344f;
@@ -1331,66 +2602,142 @@ class PlaylistEditorDialog(QDialog):
         
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
         # Playlist info header
         info_layout = QHBoxLayout()
-        title_label = QLabel(f"📝 Editing: {self.playlist.title}")
+        title_label = QLabel(f"Editing Playlist: {self.playlist.title}")
         title_label.setObjectName("editorTitleLabel")
         info_layout.addWidget(title_label)
-        
-        self.track_count_label = QLabel("⏳ Loading tracks...")
+
+        self.track_count_label = QLabel("Tracks: Loading...")
         self.track_count_label.setObjectName("editorTrackCount")
         info_layout.addWidget(self.track_count_label)
         info_layout.addStretch()
         layout.addLayout(info_layout)
-        
+
         # Loading section (visible initially)
         self.loading_section = QWidget()
         loading_layout = QVBoxLayout(self.loading_section)
-        
-        self.loading_label = QLabel("🔄 Loading playlist tracks...")
-        self.loading_label.setAlignment(Qt.AlignCenter)
+        loading_layout.setContentsMargins(0, 0, 0, 0)
+        loading_layout.setSpacing(0)
+        loading_layout.addStretch()
+
+        loading_card = QFrame()
+        loading_card.setObjectName("editorLoadingCard")
+        loading_card_layout = QVBoxLayout(loading_card)
+        loading_card_layout.setContentsMargins(18, 16, 18, 14)
+        loading_card_layout.setSpacing(6)
+
+        self.loading_label = QLabel("Preparing playlist editor...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.loading_label.setObjectName("editorLoadingLabel")
-        loading_layout.addWidget(self.loading_label)
-        
-        # Enhanced progress bar
+        loading_card_layout.addWidget(self.loading_label)
+
+        self.loading_sub = QLabel(f"Playlist: {self.playlist.title}")
+        self.loading_sub.setObjectName("editorLoadingSub")
+        self.loading_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_card_layout.addWidget(self.loading_sub)
+
         self.loading_progress = QProgressBar()
         self.loading_progress.setObjectName("editorLoadingProgress")
         self.loading_progress.setRange(0, 100)
         self.loading_progress.setValue(0)
-        loading_layout.addWidget(self.loading_progress)
-        
-        # Loading details
+        self.loading_progress.setFormat("%p%")
+        loading_card_layout.addWidget(self.loading_progress)
+
         self.loading_detail = QLabel("Initializing...")
-        self.loading_detail.setAlignment(Qt.AlignCenter)
+        self.loading_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.loading_detail.setObjectName("editorLoadingDetail")
-        loading_layout.addWidget(self.loading_detail)
-        
+        loading_card_layout.addWidget(self.loading_detail)
+
+        loading_actions_layout = QHBoxLayout()
+        loading_actions_layout.addStretch()
+        self.retry_loading_btn = QPushButton("Retry Loading")
+        self.retry_loading_btn.setObjectName("editorBtnNeutral")
+        self.retry_loading_btn.clicked.connect(self.retry_loading)
+        self.retry_loading_btn.setVisible(False)
+        loading_actions_layout.addWidget(self.retry_loading_btn)
+        loading_actions_layout.addStretch()
+        loading_card_layout.addLayout(loading_actions_layout)
+
+        loading_layout.addWidget(loading_card, alignment=Qt.AlignmentFlag.AlignCenter)
+        loading_layout.addStretch()
+
         layout.addWidget(self.loading_section)
-        
+
         # Editor section (hidden initially)
         self.editor_section = QWidget()
         self.editor_section.setVisible(False)
         editor_layout = QVBoxLayout(self.editor_section)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.setSpacing(10)
 
-        # Search/Filter section
+        body_layout = QHBoxLayout()
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(12)
+
+        # Left cover/actions panel
+        cover_card = QFrame()
+        cover_card.setObjectName("editorCoverCard")
+        cover_card.setFixedWidth(230)
+        cover_layout = QVBoxLayout(cover_card)
+        cover_layout.setContentsMargins(10, 10, 10, 10)
+        cover_layout.setSpacing(8)
+
+        cover_title = QLabel("Playlist Cover")
+        cover_title.setObjectName("editorCoverTitle")
+        cover_layout.addWidget(cover_title)
+
+        self.cover_preview_label = QLabel("No cover")
+        self.cover_preview_label.setObjectName("editorCoverPreview")
+        self.cover_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_preview_label.setMinimumSize(200, 200)
+        self.cover_preview_label.setMaximumSize(200, 200)
+        cover_layout.addWidget(self.cover_preview_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.cover_status_label = QLabel("Using current Plex cover.")
+        self.cover_status_label.setObjectName("editorCoverStatus")
+        self.cover_status_label.setWordWrap(True)
+        cover_layout.addWidget(self.cover_status_label)
+
+        self.change_cover_btn = QPushButton("Change Cover...")
+        self.change_cover_btn.setObjectName("editorBtnNeutral")
+        self.change_cover_btn.clicked.connect(self.choose_cover_image)
+        self.change_cover_btn.setEnabled(False)
+        cover_layout.addWidget(self.change_cover_btn)
+
+        self.clear_cover_btn = QPushButton("Clear Pending Cover")
+        self.clear_cover_btn.setObjectName("editorBtnNeutral")
+        self.clear_cover_btn.clicked.connect(self.clear_pending_cover)
+        self.clear_cover_btn.setEnabled(False)
+        cover_layout.addWidget(self.clear_cover_btn)
+        cover_layout.addStretch()
+
+        body_layout.addWidget(cover_card)
+
+        # Right tracks area
+        tracks_panel = QWidget()
+        tracks_layout = QVBoxLayout(tracks_panel)
+        tracks_layout.setContentsMargins(0, 0, 0, 0)
+        tracks_layout.setSpacing(8)
+
         search_layout = QHBoxLayout()
         search_layout.setContentsMargins(0, 0, 0, 0)
         search_layout.setSpacing(8)
-        search_label = QLabel("🔍 Search:")
+        search_label = QLabel("Search:")
         search_label.setObjectName("editorSearchLabel")
         search_layout.addWidget(search_label)
-        
+
         self.search_input = QLineEdit()
         self.search_input.setObjectName("editorSearchInput")
         self.search_input.setPlaceholderText("Search tracks by title, artist, or album...")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self.filter_tracks)
         search_layout.addWidget(self.search_input)
+        tracks_layout.addLayout(search_layout)
 
-        editor_layout.addLayout(search_layout)
-        
-        # Tracks table
         self.tracks_table = PlaylistTrackTable()
         self.tracks_table.setObjectName("editorTracksTable")
         self.tracks_table.setColumnCount(4)
@@ -1401,61 +2748,60 @@ class PlaylistEditorDialog(QDialog):
         self.tracks_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.tracks_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.tracks_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.tracks_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tracks_table.setDragDropMode(QAbstractItemView.InternalMove)
-
-        # Enable right-click context menu
-        self.tracks_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tracks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tracks_table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.tracks_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tracks_table.customContextMenuRequested.connect(self.show_context_menu)
-        
-        # FIXED: Remove alternating row colors that cause visibility issues
         self.tracks_table.setAlternatingRowColors(False)
-        
-        # Set column widths - FIXED: 5 columns
-        self.tracks_table.setColumnWidth(0, 250)  # Title
-        self.tracks_table.setColumnWidth(1, 200)  # Artist
-        self.tracks_table.setColumnWidth(2, 200)  # Album
-        # Duration column (3) will stretch
-        
-        editor_layout.addWidget(self.tracks_table)
-        
-        layout.addWidget(self.editor_section)
-        
-        # Button section (visible immediately but disabled)
-        button_layout = QHBoxLayout()
-        
-        self.delete_button = QPushButton("🗑️ Delete Selected")
+        self.tracks_table.setColumnWidth(0, 280)
+        self.tracks_table.setColumnWidth(1, 220)
+        self.tracks_table.setColumnWidth(2, 220)
+        self.tracks_table.verticalHeader().setDefaultSectionSize(30)
+        tracks_layout.addWidget(self.tracks_table)
+
+        body_layout.addWidget(tracks_panel, 1)
+        editor_layout.addLayout(body_layout)
+        layout.addWidget(self.editor_section, 1)
+
+        # Button section
+        self.action_bar = QWidget()
+        button_layout = QHBoxLayout(self.action_bar)
+        button_layout.setContentsMargins(0, 4, 0, 0)
+        button_layout.setSpacing(8)
+
+        self.delete_button = QPushButton("Delete Selected")
         self.delete_button.setObjectName("editorBtnNeutral")
         self.delete_button.clicked.connect(self.delete_selected)
         self.delete_button.setEnabled(False)
         button_layout.addWidget(self.delete_button)
-        
-        self.move_up_button = QPushButton("⬆️ Move Up")
+
+        self.move_up_button = QPushButton("Move Up")
         self.move_up_button.setObjectName("editorBtnNeutral")
         self.move_up_button.clicked.connect(self.move_up)
         self.move_up_button.setEnabled(False)
         button_layout.addWidget(self.move_up_button)
-        
-        self.move_down_button = QPushButton("⬇️ Move Down")
+
+        self.move_down_button = QPushButton("Move Down")
         self.move_down_button.setObjectName("editorBtnNeutral")
         self.move_down_button.clicked.connect(self.move_down)
         self.move_down_button.setEnabled(False)
         button_layout.addWidget(self.move_down_button)
-        
+
         button_layout.addStretch()
-        
-        self.save_button = QPushButton("💾 Save Changes")
+
+        self.save_button = QPushButton("Save Changes")
         self.save_button.setObjectName("editorBtnPrimary")
         self.save_button.clicked.connect(self.save_changes)
         self.save_button.setEnabled(False)
         button_layout.addWidget(self.save_button)
-        
-        self.cancel_button = QPushButton("X Cancel")
+
+        self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setObjectName("editorBtnDanger")
         self.cancel_button.clicked.connect(self.reject)
         button_layout.addWidget(self.cancel_button)
-        
-        layout.addLayout(button_layout)
+
+        self.action_bar.setVisible(False)
+        layout.addWidget(self.action_bar)
     
     def _register_track(self, track):
         """Store the track reference and return a safe identifier for UI usage."""
@@ -1469,6 +2815,126 @@ class PlaylistEditorDialog(QDialog):
         identifier = str(identifier)
         self.track_lookup[identifier] = track
         return identifier
+
+    def _set_cover_placeholder(self, text):
+        self.cover_preview_label.setPixmap(QPixmap())
+        self.cover_preview_label.setText(text)
+
+    def _set_cover_from_bytes(self, image_bytes):
+        pixmap = QPixmap()
+        if not image_bytes or not pixmap.loadFromData(image_bytes):
+            self._set_cover_placeholder("Cover unavailable")
+            return False
+        pixmap = pixmap.scaled(
+            200,
+            200,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.cover_preview_label.setPixmap(pixmap)
+        self.cover_preview_label.setText("")
+        return True
+
+    def _set_cover_from_file(self, path):
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            self._set_cover_placeholder("Invalid image")
+            return False
+        pixmap = pixmap.scaled(
+            200,
+            200,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.cover_preview_label.setPixmap(pixmap)
+        self.cover_preview_label.setText("")
+        return True
+
+    def _playlist_cover_url(self):
+        candidates = []
+        for attr in ("thumb", "composite", "art"):
+            try:
+                value = getattr(self.playlist, attr, None)
+                if value:
+                    candidates.append(str(value))
+            except Exception:
+                continue
+        try:
+            thumb_url = getattr(self.playlist, "thumbUrl", None)
+            if callable(thumb_url):
+                thumb_url = thumb_url()
+            if thumb_url:
+                candidates.append(str(thumb_url))
+        except Exception:
+            pass
+
+        for value in candidates:
+            clean = str(value or "").strip()
+            if not clean:
+                continue
+            if clean.startswith("http://") or clean.startswith("https://"):
+                return clean
+            if clean.startswith("/"):
+                try:
+                    return self.plex_server.url(clean, includeToken=True)
+                except Exception:
+                    continue
+        return ""
+
+    def load_cover_preview(self):
+        self._set_cover_placeholder("Loading cover...")
+        self.cover_status_label.setText("Loading current Plex cover...")
+        self.current_cover_url = self._playlist_cover_url()
+        if not self.current_cover_url:
+            self._set_cover_placeholder("No cover")
+            self.cover_status_label.setText("No current cover found.")
+            return
+
+        self.cover_load_thread = PlaylistCoverLoadThread(self.current_cover_url, self)
+        self.cover_load_thread.cover_loaded.connect(self._on_cover_loaded)
+        self.cover_load_thread.error.connect(self._on_cover_error)
+        self.cover_load_thread.finished.connect(lambda: setattr(self, "cover_load_thread", None))
+        self.cover_load_thread.start()
+
+    def _on_cover_loaded(self, image_bytes):
+        if self.pending_cover_path:
+            return
+        if self._set_cover_from_bytes(image_bytes):
+            self.cover_status_label.setText("Using current Plex cover.")
+        else:
+            self.cover_status_label.setText("Unable to render current cover.")
+
+    def _on_cover_error(self, error_message):
+        if self.pending_cover_path:
+            return
+        self._set_cover_placeholder("Cover unavailable")
+        self.cover_status_label.setText("Could not load current cover.")
+        logging.warning(f"Playlist cover preview load failed: {error_message}")
+
+    def choose_cover_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Playlist Cover",
+            "",
+            "Image Files (*.jpg *.jpeg *.png *.webp *.bmp)",
+        )
+        if not path:
+            return
+        if self._set_cover_from_file(path):
+            self.pending_cover_path = path
+            self.cover_status_label.setText(f"Pending cover change: {os.path.basename(path)}")
+            self.clear_cover_btn.setEnabled(True)
+        else:
+            QMessageBox.warning(self, "Invalid Image", "The selected file could not be loaded as an image.")
+
+    def clear_pending_cover(self):
+        self.pending_cover_path = ""
+        self.clear_cover_btn.setEnabled(False)
+        if self.current_cover_url:
+            self.load_cover_preview()
+        else:
+            self._set_cover_placeholder("No cover")
+            self.cover_status_label.setText("Using current Plex cover.")
 
     def _resolve_track(self, track_id):
         """Return the registered track object for a given identifier."""
@@ -1500,6 +2966,7 @@ class PlaylistEditorDialog(QDialog):
         """Start loading tracks in background thread immediately"""
         self.loading_progress.setValue(10)
         self.loading_detail.setText("Connecting to Plex server...")
+        self.retry_loading_btn.setVisible(False)
         
         # Start background thread immediately
         self.load_tracks_thread = LoadPlaylistTracksThread(self.playlist, self)
@@ -1538,7 +3005,7 @@ class PlaylistEditorDialog(QDialog):
             QApplication.processEvents()
             
             # Small delay for visual feedback, then switch views
-            QTimer.singleShot(300, self.show_editor)
+            QTimer.singleShot(180, self.show_editor)
                 
         except Exception as e:
             logging.error(f"Error processing loaded tracks: {str(e)}")
@@ -1567,17 +3034,20 @@ class PlaylistEditorDialog(QDialog):
         
         # Show editor section
         self.editor_section.setVisible(True)
+        self.action_bar.setVisible(True)
         
         # Enable all buttons
         self.delete_button.setEnabled(True)
         self.move_up_button.setEnabled(True)
         self.move_down_button.setEnabled(True)
         self.save_button.setEnabled(True)
+        self.change_cover_btn.setEnabled(True)
+        self.clear_cover_btn.setEnabled(bool(self.pending_cover_path))
         
         self.tracks_loaded = True
         
         # Update window title
-        self.setWindowTitle(f"✏️ Editing: {self.playlist.title} ({len(self.tracks)} tracks)")
+        self.setWindowTitle(f"Editing: {self.playlist.title} ({len(self.tracks)} tracks)")
     
     def filter_tracks(self, search_text):
         """Filter tracks based on search text"""
@@ -1783,28 +3253,19 @@ class PlaylistEditorDialog(QDialog):
         """)
         self.loading_label.setText("❌ Error Loading Tracks")
         self.loading_detail.setText(f"Error: {error_message}")
-        
-        # Show retry option
-        retry_button = QPushButton("🔄 Retry Loading")
-        retry_button.clicked.connect(self.retry_loading)
-        self.loading_section.layout().addWidget(retry_button)
+        self.retry_loading_btn.setVisible(True)
         
         QMessageBox.warning(self, "Loading Error", f"Failed to load tracks: {error_message}")
     
     def retry_loading(self):
         """Retry loading tracks"""
-        # Reset UI
-        for i in range(self.loading_section.layout().count()):
-            child = self.loading_section.layout().itemAt(i).widget()
-            if isinstance(child, QPushButton):
-                child.deleteLater()
-        
-        self.loading_label.setText("🔄 Retrying...")
+        self.loading_label.setText("Retrying...")
         self.loading_detail.setText("Attempting to reload tracks...")
         self.loading_progress.setValue(0)
+        self.retry_loading_btn.setVisible(False)
         self.loading_progress.setStyleSheet("""
             QProgressBar::chunk {
-                background-color: #4CAF50;
+                background-color: #2ed27a;
             }
         """)
         
@@ -1862,7 +3323,7 @@ class PlaylistEditorDialog(QDialog):
             
         try:
             # Show saving progress
-            self.save_button.setText("💾 Saving...")
+            self.save_button.setText("Saving...")
             self.save_button.setEnabled(False)
             QApplication.processEvents()
             
@@ -1882,20 +3343,42 @@ class PlaylistEditorDialog(QDialog):
                     tracks.append(track_obj)
                 else:
                     logging.warning(f"Unresolved track identifier during save: {track_id}")
-                    
+
+            existing_items = list(self.playlist.items())
+            if existing_items:
+                self.playlist.removeItems(existing_items)
             if tracks:
-                # Update playlist with new track order
-                self.playlist.removeItems(self.playlist.items())
                 self.playlist.addItems(tracks)
-                
-            QMessageBox.information(self, "Success", "🎉 Playlist updated successfully!")
+
+            cover_updated = False
+            cover_error = ""
+            if self.pending_cover_path:
+                try:
+                    self.playlist.uploadPoster(filepath=self.pending_cover_path)
+                    cover_updated = True
+                    self.pending_cover_path = ""
+                except Exception as cover_exc:
+                    cover_error = str(cover_exc)
+
+            if cover_error:
+                QMessageBox.warning(
+                    self,
+                    "Saved With Cover Warning",
+                    "Track order was saved, but cover upload failed.\n\n"
+                    f"Error: {cover_error}",
+                )
+            else:
+                success_msg = "Playlist updated successfully."
+                if cover_updated:
+                    success_msg += "\nCover image updated."
+                QMessageBox.information(self, "Success", success_msg)
             self.accept()
             
         except Exception as e:
             logging.error(f"Error saving playlist changes: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to save changes: {str(e)}")
         finally:
-            self.save_button.setText("💾 Save Changes")
+            self.save_button.setText("Save Changes")
             self.save_button.setEnabled(True)
     
     def closeEvent(self, event):
@@ -1903,6 +3386,9 @@ class PlaylistEditorDialog(QDialog):
         if self.load_tracks_thread and self.load_tracks_thread.isRunning():
             self.load_tracks_thread.terminate()
             self.load_tracks_thread.wait(1000)
+        if self.cover_load_thread and self.cover_load_thread.isRunning():
+            self.cover_load_thread.terminate()
+            self.cover_load_thread.wait(500)
         event.accept()
 
 class PlaylistMergerDialog(QDialog):
@@ -5046,6 +6532,113 @@ class PlaylistConverterThread(QThread):
         logging.info(f"Fetched {len(tracks)} tracks from ListenBrainz playlist '{playlist_name}'")
         return tracks, playlist_name, playlist_image_url
 
+    def _normalize_image_url(self, value):
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            for entry in value:
+                normalized = self._normalize_image_url(entry)
+                if normalized:
+                    return normalized
+            return ""
+        if isinstance(value, dict):
+            for key in ("url", "src", "picture", "image"):
+                normalized = self._normalize_image_url(value.get(key))
+                if normalized:
+                    return normalized
+            return ""
+
+        raw = str(value).strip()
+        if not raw:
+            return ""
+        if raw.startswith("spotify:image:"):
+            image_id = raw.split("spotify:image:", 1)[1].strip()
+            return f"https://i.scdn.co/image/{image_id}" if image_id else ""
+        if raw.startswith("spotify:mosaic:"):
+            parts = [p.strip() for p in raw.split(":") if p.strip()]
+            # spotify:mosaic:<image_id>[:<image_id>...]
+            if len(parts) >= 3:
+                return f"https://i.scdn.co/image/{parts[2]}"
+            return ""
+        if raw.startswith("image:"):
+            image_id = raw.split("image:", 1)[1].strip()
+            return f"https://i.scdn.co/image/{image_id}" if image_id else ""
+        if raw.startswith("//"):
+            return f"https:{raw}"
+        if raw.startswith("http://") or raw.startswith("https://"):
+            return raw
+        if re.fullmatch(r"[A-Za-z0-9]{20,}", raw):
+            return f"https://i.scdn.co/image/{raw}"
+        return ""
+
+    def _extract_spotify_playlist_image_candidate(self, payload):
+        if not isinstance(payload, dict):
+            return ""
+        candidates = [
+            (payload.get("attributes") or {}).get("picture"),
+            (payload.get("attributes") or {}).get("image"),
+            (payload.get("metadata") or {}).get("image_url"),
+            (payload.get("metadata") or {}).get("picture"),
+            payload.get("images"),
+            payload.get("image"),
+            payload.get("picture"),
+        ]
+        for candidate in candidates:
+            normalized = self._normalize_image_url(candidate)
+            if normalized:
+                return normalized
+        return ""
+
+    def _resolve_spotify_playlist_image_url(self, playlist_id, current_image_value):
+        normalized = self._normalize_image_url(current_image_value)
+        if normalized:
+            return normalized
+        try:
+            oauth_app = SpotifyOAuthApp()
+            oauth_token = oauth_app.get_token()
+            headers = {
+                "Authorization": f"Bearer {oauth_token}",
+                "User-Agent": self.spotify_auth.user_agent,
+            }
+            response = requests.get(
+                f"https://api.spotify.com/v1/playlists/{playlist_id}",
+                headers=headers,
+                params={"fields": "images"},
+                timeout=20,
+            )
+            if response.status_code == 200:
+                payload = response.json() or {}
+                normalized = self._normalize_image_url(payload.get("images"))
+                if normalized:
+                    return normalized
+            else:
+                logging.warning(f"Spotify cover lookup returned HTTP {response.status_code}")
+        except Exception as e:
+            logging.warning(f"Spotify cover lookup failed: {e}")
+
+        # Fallback: read public OpenGraph image directly from Spotify page.
+        try:
+            page_response = requests.get(
+                f"https://open.spotify.com/playlist/{playlist_id}",
+                headers={"User-Agent": self.spotify_auth.user_agent},
+                timeout=20,
+            )
+            if page_response.status_code == 200:
+                match = re.search(
+                    r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+                    page_response.text,
+                    re.IGNORECASE,
+                )
+                if match:
+                    normalized = self._normalize_image_url(match.group(1))
+                    if normalized:
+                        return normalized
+            else:
+                logging.warning(f"Spotify og:image lookup returned HTTP {page_response.status_code}")
+        except Exception as e:
+            logging.warning(f"Spotify og:image lookup failed: {e}")
+        return ""
+
     def process_tidal_track(self, item):
         try:
             title = (item.get("title") or "").strip()
@@ -5114,7 +6707,7 @@ class PlaylistConverterThread(QThread):
 
                     # Parse spclient response structure
                     playlist_name = playlist_data.get('attributes', {}).get('name', 'Unknown Playlist')
-                    playlist_image_url = playlist_data.get('attributes', {}).get('picture', None)
+                    playlist_image_url = self._extract_spotify_playlist_image_candidate(playlist_data)
                     total_tracks = playlist_data.get('length', 0)
 
                 elif response.status_code == 401:  # Unauthorized
@@ -5137,8 +6730,11 @@ class PlaylistConverterThread(QThread):
                     response.raise_for_status()
                     playlist_data = response.json()
                     playlist_name = playlist_data.get('attributes', {}).get('name', 'Unknown Playlist')
-                    playlist_image_url = playlist_data.get('attributes', {}).get('picture', None)
+                    playlist_image_url = self._extract_spotify_playlist_image_candidate(playlist_data)
                     total_tracks = playlist_data.get('length', 0)
+
+                if not playlist_image_url:
+                    playlist_image_url = self._resolve_spotify_playlist_image_url(playlist_id, playlist_image_url)
 
                 logging.info(f"Found playlist: {playlist_name} with {total_tracks} tracks")
 
@@ -5379,52 +6975,35 @@ class PlaylistConverterThread(QThread):
                 
                 # Set the playlist image if available
                 if playlist_image_url:
+                    normalized_image_url = self._normalize_image_url(playlist_image_url) or str(playlist_image_url).strip()
+                    temp_file = ""
                     try:
-                        # First, try to download the image to a temporary file
-                        import tempfile
-                        import os
-                        
-                        # Create a temporary file
-                        temp_dir = tempfile.gettempdir()
-                        temp_file = os.path.join(temp_dir, "playlist_image.jpg")
-                        
-                        # Download the image
-                        img_response = requests.get(playlist_image_url, 
-                                                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
+                        img_response = requests.get(
+                            normalized_image_url,
+                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'},
+                            timeout=30,
+                        )
                         img_response.raise_for_status()
-                        
-                        # Save the image to the temporary file
-                        with open(temp_file, 'wb') as f:
-                            f.write(img_response.content)
-                        
-                        # Upload the local file to Plex
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                            tmp.write(img_response.content)
+                            temp_file = tmp.name
+
                         plex_playlist.uploadPoster(filepath=temp_file)
                         logging.info(f"Successfully set thumbnail for playlist '{final_name}' using local file")
-                        
-                        # Clean up the temporary file
-                        try:
-                            os.remove(temp_file)
-                        except:
-                            pass
                     except Exception as thumb_error:
                         logging.error(f"Failed to upload thumbnail file: {str(thumb_error)}")
-                        # Fall back to the original URL method
                         try:
-                            from urllib.parse import quote
-                            encoded_url = quote(playlist_image_url)
-                            poster_url = f"{self.plex_server._baseurl}/library/metadata/{plex_playlist.ratingKey}/posters"
-                            params = {
-                                'url': encoded_url,
-                                'X-Plex-Token': self.plex_server._token
-                            }
-                            headers = {
-                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                            }
-                            response = requests.post(poster_url, params=params, headers=headers)
-                            response.raise_for_status()
+                            plex_playlist.uploadPoster(url=normalized_image_url)
                             logging.info(f"Successfully set thumbnail for playlist '{final_name}'")
                         except Exception as url_thumb_error:
                             logging.error(f"Failed to set thumbnail: {str(url_thumb_error)}")
+                    finally:
+                        if temp_file:
+                            try:
+                                os.remove(temp_file)
+                            except Exception:
+                                pass
                 
                 logging.info(f"Successfully created playlist '{final_name}' with {len(plex_tracks)} tracks")
                 if not_found_tracks:
@@ -6437,6 +8016,16 @@ class PlexPlaylistManager(QMainWindow):
         self._suspend_settings_apply = True
         self._startup_auto_fetch_pending = False
         self.apple_music_library_data = None
+        self.plex_server_profiles = []
+        self.source_server_playlists = []
+        self.source_server_playlists_profile_url = ""
+        self.server_sync_policy = "keep_extras"
+        self.server_sync_jobs = []
+        self.server_sync_job_queue = []
+        self.server_sync_job_thread = None
+        self.server_sync_jobs_ui_refreshing = False
+        self.source_playlist_load_thread = None
+        self.server_playlist_transfer_thread = None
 
         # User management
         self.current_user = None  # Currently selected user
@@ -6892,20 +8481,26 @@ class PlexPlaylistManager(QMainWindow):
         
         # Add new sync config
         add_config_layout = QHBoxLayout()
+        add_config_layout.setContentsMargins(0, 0, 0, 0)
+        add_config_layout.setSpacing(6)
         
         self.sync_playlist_combo = QComboBox()
         self.sync_playlist_combo.setMinimumWidth(200)
+        self.sync_playlist_combo.setMinimumHeight(34)
         add_config_layout.addWidget(QLabel("Plex Playlist:"))
         add_config_layout.addWidget(self.sync_playlist_combo)
         
         self.sync_source_input = QLineEdit()
+        self.sync_source_input.setMinimumHeight(34)
         self.sync_source_input.setPlaceholderText("Enter streaming URL (Spotify/Deezer/Tidal/ListenBrainz) or M3U file path")
         add_config_layout.addWidget(QLabel("Source:"))
         add_config_layout.addWidget(self.sync_source_input)
         
         self.add_sync_config_btn = ModernButton("Add Sync Config")
+        self.add_sync_config_btn.setFixedHeight(34)
         self.add_sync_config_btn.clicked.connect(self.add_sync_config)
         add_config_layout.addWidget(self.add_sync_config_btn)
+        add_config_layout.setAlignment(self.add_sync_config_btn, Qt.AlignmentFlag.AlignVCenter)
         
         sync_layout.addLayout(add_config_layout)
         
@@ -7004,6 +8599,13 @@ class PlexPlaylistManager(QMainWindow):
         self.restore_playlists_btn.clicked.connect(self.restore_playlists)
         playlist_ops_layout.addWidget(self.restore_playlists_btn, 1, 1)
 
+        # Portable playlist+audio backup
+        self.portable_backup_btn = ModernButton("Portable Backup")
+        self.portable_backup_btn.clicked.connect(self.open_portable_backup_dialog)
+        self.portable_backup_btn.setToolTip("Back up playlists plus actual audio files into a portable folder")
+        self._set_button_icon(self.portable_backup_btn, "local_tracks", QStyle.StandardPixmap.SP_DriveHDIcon)
+        playlist_ops_layout.addWidget(self.portable_backup_btn, 2, 1)
+
         # File metadata fixer
         self.metadata_fixer_btn = ModernButton("File Metadata Fixer")
         self.metadata_fixer_btn.clicked.connect(self.open_metadata_fixer)
@@ -7012,7 +8614,128 @@ class PlexPlaylistManager(QMainWindow):
         playlist_ops_layout.addWidget(self.metadata_fixer_btn, 2, 0)
 
         layout.addWidget(playlist_ops_group)
-        
+
+        # Cross-server transfer
+        server_sync_group = QGroupBox("Plex Server Sync")
+        server_sync_layout = QVBoxLayout(server_sync_group)
+
+        profile_row = QHBoxLayout()
+        profile_row.setContentsMargins(0, 0, 0, 0)
+        profile_row.setSpacing(6)
+        profile_row.addWidget(QLabel("Source Server Profile:"))
+        self.server_sync_profile_combo = QComboBox()
+        self.server_sync_profile_combo.setMinimumHeight(34)
+        self.server_sync_profile_combo.addItem("Select source server profile...", None)
+        self.server_sync_profile_combo.currentIndexChanged.connect(self.on_server_profile_changed)
+        profile_row.addWidget(self.server_sync_profile_combo, 1)
+
+        self.server_sync_add_current_btn = ModernButton("Add Current Server")
+        self.server_sync_add_current_btn.setFixedHeight(34)
+        self.server_sync_add_current_btn.clicked.connect(self.add_current_server_profile)
+        profile_row.addWidget(self.server_sync_add_current_btn)
+        profile_row.setAlignment(self.server_sync_add_current_btn, Qt.AlignmentFlag.AlignVCenter)
+        self.server_sync_remove_profile_btn = ModernButton("Remove Profile")
+        self.server_sync_remove_profile_btn.setFixedHeight(34)
+        self.server_sync_remove_profile_btn.clicked.connect(self.remove_selected_server_profile)
+        profile_row.addWidget(self.server_sync_remove_profile_btn)
+        profile_row.setAlignment(self.server_sync_remove_profile_btn, Qt.AlignmentFlag.AlignVCenter)
+        server_sync_layout.addLayout(profile_row)
+
+        playlist_row = QHBoxLayout()
+        playlist_row.setContentsMargins(0, 0, 0, 0)
+        playlist_row.setSpacing(6)
+        playlist_row.addWidget(QLabel("Source Playlist:"))
+        self.server_sync_playlist_combo = QComboBox()
+        self.server_sync_playlist_combo.setMinimumHeight(34)
+        self.server_sync_playlist_combo.addItem("Load source playlists first...", None)
+        playlist_row.addWidget(self.server_sync_playlist_combo, 1)
+        self.server_sync_load_playlists_btn = ModernButton("Load Source Playlists")
+        self.server_sync_load_playlists_btn.setFixedHeight(34)
+        self.server_sync_load_playlists_btn.clicked.connect(self.load_source_server_playlists)
+        playlist_row.addWidget(self.server_sync_load_playlists_btn)
+        playlist_row.setAlignment(self.server_sync_load_playlists_btn, Qt.AlignmentFlag.AlignVCenter)
+        server_sync_layout.addLayout(playlist_row)
+
+        policy_row = QHBoxLayout()
+        policy_row.addWidget(QLabel("Sync Policy:"))
+        self.server_sync_policy_combo = QComboBox()
+        self.server_sync_policy_combo.addItem("Mirror source (exact)", "mirror")
+        self.server_sync_policy_combo.addItem("Add missing only", "add_only")
+        self.server_sync_policy_combo.addItem("Source first, keep target extras", "keep_extras")
+        self.server_sync_policy_combo.setToolTip(
+            "Mirror: target becomes source order exactly. "
+            "Add missing only: append only missing tracks. "
+            "Keep extras: source order first, preserve extra target tracks."
+        )
+        default_policy = getattr(self, "server_sync_policy", "keep_extras")
+        policy_index = self.server_sync_policy_combo.findData(default_policy)
+        self.server_sync_policy_combo.setCurrentIndex(policy_index if policy_index >= 0 else 2)
+        self.server_sync_policy_combo.currentIndexChanged.connect(self.on_server_sync_policy_changed)
+        policy_row.addWidget(self.server_sync_policy_combo, 1)
+        server_sync_layout.addLayout(policy_row)
+
+        action_row = QHBoxLayout()
+        self.server_sync_overwrite_cb = QCheckBox("Overwrite target playlist if it exists")
+        self.server_sync_overwrite_cb.setChecked(True)
+        self.server_sync_overwrite_cb.stateChanged.connect(self.on_server_sync_overwrite_changed)
+        action_row.addWidget(self.server_sync_overwrite_cb)
+        action_row.addStretch()
+        self.server_sync_preview_btn = ModernButton("Dry Run Diff")
+        self.server_sync_preview_btn.clicked.connect(self.preview_playlist_transfer_from_source_server)
+        self._set_button_icon(self.server_sync_preview_btn, "playlists", QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        action_row.addWidget(self.server_sync_preview_btn)
+        self.server_sync_transfer_btn = ModernButton("Transfer to Connected Server")
+        self.server_sync_transfer_btn.clicked.connect(self.transfer_playlist_from_source_server)
+        self._set_button_icon(self.server_sync_transfer_btn, "sync_manager", QStyle.StandardPixmap.SP_BrowserReload)
+        action_row.addWidget(self.server_sync_transfer_btn)
+        server_sync_layout.addLayout(action_row)
+        self.on_server_sync_overwrite_changed()
+
+        self.server_sync_status = QLabel(
+            "Save multiple source servers, load a playlist from one server, and transfer it directly into the currently connected Plex server."
+        )
+        self.server_sync_status.setWordWrap(True)
+        self.server_sync_status.setStyleSheet("color: #b8c9df; font-size: 12px;")
+        server_sync_layout.addWidget(self.server_sync_status)
+
+        scheduler_group = QGroupBox("Scheduled Server Sync Jobs")
+        scheduler_layout = QVBoxLayout(scheduler_group)
+
+        scheduler_controls = QHBoxLayout()
+        scheduler_controls.addWidget(QLabel("Interval:"))
+        self.server_sync_job_interval_spin = QSpinBox()
+        self.server_sync_job_interval_spin.setRange(5, 10080)
+        self.server_sync_job_interval_spin.setValue(60)
+        self.server_sync_job_interval_spin.setSuffix(" min")
+        scheduler_controls.addWidget(self.server_sync_job_interval_spin)
+        scheduler_controls.addStretch()
+
+        self.server_sync_add_job_btn = ModernButton("Add Scheduled Job")
+        self.server_sync_add_job_btn.clicked.connect(self.add_server_sync_job_from_current_selection)
+        scheduler_controls.addWidget(self.server_sync_add_job_btn)
+
+        self.server_sync_run_due_btn = ModernButton("Run Due Jobs Now")
+        self.server_sync_run_due_btn.clicked.connect(lambda: self.check_server_sync_jobs(force_run_due=True))
+        scheduler_controls.addWidget(self.server_sync_run_due_btn)
+
+        self.server_sync_remove_job_btn = ModernButton("Remove Selected Job")
+        self.server_sync_remove_job_btn.clicked.connect(self.remove_selected_server_sync_job)
+        scheduler_controls.addWidget(self.server_sync_remove_job_btn)
+        scheduler_layout.addLayout(scheduler_controls)
+
+        self.server_sync_jobs_list = QListWidget()
+        self.server_sync_jobs_list.setMinimumHeight(130)
+        self.server_sync_jobs_list.itemChanged.connect(self.on_server_sync_job_item_changed)
+        scheduler_layout.addWidget(self.server_sync_jobs_list)
+
+        self.server_sync_jobs_status = QLabel("No scheduled server sync jobs configured.")
+        self.server_sync_jobs_status.setStyleSheet("color: #9cb2d2; font-size: 12px;")
+        scheduler_layout.addWidget(self.server_sync_jobs_status)
+
+        server_sync_layout.addWidget(scheduler_group)
+
+        layout.addWidget(server_sync_group)
+
         # Statistics
         stats_group = QGroupBox("Playlist Statistics")
         stats_layout = QVBoxLayout(stats_group)
@@ -7046,6 +8769,698 @@ class PlexPlaylistManager(QMainWindow):
         layout.addStretch()
         self._add_page_to_stack(page)
         self.refresh_feature_dependent_ui()
+        self.refresh_server_sync_profiles_ui()
+        self.refresh_server_sync_jobs_ui()
+
+    def _build_current_server_profile(self):
+        if not self.plex_server:
+            return None
+
+        base_url = str(getattr(self.plex_server, "_baseurl", "") or "").strip()
+        if not base_url:
+            ip = self.server_ip_input.text().strip() if hasattr(self, "server_ip_input") else ""
+            port = self.server_port_input.text().strip() if hasattr(self, "server_port_input") else ""
+            if not ip or not port:
+                return None
+            base_url = f"http://{ip}:{port}"
+
+        token = self.token_input.text().strip() if hasattr(self, "token_input") else ""
+        if not token and self.plex_account:
+            token = str(getattr(self.plex_account, "authenticationToken", "") or "").strip()
+        if not token:
+            token = str(getattr(self.plex_server, "_token", "") or "").strip()
+        if not token:
+            return None
+
+        profile_name = self.current_user_name if self.current_user_name else "Current Server"
+        ip_hint = self.server_ip_input.text().strip() if hasattr(self, "server_ip_input") else ""
+        if ip_hint:
+            profile_name = f"{profile_name} @ {ip_hint}"
+        return {
+            "name": profile_name,
+            "base_url": base_url,
+            "token": token,
+        }
+
+    def refresh_server_sync_profiles_ui(self):
+        if not hasattr(self, "server_sync_profile_combo"):
+            return
+
+        selected_base = None
+        current_data = self.server_sync_profile_combo.currentData()
+        if isinstance(current_data, dict):
+            selected_base = str(current_data.get("base_url", "") or "").strip().lower()
+
+        self.server_sync_profile_combo.blockSignals(True)
+        self.server_sync_profile_combo.clear()
+        self.server_sync_profile_combo.addItem("Select source server profile...", None)
+
+        profiles = self.plex_server_profiles if isinstance(self.plex_server_profiles, list) else []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            name = str(profile.get("name", "Unnamed Server") or "Unnamed Server").strip()
+            base_url = str(profile.get("base_url", "") or "").strip()
+            label = f"{name} ({base_url})" if base_url else name
+            self.server_sync_profile_combo.addItem(label, profile)
+
+        if selected_base:
+            for idx in range(self.server_sync_profile_combo.count()):
+                profile = self.server_sync_profile_combo.itemData(idx)
+                if isinstance(profile, dict) and str(profile.get("base_url", "") or "").strip().lower() == selected_base:
+                    self.server_sync_profile_combo.setCurrentIndex(idx)
+                    break
+
+        self.server_sync_profile_combo.blockSignals(False)
+        self.on_server_profile_changed()
+
+    def add_current_server_profile(self):
+        profile = self._build_current_server_profile()
+        if not profile:
+            QMessageBox.warning(self, "Not Connected", "Connect to a Plex server first, then add it as a profile.")
+            return
+
+        existing_profiles = self.plex_server_profiles if isinstance(self.plex_server_profiles, list) else []
+        base_url_key = str(profile.get("base_url", "") or "").strip().lower()
+        replaced = False
+        for idx, existing in enumerate(existing_profiles):
+            if not isinstance(existing, dict):
+                continue
+            existing_key = str(existing.get("base_url", "") or "").strip().lower()
+            if existing_key and existing_key == base_url_key:
+                existing_profiles[idx] = profile
+                replaced = True
+                break
+
+        if not replaced:
+            existing_profiles.append(profile)
+        self.plex_server_profiles = existing_profiles
+        self.refresh_server_sync_profiles_ui()
+        self.save_config()
+        self.statusBar().showMessage("Server profile saved.", 2500)
+
+    def remove_selected_server_profile(self):
+        if not hasattr(self, "server_sync_profile_combo"):
+            return
+        profile = self.server_sync_profile_combo.currentData()
+        if not isinstance(profile, dict):
+            QMessageBox.warning(self, "No Profile Selected", "Select a source server profile to remove.")
+            return
+
+        base_url = str(profile.get("base_url", "") or "").strip().lower()
+        if not base_url:
+            return
+        self.plex_server_profiles = [
+            item for item in (self.plex_server_profiles or [])
+            if not (isinstance(item, dict) and str(item.get("base_url", "") or "").strip().lower() == base_url)
+        ]
+        self.source_server_playlists = []
+        self.source_server_playlists_profile_url = ""
+        if hasattr(self, "server_sync_playlist_combo"):
+            self.server_sync_playlist_combo.clear()
+            self.server_sync_playlist_combo.addItem("Load source playlists first...", None)
+        self.refresh_server_sync_profiles_ui()
+        self.save_config()
+        self.statusBar().showMessage("Server profile removed.", 2500)
+
+    def on_server_profile_changed(self):
+        profile = self.server_sync_profile_combo.currentData() if hasattr(self, "server_sync_profile_combo") else None
+        has_profile = isinstance(profile, dict)
+        profile_url = str(profile.get("base_url", "") or "").strip().lower() if has_profile else ""
+        if profile_url != self.source_server_playlists_profile_url:
+            self.source_server_playlists = []
+            if hasattr(self, "server_sync_playlist_combo"):
+                self.server_sync_playlist_combo.clear()
+                self.server_sync_playlist_combo.addItem("Load source playlists first...", None)
+        if hasattr(self, "server_sync_load_playlists_btn"):
+            self.server_sync_load_playlists_btn.setEnabled(has_profile)
+        if hasattr(self, "server_sync_add_job_btn"):
+            self.server_sync_add_job_btn.setEnabled(bool(self.plex_server) and has_profile and bool(self.source_server_playlists))
+        if hasattr(self, "server_sync_preview_btn"):
+            self.server_sync_preview_btn.setEnabled(bool(self.plex_server) and has_profile and bool(self.source_server_playlists))
+        if hasattr(self, "server_sync_transfer_btn"):
+            self.server_sync_transfer_btn.setEnabled(bool(self.plex_server) and has_profile and bool(self.source_server_playlists))
+
+    def on_server_sync_policy_changed(self):
+        selected_policy = self.server_sync_policy_combo.currentData() if hasattr(self, "server_sync_policy_combo") else self.server_sync_policy
+        self.server_sync_policy = str(selected_policy or "keep_extras").strip().lower()
+        if not self._suspend_settings_apply:
+            self.save_config()
+
+    def on_server_sync_overwrite_changed(self):
+        overwrite_enabled = bool(self.server_sync_overwrite_cb.isChecked()) if hasattr(self, "server_sync_overwrite_cb") else True
+        if hasattr(self, "server_sync_policy_combo"):
+            self.server_sync_policy_combo.setEnabled(overwrite_enabled)
+        if not self._suspend_settings_apply:
+            self.save_config()
+
+    def _server_sync_parse_datetime(self, value):
+        if not value:
+            return None
+        try:
+            parsed = datetime.strptime(str(value), "%Y-%m-%d %H:%M")
+            return parsed
+        except Exception:
+            return None
+
+    def _server_sync_format_datetime(self, value):
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M")
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    def _server_sync_next_run(self, interval_minutes):
+        try:
+            minutes = max(5, int(interval_minutes))
+        except Exception:
+            minutes = 60
+        return datetime.now() + timedelta(minutes=minutes)
+
+    def _server_sync_job_label(self, job):
+        source_profile = job.get("source_profile", {}) if isinstance(job, dict) else {}
+        profile_name = str(source_profile.get("name", "Unknown Source") or "Unknown Source").strip()
+        target_profile = job.get("target_profile", {}) if isinstance(job, dict) else {}
+        target_name = str(target_profile.get("name", "Target server") or "Target server").strip()
+        playlist_name = str(job.get("source_playlist_title", "Unknown Playlist") or "Unknown Playlist").strip()
+        policy = self._server_sync_policy_label(job.get("sync_policy", "keep_extras"))
+        interval = int(job.get("interval_minutes", 60) or 60)
+        next_run = str(job.get("next_run", "") or "n/a")
+        last_status = str(job.get("last_status", "") or "").strip()
+        base = f"{profile_name} -> {target_name}:{playlist_name} | Every {interval}m | {policy} | Next: {next_run}"
+        if last_status:
+            base += f" | Last: {last_status}"
+        return base
+
+    def refresh_server_sync_jobs_ui(self):
+        if not hasattr(self, "server_sync_jobs_list"):
+            return
+
+        self.server_sync_jobs_ui_refreshing = True
+        self.server_sync_jobs_list.clear()
+        jobs = self.server_sync_jobs if isinstance(self.server_sync_jobs, list) else []
+        enabled_count = 0
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            item = QListWidgetItem(self._server_sync_job_label(job))
+            item.setData(Qt.ItemDataRole.UserRole, str(job.get("id", "") or ""))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            is_enabled = bool(job.get("enabled", True))
+            if is_enabled:
+                enabled_count += 1
+            item.setCheckState(Qt.CheckState.Checked if is_enabled else Qt.CheckState.Unchecked)
+            self.server_sync_jobs_list.addItem(item)
+        self.server_sync_jobs_ui_refreshing = False
+
+        if hasattr(self, "server_sync_jobs_status"):
+            if not jobs:
+                self.server_sync_jobs_status.setText("No scheduled server sync jobs configured.")
+            else:
+                self.server_sync_jobs_status.setText(f"Scheduled jobs: {len(jobs)} total, {enabled_count} enabled.")
+        if hasattr(self, "server_sync_run_due_btn"):
+            self.server_sync_run_due_btn.setEnabled(bool(jobs))
+
+    def on_server_sync_job_item_changed(self, item):
+        if self.server_sync_jobs_ui_refreshing:
+            return
+        if not item:
+            return
+        job_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not job_id:
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        updated = False
+        for job in self.server_sync_jobs:
+            if isinstance(job, dict) and str(job.get("id", "")) == job_id:
+                job["enabled"] = enabled
+                updated = True
+                break
+        if updated:
+            self.save_config()
+            self.refresh_server_sync_jobs_ui()
+
+    def _find_server_sync_job_by_id(self, job_id):
+        for job in self.server_sync_jobs:
+            if isinstance(job, dict) and str(job.get("id", "")) == str(job_id):
+                return job
+        return None
+
+    def add_server_sync_job_from_current_selection(self):
+        try:
+            request = self._build_server_transfer_request()
+        except Exception as e:
+            QMessageBox.warning(self, "Server Sync Scheduler", str(e))
+            return
+
+        target_profile = self._build_current_server_profile()
+        if not target_profile:
+            QMessageBox.warning(self, "Server Sync Scheduler", "Connect to the target server before creating scheduled jobs.")
+            return
+
+        interval = int(self.server_sync_job_interval_spin.value()) if hasattr(self, "server_sync_job_interval_spin") else 60
+        job = {
+            "id": secrets.token_hex(8),
+            "enabled": True,
+            "source_profile": dict(request.get("profile", {})),
+            "target_profile": target_profile,
+            "source_playlist_title": request.get("source_playlist_title"),
+            "target_section_id": request.get("section_id"),
+            "target_section_title": self.section_combo.currentText().strip() if hasattr(self, "section_combo") else "",
+            "target_mode": request.get("transfer_mode", "overwrite"),
+            "sync_policy": request.get("sync_policy", "keep_extras"),
+            "target_playlist_name": request.get("source_playlist_title"),
+            "interval_minutes": interval,
+            "next_run": self._server_sync_format_datetime(self._server_sync_next_run(interval)),
+            "last_run": "",
+            "last_status": "Pending",
+        }
+        if not isinstance(self.server_sync_jobs, list):
+            self.server_sync_jobs = []
+        self.server_sync_jobs.append(job)
+        self.save_config()
+        self.refresh_server_sync_jobs_ui()
+        self.statusBar().showMessage("Scheduled server sync job added.", 3000)
+
+    def remove_selected_server_sync_job(self):
+        if not hasattr(self, "server_sync_jobs_list"):
+            return
+        item = self.server_sync_jobs_list.currentItem()
+        if not item:
+            QMessageBox.warning(self, "Server Sync Scheduler", "Select a scheduled job to remove.")
+            return
+        job_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not job_id:
+            return
+
+        self.server_sync_jobs = [
+            job for job in (self.server_sync_jobs or [])
+            if not (isinstance(job, dict) and str(job.get("id", "")) == job_id)
+        ]
+        self.save_config()
+        self.refresh_server_sync_jobs_ui()
+        self.statusBar().showMessage("Scheduled job removed.", 2500)
+
+    def check_server_sync_jobs(self, force_run_due=False):
+        jobs = [job for job in (self.server_sync_jobs or []) if isinstance(job, dict)]
+        if not jobs:
+            if force_run_due:
+                QMessageBox.information(self, "Server Sync Scheduler", "No scheduled jobs configured.")
+            return
+
+        if (self.server_sync_job_thread and self.server_sync_job_thread.isRunning()) or (
+            self.server_playlist_transfer_thread and self.server_playlist_transfer_thread.isRunning()
+        ) or (
+            self.sync_thread and self.sync_thread.isRunning()
+        ):
+            if force_run_due:
+                QMessageBox.information(self, "Server Sync Scheduler", "A server transfer is already running.")
+            return
+
+        now = datetime.now()
+        due_jobs = []
+        for job in jobs:
+            if not bool(job.get("enabled", True)):
+                continue
+            next_run = self._server_sync_parse_datetime(job.get("next_run"))
+            if not next_run:
+                next_run = now
+                job["next_run"] = self._server_sync_format_datetime(next_run)
+            if now >= next_run:
+                due_jobs.append(job)
+
+        if not due_jobs:
+            if force_run_due:
+                QMessageBox.information(self, "Server Sync Scheduler", "No due jobs right now.")
+            return
+
+        due_jobs.sort(key=lambda j: self._server_sync_parse_datetime(j.get("next_run")) or now)
+        self.server_sync_job_queue = due_jobs
+        self._run_next_server_sync_job()
+
+    def _run_next_server_sync_job(self):
+        if not self.server_sync_job_queue:
+            self.save_config()
+            self.refresh_server_sync_jobs_ui()
+            return
+
+        job = self.server_sync_job_queue.pop(0)
+        source_profile = job.get("source_profile", {}) if isinstance(job, dict) else {}
+        target_profile = job.get("target_profile", {}) if isinstance(job, dict) else {}
+        source_playlist = str(job.get("source_playlist_title", "") or "").strip()
+        target_section_id = job.get("target_section_id")
+        target_section_title = str(job.get("target_section_title", "") or "").strip()
+        target_mode = str(job.get("target_mode", "overwrite") or "overwrite").strip().lower()
+        sync_policy = str(job.get("sync_policy", "keep_extras") or "keep_extras").strip().lower()
+        target_name = str(job.get("target_playlist_name", source_playlist) or source_playlist).strip()
+        filter_settings = {
+            "enabled": bool(self.enable_filters_checkbox.isChecked()) if hasattr(self, "enable_filters_checkbox") else False,
+            "avoid_live": bool(self.filter_live_checkbox.isChecked()) if hasattr(self, "filter_live_checkbox") else False,
+            "avoid_compilation": bool(self.filter_compilation_checkbox.isChecked()) if hasattr(self, "filter_compilation_checkbox") else False,
+            "deprioritize_remaster": bool(self.filter_remaster_checkbox.isChecked()) if hasattr(self, "filter_remaster_checkbox") else False,
+            "deprioritize_deluxe": bool(self.filter_deluxe_checkbox.isChecked()) if hasattr(self, "filter_deluxe_checkbox") else False,
+        }
+
+        source_base_url = str(source_profile.get("base_url", "") or "").strip() if isinstance(source_profile, dict) else ""
+        source_token = str(source_profile.get("token", "") or "").strip() if isinstance(source_profile, dict) else ""
+        target_base_url = str(target_profile.get("base_url", "") or "").strip() if isinstance(target_profile, dict) else ""
+        target_token = str(target_profile.get("token", "") or "").strip() if isinstance(target_profile, dict) else ""
+
+        if not source_profile or not target_profile or not source_base_url or not source_token or not target_base_url or not target_token:
+            job["last_run"] = self._server_sync_format_datetime(datetime.now())
+            job["last_status"] = "Error: source/target profile missing"
+            interval = int(job.get("interval_minutes", 60) or 60)
+            job["next_run"] = self._server_sync_format_datetime(self._server_sync_next_run(interval))
+            if hasattr(self, "sync_log"):
+                self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Server job skipped (profile missing): {source_playlist}")
+            self._run_next_server_sync_job()
+            return
+
+        if hasattr(self, "sync_log"):
+            self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Running server sync job: {source_playlist}")
+        if hasattr(self, "server_sync_jobs_status"):
+            self.server_sync_jobs_status.setText(f"Running scheduled job: {source_playlist}")
+
+        self.server_sync_job_thread = PlexServerPlaylistTransferThread(
+            source_profile=source_profile,
+            source_playlist_title=source_playlist,
+            target_server=None,
+            target_section_id=target_section_id,
+            target_profile=target_profile,
+            target_section_title=target_section_title,
+            target_mode=target_mode,
+            sync_policy=sync_policy,
+            target_name_override=target_name,
+            filter_settings=filter_settings,
+            dry_run=False,
+            parent=self,
+        )
+        self.server_sync_job_thread.progress_update.connect(
+            lambda message, _pct: self._on_server_sync_job_progress(job, message)
+        )
+        self.server_sync_job_thread.transfer_complete.connect(
+            lambda result: self._on_server_sync_job_complete(job, result)
+        )
+        self.server_sync_job_thread.error.connect(
+            lambda error_message: self._on_server_sync_job_error(job, error_message)
+        )
+        self.server_sync_job_thread.finished.connect(self._on_server_sync_job_finished)
+        self.server_sync_job_thread.start()
+
+    def _on_server_sync_job_progress(self, job, message):
+        if hasattr(self, "server_sync_jobs_status"):
+            self.server_sync_jobs_status.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _on_server_sync_job_complete(self, job, result):
+        now = datetime.now()
+        matched = int(result.get("matched_tracks", 0))
+        total = int(result.get("total_tracks", 0))
+        final_count = int(result.get("final_tracks", matched))
+        job["last_run"] = self._server_sync_format_datetime(now)
+        job["last_status"] = f"OK {matched}/{total} (final {final_count})"
+        interval = int(job.get("interval_minutes", 60) or 60)
+        job["next_run"] = self._server_sync_format_datetime(self._server_sync_next_run(interval))
+        if hasattr(self, "sync_log"):
+            self.sync_log.append(
+                f"[{now.strftime('%H:%M:%S')}] Server job completed: {job.get('source_playlist_title', 'Unknown')} ({matched}/{total})"
+            )
+
+    def _on_server_sync_job_error(self, job, error_message):
+        now = datetime.now()
+        short_error = str(error_message or "Unknown error")
+        if len(short_error) > 140:
+            short_error = short_error[:140] + "..."
+        job["last_run"] = self._server_sync_format_datetime(now)
+        job["last_status"] = f"Error: {short_error}"
+        interval = int(job.get("interval_minutes", 60) or 60)
+        job["next_run"] = self._server_sync_format_datetime(self._server_sync_next_run(interval))
+        if hasattr(self, "sync_log"):
+            self.sync_log.append(
+                f"[{now.strftime('%H:%M:%S')}] Server job error: {job.get('source_playlist_title', 'Unknown')} -> {short_error}"
+            )
+        logging.error(f"Scheduled server sync job failed: {error_message}")
+
+    def _on_server_sync_job_finished(self):
+        self.server_sync_job_thread = None
+        self.save_config()
+        self.refresh_server_sync_jobs_ui()
+        self._run_next_server_sync_job()
+
+    def load_source_server_playlists(self):
+        profile = self.server_sync_profile_combo.currentData() if hasattr(self, "server_sync_profile_combo") else None
+        if not isinstance(profile, dict):
+            QMessageBox.warning(self, "No Source Selected", "Select a source server profile first.")
+            return
+
+        self.show_loading("Plex Server Sync", "Loading source server playlists...")
+        if hasattr(self, "server_sync_load_playlists_btn"):
+            self.server_sync_load_playlists_btn.setEnabled(False)
+
+        self.source_playlist_load_thread = PlexServerPlaylistLoadThread(profile, self)
+        self.source_playlist_load_thread.progress_update.connect(self.on_source_server_playlists_progress)
+        self.source_playlist_load_thread.playlists_loaded.connect(self.on_source_server_playlists_loaded)
+        self.source_playlist_load_thread.error.connect(self.on_source_server_playlists_error)
+        self.source_playlist_load_thread.finished.connect(self._on_source_playlist_load_finished)
+        self.source_playlist_load_thread.start()
+
+    def _on_source_playlist_load_finished(self):
+        if hasattr(self, "server_sync_load_playlists_btn"):
+            self.server_sync_load_playlists_btn.setEnabled(True)
+
+    def on_source_server_playlists_progress(self, message, percentage):
+        if self.loading_dialog:
+            self.loading_dialog.update_progress(message, percentage)
+        if hasattr(self, "server_sync_status"):
+            self.server_sync_status.setText(message)
+
+    def on_source_server_playlists_loaded(self, playlists):
+        self.hide_loading()
+        self.source_server_playlists = playlists if isinstance(playlists, list) else []
+        profile = self.server_sync_profile_combo.currentData() if hasattr(self, "server_sync_profile_combo") else None
+        self.source_server_playlists_profile_url = (
+            str(profile.get("base_url", "") or "").strip().lower() if isinstance(profile, dict) else ""
+        )
+
+        if hasattr(self, "server_sync_playlist_combo"):
+            self.server_sync_playlist_combo.blockSignals(True)
+            self.server_sync_playlist_combo.clear()
+            self.server_sync_playlist_combo.addItem("Select source playlist...", None)
+            for playlist in self.source_server_playlists:
+                title = str(playlist.get("title", "") or "").strip()
+                if not title:
+                    continue
+                leaf_count = playlist.get("leaf_count")
+                label = f"{title} ({leaf_count} tracks)" if isinstance(leaf_count, int) else title
+                self.server_sync_playlist_combo.addItem(label, title)
+            self.server_sync_playlist_combo.blockSignals(False)
+
+        self.on_server_profile_changed()
+        self.statusBar().showMessage(f"Loaded {len(self.source_server_playlists)} source playlists.", 3000)
+        if hasattr(self, "server_sync_status"):
+            self.server_sync_status.setText(
+                f"Loaded {len(self.source_server_playlists)} playlists. Select one and transfer it to the connected server."
+            )
+
+    def on_source_server_playlists_error(self, error_message):
+        self.hide_loading()
+        self.source_server_playlists = []
+        self.source_server_playlists_profile_url = ""
+        logging.error(f"Error loading source server playlists: {error_message}")
+        QMessageBox.warning(self, "Source Server Error", f"Failed to load source playlists:\n{error_message}")
+        if hasattr(self, "server_sync_status"):
+            self.server_sync_status.setText("Failed to load source playlists. Check profile URL/token and try again.")
+
+    def _build_server_transfer_request(self):
+        if not self.plex_server:
+            raise ValueError("Connect to the target Plex server first.")
+
+        section_id = self.section_combo.currentData()
+        if not section_id:
+            raise ValueError("Select a target music library section first.")
+
+        profile = self.server_sync_profile_combo.currentData() if hasattr(self, "server_sync_profile_combo") else None
+        if not isinstance(profile, dict):
+            raise ValueError("Select a source server profile first.")
+
+        source_playlist_title = self.server_sync_playlist_combo.currentData() if hasattr(self, "server_sync_playlist_combo") else None
+        if not source_playlist_title:
+            raise ValueError("Select a source playlist to transfer.")
+
+        transfer_mode = "overwrite" if (hasattr(self, "server_sync_overwrite_cb") and self.server_sync_overwrite_cb.isChecked()) else "create_copy"
+        sync_policy = self.server_sync_policy_combo.currentData() if hasattr(self, "server_sync_policy_combo") else self.server_sync_policy
+        sync_policy = str(sync_policy or "keep_extras").strip().lower()
+        filter_settings = {
+            "enabled": bool(self.enable_filters_checkbox.isChecked()) if hasattr(self, "enable_filters_checkbox") else False,
+            "avoid_live": bool(self.filter_live_checkbox.isChecked()) if hasattr(self, "filter_live_checkbox") else False,
+            "avoid_compilation": bool(self.filter_compilation_checkbox.isChecked()) if hasattr(self, "filter_compilation_checkbox") else False,
+            "deprioritize_remaster": bool(self.filter_remaster_checkbox.isChecked()) if hasattr(self, "filter_remaster_checkbox") else False,
+            "deprioritize_deluxe": bool(self.filter_deluxe_checkbox.isChecked()) if hasattr(self, "filter_deluxe_checkbox") else False,
+        }
+        return {
+            "profile": profile,
+            "source_playlist_title": source_playlist_title,
+            "section_id": section_id,
+            "transfer_mode": transfer_mode,
+            "sync_policy": sync_policy,
+            "filter_settings": filter_settings,
+        }
+
+    def _start_server_playlist_transfer(self, dry_run=False):
+        request = self._build_server_transfer_request()
+        source_playlist_title = request["source_playlist_title"]
+        sync_policy = request["sync_policy"]
+        operation_label = "Dry run preview" if dry_run else "Transfer"
+        self.show_loading("Plex Server Sync", f"{operation_label} for '{source_playlist_title}'...")
+
+        if hasattr(self, "server_sync_transfer_btn"):
+            self.server_sync_transfer_btn.setEnabled(False)
+        if hasattr(self, "server_sync_preview_btn"):
+            self.server_sync_preview_btn.setEnabled(False)
+
+        self.server_playlist_transfer_thread = PlexServerPlaylistTransferThread(
+            source_profile=request["profile"],
+            source_playlist_title=source_playlist_title,
+            target_server=self.plex_server,
+            target_section_id=request["section_id"],
+            target_mode=request["transfer_mode"],
+            sync_policy=sync_policy,
+            target_name_override=source_playlist_title,
+            filter_settings=request["filter_settings"],
+            dry_run=dry_run,
+            parent=self,
+        )
+        self.server_playlist_transfer_thread.progress_update.connect(self.on_server_playlist_transfer_progress)
+        self.server_playlist_transfer_thread.transfer_complete.connect(self.on_server_playlist_transfer_complete)
+        self.server_playlist_transfer_thread.error.connect(self.on_server_playlist_transfer_error)
+        self.server_playlist_transfer_thread.finished.connect(self._on_server_playlist_transfer_finished)
+        self.server_playlist_transfer_thread.start()
+
+    def transfer_playlist_from_source_server(self):
+        try:
+            self._start_server_playlist_transfer(dry_run=False)
+        except Exception as e:
+            QMessageBox.warning(self, "Plex Server Sync", str(e))
+
+    def preview_playlist_transfer_from_source_server(self):
+        try:
+            self._start_server_playlist_transfer(dry_run=True)
+        except Exception as e:
+            QMessageBox.warning(self, "Plex Server Sync", str(e))
+
+    def _on_server_playlist_transfer_finished(self):
+        if hasattr(self, "server_sync_transfer_btn"):
+            self.server_sync_transfer_btn.setEnabled(True)
+        if hasattr(self, "server_sync_preview_btn"):
+            self.server_sync_preview_btn.setEnabled(True)
+        self.on_server_profile_changed()
+
+    def on_server_playlist_transfer_progress(self, message, percentage):
+        if self.loading_dialog:
+            self.loading_dialog.update_progress(message, percentage)
+        if hasattr(self, "server_sync_status"):
+            self.server_sync_status.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _server_sync_policy_label(self, policy_value):
+        mapping = {
+            "mirror": "Mirror source (exact)",
+            "add_only": "Add missing only",
+            "keep_extras": "Source first, keep target extras",
+        }
+        key = str(policy_value or "keep_extras").strip().lower()
+        return mapping.get(key, key)
+
+    def on_server_playlist_transfer_complete(self, result):
+        self.hide_loading()
+        if bool(result.get("dry_run", False)):
+            source_name = result.get("source_playlist", "Source Playlist")
+            target_name = result.get("target_playlist", "Target Playlist")
+            matched = int(result.get("matched_tracks", 0))
+            final_count = int(result.get("final_tracks", matched))
+            total = int(result.get("total_tracks", 0))
+            missing = int(result.get("missing_tracks", 0))
+            will_add = int(result.get("will_add", 0))
+            will_remove = int(result.get("will_remove", 0))
+            will_reorder = bool(result.get("will_reorder", False))
+            target_exists = bool(result.get("target_exists", False))
+            existing_count = int(result.get("existing_count", 0))
+            mode = str(result.get("mode", "overwrite"))
+            sync_policy = str(result.get("sync_policy", "keep_extras"))
+            sync_policy_label = self._server_sync_policy_label(sync_policy)
+
+            summary = (
+                f"Dry Run for '{source_name}' -> '{target_name}'\n\n"
+                f"Target exists: {'Yes' if target_exists else 'No'}"
+            )
+            if target_exists:
+                summary += f" ({existing_count} current tracks)"
+            summary += (
+                f"\nMode: {mode}\n"
+                f"Policy: {sync_policy_label}\n"
+                f"Matched: {matched}/{total}\n"
+                f"Final target tracks: {final_count}\n"
+                f"Missing: {missing}\n"
+                f"Will add: {will_add}\n"
+                f"Will remove: {will_remove}\n"
+                f"Will reorder: {'Yes' if will_reorder else 'No'}"
+            )
+
+            add_samples = result.get("add_samples", []) or []
+            remove_samples = result.get("remove_samples", []) or []
+            missing_samples = result.get("missing_samples", []) or []
+            detail_lines = []
+            if add_samples:
+                detail_lines.append("\nAdd samples:")
+                detail_lines.extend([f"- {item}" for item in add_samples[:8]])
+            if remove_samples:
+                detail_lines.append("\nRemove samples:")
+                detail_lines.extend([f"- {item}" for item in remove_samples[:8]])
+            if missing_samples:
+                detail_lines.append("\nMissing samples:")
+                detail_lines.extend([f"- {item}" for item in missing_samples[:8]])
+            if detail_lines:
+                summary += "\n" + "\n".join(detail_lines)
+
+            QMessageBox.information(self, "Plex Server Sync Dry Run", summary)
+            self.statusBar().showMessage(f"Dry run complete for '{source_name}'.", 5000)
+            if hasattr(self, "server_sync_status"):
+                self.server_sync_status.setText(
+                    f"Dry run complete: {matched}/{total} matched, {missing} missing, add {will_add}, remove {will_remove}."
+                )
+            return
+
+        matched = int(result.get("matched_tracks", 0))
+        final_count = int(result.get("final_tracks", matched))
+        total = int(result.get("total_tracks", 0))
+        missing = int(result.get("missing_tracks", 0))
+        source_name = result.get("source_playlist", "Source Playlist")
+        target_name = result.get("target_playlist", "Target Playlist")
+        sync_policy = str(result.get("sync_policy", "keep_extras"))
+        sync_policy_label = self._server_sync_policy_label(sync_policy)
+        summary = (
+            f"Transferred '{source_name}' to '{target_name}'.\n\n"
+            f"Matched: {matched}/{total}\n"
+            f"Final target tracks: {final_count}\n"
+            f"Policy: {sync_policy_label}\n"
+            f"Missing: {missing}"
+        )
+        missing_samples = result.get("missing_samples", []) or []
+        if missing_samples:
+            summary += "\n\nMissing samples:\n" + "\n".join(missing_samples[:8])
+
+        QMessageBox.information(self, "Plex Server Sync Complete", summary)
+        self.statusBar().showMessage(f"Transferred '{source_name}' to '{target_name}' ({matched}/{total} matched).", 5000)
+        if hasattr(self, "server_sync_status"):
+            self.server_sync_status.setText(
+                f"Transfer complete: '{source_name}' -> '{target_name}' ({matched}/{total} matched)."
+            )
+        self.fetch_playlists()
+
+    def on_server_playlist_transfer_error(self, error_message):
+        self.hide_loading()
+        logging.error(f"Plex server playlist transfer failed: {error_message}")
+        QMessageBox.warning(self, "Plex Server Sync Error", f"Failed to transfer playlist:\n{error_message}")
+        if hasattr(self, "server_sync_status"):
+            self.server_sync_status.setText("Transfer failed. Check server profiles, tokens, and library selection.")
 
     def setup_metadata_service(self):
         """Initialize metadata service from config defaults/runtime values."""
@@ -7109,6 +9524,14 @@ class PlexPlaylistManager(QMainWindow):
         )
         dialog.exec()
 
+    def open_portable_backup_dialog(self):
+        """Open portable backup dialog for playlist + audio export."""
+        if not self.plex_server:
+            QMessageBox.warning(self, "Not Connected", "Please connect to Plex server first.")
+            return
+        dialog = PortableBackupDialog(self.plex_server, self)
+        dialog.exec()
+
     def refresh_feature_dependent_ui(self):
         metadata_enabled = bool(self.feature_flags.get("metadata_fixer", False))
         if hasattr(self, "metadata_fixer_btn"):
@@ -7138,6 +9561,19 @@ class PlexPlaylistManager(QMainWindow):
             connection_state = "Connected" if self.plex_server else "Not connected"
             fixer_state = "Enabled" if metadata_enabled else "Disabled"
             self.dashboard_status_label.setText(f"Connection: {connection_state}\nFile Metadata Fixer: {fixer_state}")
+        if hasattr(self, "server_sync_add_current_btn"):
+            self.server_sync_add_current_btn.setEnabled(bool(self.plex_server))
+        if hasattr(self, "server_sync_add_job_btn"):
+            profile = self.server_sync_profile_combo.currentData() if hasattr(self, "server_sync_profile_combo") else None
+            self.server_sync_add_job_btn.setEnabled(bool(self.plex_server) and isinstance(profile, dict) and bool(getattr(self, "source_server_playlists", [])))
+        if hasattr(self, "server_sync_run_due_btn"):
+            self.server_sync_run_due_btn.setEnabled(bool(getattr(self, "server_sync_jobs", [])))
+        if hasattr(self, "server_sync_preview_btn"):
+            has_source_playlist = bool(getattr(self, "source_server_playlists", []))
+            self.server_sync_preview_btn.setEnabled(bool(self.plex_server) and has_source_playlist)
+        if hasattr(self, "server_sync_transfer_btn"):
+            has_source_playlist = bool(getattr(self, "source_server_playlists", []))
+            self.server_sync_transfer_btn.setEnabled(bool(self.plex_server) and has_source_playlist)
         self.update_dashboard_metrics()
 
     def update_dashboard_metrics(self):
@@ -7357,17 +9793,23 @@ class PlexPlaylistManager(QMainWindow):
 
         # Add new mapping controls
         add_mapping_layout = QHBoxLayout()
+        add_mapping_layout.setContentsMargins(0, 0, 0, 0)
+        add_mapping_layout.setSpacing(6)
 
         self.source_path_input = ModernLineEdit()
+        self.source_path_input.setMinimumHeight(34)
         self.source_path_input.setPlaceholderText("Source path (e.g., C:\\Music or //NAS/Music)")
 
         self.target_path_input = ModernLineEdit()
+        self.target_path_input.setMinimumHeight(34)
         self.target_path_input.setPlaceholderText("Target path (e.g., /volume1/music or /mnt/music)")
 
         add_mapping_btn = ModernButton('➕ Add Mapping')
+        add_mapping_btn.setFixedHeight(34)
         add_mapping_btn.clicked.connect(self.add_path_mapping)
 
         remove_mapping_btn = ModernButton('➖ Remove Selected')
+        remove_mapping_btn.setFixedHeight(34)
         remove_mapping_btn.clicked.connect(self.remove_path_mapping)
 
         add_mapping_layout.addWidget(QLabel("Source:"))
@@ -7375,7 +9817,9 @@ class PlexPlaylistManager(QMainWindow):
         add_mapping_layout.addWidget(QLabel("→ Target:"))
         add_mapping_layout.addWidget(self.target_path_input)
         add_mapping_layout.addWidget(add_mapping_btn)
+        add_mapping_layout.setAlignment(add_mapping_btn, Qt.AlignmentFlag.AlignVCenter)
         add_mapping_layout.addWidget(remove_mapping_btn)
+        add_mapping_layout.setAlignment(remove_mapping_btn, Qt.AlignmentFlag.AlignVCenter)
 
         path_mappings_layout.addLayout(add_mapping_layout)
 
@@ -7503,13 +9947,18 @@ class PlexPlaylistManager(QMainWindow):
         folder_layout = QVBoxLayout()
     
         folder_select_layout = QHBoxLayout()
+        folder_select_layout.setContentsMargins(0, 0, 0, 0)
+        folder_select_layout.setSpacing(6)
         self.folder_path_input = ModernLineEdit()
+        self.folder_path_input.setMinimumHeight(34)
         self.folder_path_input.setPlaceholderText("Select a folder containing music tracks")
         folder_select_layout.addWidget(self.folder_path_input)
     
         browse_folder_button = ModernButton('Browse')
+        browse_folder_button.setFixedHeight(34)
         browse_folder_button.clicked.connect(self.browse_music_folder)
         folder_select_layout.addWidget(browse_folder_button)
+        folder_select_layout.setAlignment(browse_folder_button, Qt.AlignmentFlag.AlignVCenter)
         folder_layout.addLayout(folder_select_layout)
     
         # Option to include subfolders
@@ -8145,11 +10594,15 @@ class PlexPlaylistManager(QMainWindow):
         import_layout.addWidget(self.playlist_input)
         
         browse_button = ModernButton('Browse')
+        browse_button.setObjectName("importBrowseButton")
         browse_button.clicked.connect(self.browse_files)
+        import_layout.setAlignment(browse_button, Qt.AlignmentFlag.AlignTop)
         import_layout.addWidget(browse_button)
         
         import_button = ModernButton('Import Playlist(s)')
+        import_button.setObjectName("importPlaylistButton")
         import_button.clicked.connect(self.import_playlist)
+        import_layout.setAlignment(import_button, Qt.AlignmentFlag.AlignTop)
         import_layout.addWidget(import_button)
         
         ie_layout.addLayout(import_layout)
@@ -8361,24 +10814,36 @@ class PlexPlaylistManager(QMainWindow):
         listenbrainz_layout.addLayout(auth_row)
 
         import_row = QHBoxLayout()
+        import_row.setContentsMargins(0, 0, 0, 0)
+        import_row.setSpacing(6)
         self.listenbrainz_playlist_combo = QComboBox()
+        self.listenbrainz_playlist_combo.setMinimumHeight(34)
         self.listenbrainz_playlist_combo.addItem("Select ListenBrainz playlist...")
         import_row.addWidget(self.listenbrainz_playlist_combo, 1)
         self.listenbrainz_load_btn = ModernButton("Load ListenBrainz Playlists")
+        self.listenbrainz_load_btn.setFixedHeight(34)
         self.listenbrainz_load_btn.clicked.connect(self.load_listenbrainz_playlists)
         import_row.addWidget(self.listenbrainz_load_btn)
+        import_row.setAlignment(self.listenbrainz_load_btn, Qt.AlignmentFlag.AlignVCenter)
         self.listenbrainz_import_btn = ModernButton("Import Selected to Plex")
+        self.listenbrainz_import_btn.setFixedHeight(34)
         self.listenbrainz_import_btn.clicked.connect(self.import_selected_listenbrainz_playlist)
         import_row.addWidget(self.listenbrainz_import_btn)
+        import_row.setAlignment(self.listenbrainz_import_btn, Qt.AlignmentFlag.AlignVCenter)
         listenbrainz_layout.addLayout(import_row)
 
         export_row = QHBoxLayout()
+        export_row.setContentsMargins(0, 0, 0, 0)
+        export_row.setSpacing(6)
         self.listenbrainz_export_combo = QComboBox()
+        self.listenbrainz_export_combo.setMinimumHeight(34)
         self.listenbrainz_export_combo.addItem("Select Plex playlist to export...")
         export_row.addWidget(self.listenbrainz_export_combo, 1)
         self.listenbrainz_export_btn = ModernButton("Export Plex Playlist to ListenBrainz")
+        self.listenbrainz_export_btn.setFixedHeight(34)
         self.listenbrainz_export_btn.clicked.connect(self.export_selected_playlist_to_listenbrainz)
         export_row.addWidget(self.listenbrainz_export_btn)
+        export_row.setAlignment(self.listenbrainz_export_btn, Qt.AlignmentFlag.AlignVCenter)
         listenbrainz_layout.addLayout(export_row)
 
         listenbrainz_hint = QLabel(
@@ -8398,15 +10863,22 @@ class PlexPlaylistManager(QMainWindow):
         apple_music_layout = QVBoxLayout(apple_music_group)
 
         xml_row = QHBoxLayout()
+        xml_row.setContentsMargins(0, 0, 0, 0)
+        xml_row.setSpacing(6)
         self.apple_music_xml_input = ModernLineEdit()
+        self.apple_music_xml_input.setMinimumHeight(34)
         self.apple_music_xml_input.setPlaceholderText("Select Apple Music Library XML export file")
         xml_row.addWidget(self.apple_music_xml_input, 1)
         self.apple_music_browse_btn = ModernButton("Browse XML")
+        self.apple_music_browse_btn.setFixedHeight(34)
         self.apple_music_browse_btn.clicked.connect(self.browse_apple_music_xml)
         xml_row.addWidget(self.apple_music_browse_btn)
+        xml_row.setAlignment(self.apple_music_browse_btn, Qt.AlignmentFlag.AlignVCenter)
         self.apple_music_load_btn = ModernButton("Load Library")
+        self.apple_music_load_btn.setFixedHeight(34)
         self.apple_music_load_btn.clicked.connect(self.load_apple_music_xml)
         xml_row.addWidget(self.apple_music_load_btn)
+        xml_row.setAlignment(self.apple_music_load_btn, Qt.AlignmentFlag.AlignVCenter)
         apple_music_layout.addLayout(xml_row)
 
         options_row = QHBoxLayout()
@@ -9676,6 +12148,9 @@ class PlexPlaylistManager(QMainWindow):
 
     def check_scheduled_sync(self):
         """Check if it's time to run scheduled sync (called every minute)"""
+        # Always process cross-server scheduled jobs, independent of legacy sync scheduler toggle.
+        self.check_server_sync_jobs(force_run_due=False)
+
         if not self.scheduled_sync_checkbox.isChecked():
             return
 
@@ -13145,6 +15620,40 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         token_value = config.get('token', '') or ''
         self.token_input.setText(token_value)
+        self.plex_server_profiles = config.get("plex_server_profiles", []) if isinstance(config.get("plex_server_profiles", []), list) else []
+        self.server_sync_policy = str(config.get("server_sync_policy", "keep_extras") or "keep_extras").strip().lower()
+        raw_jobs = config.get("server_sync_jobs", [])
+        self.server_sync_jobs = []
+        if isinstance(raw_jobs, list):
+            for raw_job in raw_jobs:
+                if not isinstance(raw_job, dict):
+                    continue
+                normalized_job = {
+                    "id": str(raw_job.get("id", "") or secrets.token_hex(8)),
+                    "enabled": bool(raw_job.get("enabled", True)),
+                    "source_profile": raw_job.get("source_profile", {}) if isinstance(raw_job.get("source_profile", {}), dict) else {},
+                    "source_playlist_title": str(raw_job.get("source_playlist_title", "") or "").strip(),
+                    "target_profile": raw_job.get("target_profile", {}) if isinstance(raw_job.get("target_profile", {}), dict) else {},
+                    "target_section_id": raw_job.get("target_section_id"),
+                    "target_section_title": str(raw_job.get("target_section_title", "") or "").strip(),
+                    "target_mode": str(raw_job.get("target_mode", "overwrite") or "overwrite").strip().lower(),
+                    "sync_policy": str(raw_job.get("sync_policy", "keep_extras") or "keep_extras").strip().lower(),
+                    "target_playlist_name": str(raw_job.get("target_playlist_name", raw_job.get("source_playlist_title", "")) or "").strip(),
+                    "interval_minutes": max(5, int(raw_job.get("interval_minutes", 60) or 60)),
+                    "next_run": str(raw_job.get("next_run", "") or ""),
+                    "last_run": str(raw_job.get("last_run", "") or ""),
+                    "last_status": str(raw_job.get("last_status", "") or ""),
+                }
+                if not normalized_job["next_run"]:
+                    normalized_job["next_run"] = self._server_sync_format_datetime(self._server_sync_next_run(normalized_job["interval_minutes"]))
+                self.server_sync_jobs.append(normalized_job)
+        if hasattr(self, "server_sync_profile_combo"):
+            self.refresh_server_sync_profiles_ui()
+        if hasattr(self, "server_sync_policy_combo"):
+            policy_index = self.server_sync_policy_combo.findData(self.server_sync_policy)
+            self.server_sync_policy_combo.setCurrentIndex(policy_index if policy_index >= 0 else 2)
+        if hasattr(self, "server_sync_jobs_list"):
+            self.refresh_server_sync_jobs_ui()
         if hasattr(self, "listenbrainz_token_input"):
             self.listenbrainz_token_input.setText(config.get("listenbrainz_token", ""))
         if hasattr(self, "listenbrainz_user_input"):
@@ -13221,6 +15730,9 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     "auto_apply_threshold": int(self.metadata_auto_apply_spin.value()),
                     "review_threshold": int(self.metadata_review_spin.value()),
                 }
+            if hasattr(self, "server_sync_policy_combo"):
+                selected_policy = self.server_sync_policy_combo.currentData()
+                self.server_sync_policy = str(selected_policy or "keep_extras").strip().lower()
 
             # Save password to secure storage (Windows Credential Manager, macOS Keychain, etc.)
             if username and password:
@@ -13233,6 +15745,9 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 "server_ip": self.server_ip_input.text(),
                 "server_port": self.server_port_input.text(),
                 "token": active_token,  # Save currently active token for true token-first auto-reconnect
+                "plex_server_profiles": self.plex_server_profiles if isinstance(self.plex_server_profiles, list) else [],
+                "server_sync_policy": self.server_sync_policy,
+                "server_sync_jobs": self.server_sync_jobs if isinstance(self.server_sync_jobs, list) else [],
                 "listenbrainz_token": self.listenbrainz_token_input.text().strip() if hasattr(self, "listenbrainz_token_input") else existing_config.get("listenbrainz_token", ""),
                 "listenbrainz_user": self.listenbrainz_user_input.text().strip() if hasattr(self, "listenbrainz_user_input") else existing_config.get("listenbrainz_user", ""),
                 "apple_music_xml_path": self.apple_music_xml_input.text().strip() if hasattr(self, "apple_music_xml_input") else existing_config.get("apple_music_xml_path", ""),
@@ -13293,6 +15808,18 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             if hasattr(self, 'duplicates_thread') and self.duplicates_thread.isRunning():
                 self.duplicates_thread.terminate()
                 self.duplicates_thread.wait(3000)
+
+            if self.source_playlist_load_thread and self.source_playlist_load_thread.isRunning():
+                self.source_playlist_load_thread.terminate()
+                self.source_playlist_load_thread.wait(2000)
+
+            if self.server_playlist_transfer_thread and self.server_playlist_transfer_thread.isRunning():
+                self.server_playlist_transfer_thread.terminate()
+                self.server_playlist_transfer_thread.wait(3000)
+
+            if self.server_sync_job_thread and self.server_sync_job_thread.isRunning():
+                self.server_sync_job_thread.terminate()
+                self.server_sync_job_thread.wait(3000)
             
             # Stop track count loading threads
             for thread in list(self.track_count_threads.values()):

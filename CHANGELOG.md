@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.20.0 - 2026-03-02
+### 🚀 Portable Backup + Editor Overhaul + UX Polish
+- Added **Portable Backup** as a dedicated Tools dialog to export playlists together with actual audio media files.
+- Added remote Plex media download fallback for portable backup when source file paths are not locally accessible.
+- Added portable backup options for scope selection, dedupe, manifest output, ZIP packaging, and M3U generation with portable relative paths.
+- Added asynchronous playlist loading inside the portable backup dialog to prevent UI freezes with large libraries.
+- Added scheduled **Plex Server Sync Jobs** improvements to run from saved source/target server profiles (not only current UI connection).
+- Fixed scheduled server job config normalization for target profile and target section metadata.
+- Fixed Spotify playlist cover import reliability:
+  - Normalized `spotify:image:` and related image URI formats to real CDN URLs.
+  - Added fallback cover resolution from Spotify metadata/OpenGraph when Web API image lookup fails.
+  - Hardened Plex poster upload fallback path.
+- Overhauled **Playlist Editor** with a modern split layout, improved loading state, and stronger visual consistency.
+- Added playlist cover preview/change workflow directly in Playlist Editor with external image upload and save-time cover apply.
+- Improved playlist editor loading UX with centered loading card, retry action, cleaner transitions, and hidden action bar until ready.
+- Themed playlist editor table corner/header visuals to remove mismatched gray corner block artifacts.
+- Applied row-level control alignment polish across Streaming Import, Sync Manager, Local Tracks, and Settings mapping controls for consistent button/field centering.
+
 ## v2.19.0 - 2026-03-02
 ### ✅ Matching Accuracy, Ordering, and ListenBrainz Reliability
 - Fixed smart matching filters not being applied in worker-thread matching paths (sync/import), which could previously prefer live/acoustic/compilation variants.

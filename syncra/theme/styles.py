@@ -136,6 +136,10 @@ QPushButton:hover, QComboBox:hover {{
 QPushButton:pressed, QComboBox:on {{
     background-color: {TOKENS['bg_1']};
 }}
+QPushButton#importBrowseButton, QPushButton#importPlaylistButton {{
+    margin-top: 0px;
+    margin-bottom: 0px;
+}}
 QLineEdit, QTextEdit, QPlainTextEdit, QDateTimeEdit, QSpinBox {{
     background-color: {TOKENS['bg_1']};
     border: 1px solid {TOKENS['border']};
