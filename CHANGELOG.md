@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.20.2 - 2026-03-09
+### 🎯 Smart Matching Reliability + UX
+- Reworked **smart M3U matching** for NAS, remote-server, and remapped-path libraries so imports no longer depend on exact case-sensitive path matches.
+- Added stronger path parsing and metadata extraction for path-only M3U files, including better handling for portable-backup paths, mixed separators, URL-encoded paths, and artist-prefixed album folders.
+- Fixed smart matching false metadata extraction from container folders like `Playlists` / `Rock Hits`, preventing those values from polluting artist/album scoring.
+- Improved ambiguous-match scoring so duplicate title/artist tracks prefer the correct album version more consistently.
+- Added session-level smart-match library indexing reuse so repeated imports against the same connected Plex library are significantly faster after the first run.
+- Replaced status-bar-only smart-match startup feedback with a dedicated **Smart Match Import** progress dialog.
+- Added **Cancel Import** support to the smart-match progress dialog with clean worker cancellation.
+- Fixed a Qt thread-affinity warning in batched playlist track-count loading by removing nested worker-thread parenting.
+
 ## v2.20.1 - 2026-03-03
 ### 🛠️ Portable Backup + Local Tracks Fixes
 - Added a new **Portable Backup** option to preserve Plex server folder hierarchy (relative to the library root), so exported media can keep paths like `Artist/Album/Track.ext`.
