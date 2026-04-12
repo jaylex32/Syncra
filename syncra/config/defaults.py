@@ -24,8 +24,13 @@ APP_CONFIG_DEFAULTS = {
         "ui_refresh_v2": False,
         "auto_fetch_playlists_on_startup": False,
     },
+    "smart_match": {
+        "persist_cache": True,
+        "preload_on_connect": True,
+        "cache_db": "smart_match_cache.sqlite",
+    },
     "metadata": {
-        "user_agent": "Syncra/2.20.1 (metadata-fixer; contact: github.com/jaylex32/syncra)",
+        "user_agent": "Syncra/2.20.3 (metadata-fixer; contact: github.com/jaylex32/syncra)",
         "rate_limit_rps": 1.0,
         "cache_ttl_hours": 168,
         "auto_apply_threshold": 95,

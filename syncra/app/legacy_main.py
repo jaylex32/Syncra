@@ -1,6 +1,7 @@
 import sys
 import json
 import os
+import html
 import base64
 import hashlib
 import hmac
@@ -14,9 +15,10 @@ import zipfile
 import platform
 import signal
 import socket
+import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.20.2"
+__version__ = "2.20.3"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -36,6 +38,7 @@ from PyQt6.QtSvgWidgets import QSvgWidget
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import math
 import random
 import webbrowser
 import urllib.parse
@@ -68,8 +71,140 @@ from syncra.ui.dialogs.metadata_fixer_dialog import MetadataFixerDialog
 CONFIG_FILE = "app_config.json"
 _SYNCRA_LIBRARY_MATCH_SESSION_CACHE = {}
 _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK = threading.Lock()
+_SYNCRA_LIBRARY_MATCH_BUILD_STATES = {}
+_SYNCRA_LIBRARY_MATCH_BUILD_STATES_LOCK = threading.Lock()
+_SYNCRA_SMART_MATCH_RUNTIME_SETTINGS = dict(APP_CONFIG_DEFAULTS.get("smart_match", {}))
+_SYNCRA_SMART_MATCH_CACHE_STORE = None
+_SYNCRA_SMART_MATCH_CACHE_STORE_LOCK = threading.Lock()
 
 patch_qt_legacy_apis()
+
+
+def get_syncra_logo_svg():
+    return """
+    <svg width="250" height="100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+            <linearGradient id="mainGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" style="stop-color:#00E676"/>
+                <stop offset="50%" style="stop-color:#00BCD4"/>
+                <stop offset="100%" style="stop-color:#2196F3"/>
+            </linearGradient>
+            <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" style="stop-color:#42A5F5"/>
+                <stop offset="100%" style="stop-color:#2196F3"/>
+            </linearGradient>
+        </defs>
+        <g transform="translate(10, 20)">
+            <circle cx="25" cy="30" r="25" fill="none" stroke="url(#mainGrad)" stroke-width="4"/>
+            <circle cx="25" cy="30" r="15" fill="none" stroke="url(#mainGrad)" stroke-width="2" opacity="0.7"/>
+            <circle cx="25" cy="30" r="5" fill="url(#mainGrad)"/>
+            <circle cx="45" cy="30" r="25" fill="none" stroke="url(#mainGrad)" stroke-width="4" opacity="0.8"/>
+            <circle cx="45" cy="30" r="15" fill="none" stroke="url(#mainGrad)" stroke-width="2" opacity="0.6"/>
+            <circle cx="45" cy="30" r="5" fill="url(#mainGrad)" opacity="0.8"/>
+            <text x="85" y="40" font-family="Inter, sans-serif" font-size="32" font-weight="800" fill="url(#textGrad)" letter-spacing="-1px">SYNCRA</text>
+        </g>
+    </svg>
+    """
+
+
+class StartupSplashScreen(QWidget):
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.SplashScreen)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setObjectName("startupSplash")
+        self.setFixedSize(520, 300)
+        self._build_ui()
+        self._center_on_primary_screen()
+
+    def _build_ui(self):
+        from PyQt6.QtCore import QByteArray
+
+        self.setStyleSheet("""
+            QWidget#startupSplash {
+                background-color: #0f1726;
+                border: 1px solid #243248;
+                border-radius: 18px;
+            }
+            QLabel#startupTitle {
+                color: #f4f7fb;
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel#startupSubtitle {
+                color: #9ab0cc;
+                font-size: 12px;
+            }
+            QLabel#startupStatus {
+                color: #dce7f5;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QProgressBar {
+                border: 1px solid #32455f;
+                border-radius: 8px;
+                background: #111a29;
+                color: #f4f7fb;
+                text-align: center;
+                height: 18px;
+            }
+            QProgressBar::chunk {
+                border-radius: 7px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00c7a4, stop:0.55 #20b8d9, stop:1 #2d8cff);
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(14)
+
+        logo_widget = QSvgWidget()
+        logo_widget.load(QByteArray(get_syncra_logo_svg().encode("utf-8")))
+        logo_widget.setFixedSize(258, 100)
+        layout.addWidget(logo_widget, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        self.title_label = QLabel("Starting Syncra")
+        self.title_label.setObjectName("startupTitle")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title_label)
+
+        subtitle = QLabel("Preparing playlists, services, and Smart Match cache")
+        subtitle.setObjectName("startupSubtitle")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+
+        layout.addStretch(1)
+
+        self.status_label = QLabel("Loading interface...")
+        self.status_label.setObjectName("startupStatus")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(5)
+        layout.addWidget(self.progress_bar)
+
+    def _center_on_primary_screen(self):
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        geometry = screen.availableGeometry()
+        self.move(
+            geometry.center().x() - self.width() // 2,
+            geometry.center().y() - self.height() // 2,
+        )
+
+    def update_progress(self, message, value=None):
+        self.status_label.setText(str(message or "").strip() or "Loading...")
+        if value is not None:
+            self.progress_bar.setValue(int(max(0, min(100, value))))
+        QApplication.processEvents()
+
+    def finish_for(self, window=None):
+        self.update_progress("Ready", 100)
+        QApplication.processEvents()
+        self.close()
 
 
 def _normalize_match_text(value):
@@ -181,39 +316,175 @@ def _is_compilation_like_album(value):
     return any(marker in normalized for marker in markers)
 
 
-def _get_all_library_tracks_cached(library_section):
-    cache_attr = "_syncra_all_tracks_cache"
-    if hasattr(library_section, cache_attr):
-        return getattr(library_section, cache_attr)
-    session_key = _get_library_match_session_key(library_section)
-    if session_key is not None:
-        with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
-            cached_payload = _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.get(session_key, {})
-            if "all_tracks" in cached_payload:
-                all_tracks = cached_payload["all_tracks"]
-                try:
-                    setattr(library_section, cache_attr, all_tracks)
-                except Exception:
-                    pass
-                return all_tracks
-    all_tracks = []
-    try:
-        all_tracks = list(library_section.searchTracks(limit=200000) or [])
-    except Exception:
-        all_tracks = []
-    if not all_tracks:
-        try:
-            all_tracks = list(library_section.all() or [])
-        except Exception:
-            all_tracks = []
-    try:
-        setattr(library_section, cache_attr, all_tracks)
-    except Exception:
-        pass
-    if session_key is not None:
-        with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
-            _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.setdefault(session_key, {})["all_tracks"] = all_tracks
-    return all_tracks
+def _set_smart_match_runtime_settings(settings):
+    global _SYNCRA_SMART_MATCH_RUNTIME_SETTINGS, _SYNCRA_SMART_MATCH_CACHE_STORE
+    merged = dict(APP_CONFIG_DEFAULTS.get("smart_match", {}))
+    if isinstance(settings, dict):
+        merged.update(settings)
+    _SYNCRA_SMART_MATCH_RUNTIME_SETTINGS = merged
+    with _SYNCRA_SMART_MATCH_CACHE_STORE_LOCK:
+        _SYNCRA_SMART_MATCH_CACHE_STORE = None
+
+
+def _get_smart_match_cache_db_path():
+    cache_name = str(_SYNCRA_SMART_MATCH_RUNTIME_SETTINGS.get("cache_db", "smart_match_cache.sqlite") or "smart_match_cache.sqlite").strip()
+    return os.path.abspath(cache_name)
+
+
+class SmartMatchCacheStore:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._ensure_schema()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _ensure_schema(self):
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smart_match_meta (
+                    session_key TEXT PRIMARY KEY,
+                    server_id TEXT,
+                    section_id TEXT,
+                    track_total INTEGER,
+                    newest_added_at TEXT,
+                    newest_updated_at TEXT,
+                    built_at TEXT,
+                    row_count INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smart_match_rows (
+                    session_key TEXT NOT NULL,
+                    rating_key TEXT NOT NULL,
+                    title TEXT,
+                    artist TEXT,
+                    album TEXT,
+                    title_variants_json TEXT,
+                    exact_paths_json TEXT,
+                    suffix3_json TEXT,
+                    suffix2_json TEXT,
+                    PRIMARY KEY (session_key, rating_key)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_smart_match_rows_session ON smart_match_rows(session_key)"
+            )
+
+    def get_meta(self, session_key):
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT session_key, server_id, section_id, track_total, newest_added_at,
+                       newest_updated_at, built_at, row_count
+                FROM smart_match_meta WHERE session_key = ?
+                """,
+                (session_key,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "session_key": row[0],
+            "server_id": row[1],
+            "section_id": row[2],
+            "track_total": int(row[3] or 0),
+            "newest_added_at": str(row[4] or ""),
+            "newest_updated_at": str(row[5] or ""),
+            "built_at": str(row[6] or ""),
+            "row_count": int(row[7] or 0),
+        }
+
+    def load_rows(self, session_key):
+        rows = []
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT rating_key, title, artist, album, title_variants_json,
+                       exact_paths_json, suffix3_json, suffix2_json
+                FROM smart_match_rows
+                WHERE session_key = ?
+                """,
+                (session_key,),
+            )
+            for row in cursor.fetchall():
+                rows.append({
+                    "rating_key": str(row[0] or ""),
+                    "title": str(row[1] or ""),
+                    "artist": str(row[2] or ""),
+                    "album": str(row[3] or ""),
+                    "title_variants": json.loads(row[4] or "[]"),
+                    "exact_paths": json.loads(row[5] or "[]"),
+                    "suffix3": json.loads(row[6] or "[]"),
+                    "suffix2": json.loads(row[7] or "[]"),
+                })
+        return rows
+
+    def save_rows(self, session_key, fingerprint, rows):
+        built_at = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM smart_match_rows WHERE session_key = ?", (session_key,))
+            conn.execute("DELETE FROM smart_match_meta WHERE session_key = ?", (session_key,))
+            conn.executemany(
+                """
+                INSERT INTO smart_match_rows (
+                    session_key, rating_key, title, artist, album, title_variants_json,
+                    exact_paths_json, suffix3_json, suffix2_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        session_key,
+                        str(row.get("rating_key", "") or ""),
+                        str(row.get("title", "") or ""),
+                        str(row.get("artist", "") or ""),
+                        str(row.get("album", "") or ""),
+                        json.dumps(list(row.get("title_variants", []) or [])),
+                        json.dumps(list(row.get("exact_paths", []) or [])),
+                        json.dumps(list(row.get("suffix3", []) or [])),
+                        json.dumps(list(row.get("suffix2", []) or [])),
+                    )
+                    for row in rows
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO smart_match_meta (
+                    session_key, server_id, section_id, track_total, newest_added_at,
+                    newest_updated_at, built_at, row_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_key,
+                    str(fingerprint.get("server_id", "") or ""),
+                    str(fingerprint.get("section_id", "") or ""),
+                    int(fingerprint.get("track_total", 0) or 0),
+                    str(fingerprint.get("newest_added_at", "") or ""),
+                    str(fingerprint.get("newest_updated_at", "") or ""),
+                    built_at,
+                    len(rows),
+                ),
+            )
+
+    def clear_library(self, session_key):
+        with self._connect() as conn:
+            conn.execute("DELETE FROM smart_match_rows WHERE session_key = ?", (session_key,))
+            conn.execute("DELETE FROM smart_match_meta WHERE session_key = ?", (session_key,))
+
+
+def _get_smart_match_cache_store():
+    global _SYNCRA_SMART_MATCH_CACHE_STORE
+    with _SYNCRA_SMART_MATCH_CACHE_STORE_LOCK:
+        db_path = _get_smart_match_cache_db_path()
+        if _SYNCRA_SMART_MATCH_CACHE_STORE is None or getattr(_SYNCRA_SMART_MATCH_CACHE_STORE, "db_path", None) != db_path:
+            _SYNCRA_SMART_MATCH_CACHE_STORE = SmartMatchCacheStore(db_path)
+        return _SYNCRA_SMART_MATCH_CACHE_STORE
 
 
 def _get_library_match_session_key(library_section):
@@ -236,71 +507,118 @@ def _get_library_match_session_key(library_section):
         return None
 
 
-def _build_library_match_indexes(library_section):
-    cache_attr = "_syncra_match_index_bundle"
-    if hasattr(library_section, cache_attr):
-        return getattr(library_section, cache_attr)
-    session_key = _get_library_match_session_key(library_section)
-    if session_key is not None:
-        with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
-            cached_payload = _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.get(session_key, {})
-            bundle = cached_payload.get("bundle")
-            if bundle:
-                try:
-                    setattr(library_section, cache_attr, bundle)
-                    setattr(library_section, "_syncra_title_index_cache", bundle["titles"])
-                    setattr(library_section, "_syncra_artist_index_cache", bundle["artists"])
-                    setattr(library_section, "_syncra_album_index_cache", bundle["albums"])
-                    setattr(library_section, "_syncra_path_index_cache", bundle["paths"])
-                    if "all_tracks" in cached_payload:
-                        setattr(library_section, "_syncra_all_tracks_cache", cached_payload["all_tracks"])
-                except Exception:
-                    pass
-                return bundle
+def _query_library_tracks_page(library_section, start=0, size=200, sort=None):
+    server = getattr(library_section, "_server", None)
+    section_id = (
+        str(getattr(library_section, "key", "") or "").strip()
+        or str(getattr(library_section, "ratingKey", "") or "").strip()
+    )
+    if not server or not section_id:
+        raise ValueError("Library section is missing server or section id")
+    params = {
+        "type": 10,
+        "X-Plex-Container-Start": max(0, int(start or 0)),
+        "X-Plex-Container-Size": max(1, int(size or 200)),
+        "includeElements": "Media,Part",
+        "includeFields": "ratingKey,title,originalTitle,grandparentTitle,parentTitle,duration,addedAt,updatedAt",
+    }
+    if sort:
+        params["sort"] = sort
+    query = f"/library/sections/{section_id}/all?{urllib.parse.urlencode(params)}"
+    return server.query(query)
 
+
+def _iter_track_elements(container):
+    if container is None:
+        return []
+    tracks = [elem for elem in list(container) if str(getattr(elem, "tag", "")).lower() == "track"]
+    if tracks:
+        return tracks
+    return list(container.findall(".//Track"))
+
+
+def _extract_index_row_from_track_element(track_elem):
+    rating_key = str(track_elem.attrib.get("ratingKey", "") or "").strip()
+    if not rating_key:
+        return None
+
+    title = str(track_elem.attrib.get("title", "") or "").strip()
+    artist = str(track_elem.attrib.get("originalTitle", "") or track_elem.attrib.get("grandparentTitle", "") or "").strip()
+    album = str(track_elem.attrib.get("parentTitle", "") or "").strip()
+    try:
+        duration_ms = int(track_elem.attrib.get("duration", 0) or 0)
+    except Exception:
+        duration_ms = 0
+
+    exact_paths = []
+    suffix3 = []
+    suffix2 = []
+    seen_paths = set()
+    for part in track_elem.findall(".//Part"):
+        file_path = str(part.attrib.get("file", "") or "").strip()
+        if not file_path:
+            continue
+        normalized = file_path.replace("\\", "/").lower()
+        if normalized in seen_paths:
+            continue
+        seen_paths.add(normalized)
+        exact_paths.append(normalized)
+        path_parts = [segment for segment in normalized.split("/") if segment]
+        if len(path_parts) >= 3:
+            suffix3_value = "/".join(path_parts[-3:])
+            if suffix3_value not in suffix3:
+                suffix3.append(suffix3_value)
+        if len(path_parts) >= 2:
+            suffix2_value = "/".join(path_parts[-2:])
+            if suffix2_value not in suffix2:
+                suffix2.append(suffix2_value)
+
+    return {
+        "rating_key": rating_key,
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "duration_ms": duration_ms,
+        "title_variants": _normalize_title_variants(title),
+        "exact_paths": exact_paths,
+        "suffix3": suffix3,
+        "suffix2": suffix2,
+    }
+
+
+def _build_bundle_from_rows(rows):
     title_index = {}
     artist_index = {}
     album_index = {}
     exact_map = {}
     suffix3_map = {}
     suffix2_map = {}
-    all_tracks = _get_all_library_tracks_cached(library_section)
+    rows_by_key = {}
 
-    for track in all_tracks:
-        try:
-            title = str(getattr(track, "title", "") or "").strip()
-            if title:
-                for variant in _normalize_title_variants(title):
-                    title_index.setdefault(variant, []).append(track)
-
-            artist = _normalize_match_text(_extract_plex_track_artist_name(track))
-            if artist:
-                artist_index.setdefault(artist, []).append(track)
-
-            album = _normalize_match_text(_extract_plex_track_album_name(track))
-            if album:
-                album_index.setdefault(album, []).append(track)
-
-            media_items = getattr(track, "media", None) or []
-            for media in media_items:
-                parts = getattr(media, "parts", None) or []
-                for part in parts:
-                    file_path = str(getattr(part, "file", "") or "").strip()
-                    if not file_path:
-                        continue
-                    normalized = file_path.replace("\\", "/").lower()
-                    path_parts = [segment for segment in normalized.split("/") if segment]
-                    exact_map.setdefault(normalized, []).append(track)
-                    if len(path_parts) >= 3:
-                        suffix3 = "/".join(path_parts[-3:])
-                        suffix3_map.setdefault(suffix3, []).append(track)
-                    if len(path_parts) >= 2:
-                        suffix2 = "/".join(path_parts[-2:])
-                        suffix2_map.setdefault(suffix2, []).append(track)
-        except Exception:
+    for row in rows or []:
+        rating_key = str(row.get("rating_key", "") or "").strip()
+        if not rating_key:
             continue
+        rows_by_key[rating_key] = row
+        for variant in row.get("title_variants", []) or []:
+            if variant:
+                title_index.setdefault(variant, []).append(row)
+        artist = _normalize_match_text(row.get("artist", ""))
+        if artist:
+            artist_index.setdefault(artist, []).append(row)
+        album = _normalize_match_text(row.get("album", ""))
+        if album:
+            album_index.setdefault(album, []).append(row)
+        for value in row.get("exact_paths", []) or []:
+            exact_map.setdefault(value, []).append(row)
+        for value in row.get("suffix3", []) or []:
+            suffix3_map.setdefault(value, []).append(row)
+        for value in row.get("suffix2", []) or []:
+            suffix2_map.setdefault(value, []).append(row)
 
-    bundle = {
+    return {
+        "rows": list(rows_by_key.values()),
+        "rows_by_key": rows_by_key,
         "titles": title_index,
         "artists": artist_index,
         "albums": album_index,
@@ -310,20 +628,222 @@ def _build_library_match_indexes(library_section):
             "suffix2": suffix2_map,
         },
     }
+
+
+def _store_library_match_bundle(library_section, bundle, fingerprint=None):
+    cache_attr = "_syncra_match_index_bundle"
+    session_key = _get_library_match_session_key(library_section)
     try:
         setattr(library_section, cache_attr, bundle)
-        setattr(library_section, "_syncra_title_index_cache", title_index)
-        setattr(library_section, "_syncra_artist_index_cache", artist_index)
-        setattr(library_section, "_syncra_album_index_cache", album_index)
+        setattr(library_section, "_syncra_match_rows_cache", bundle["rows"])
+        setattr(library_section, "_syncra_match_rows_by_key_cache", bundle["rows_by_key"])
+        setattr(library_section, "_syncra_title_index_cache", bundle["titles"])
+        setattr(library_section, "_syncra_artist_index_cache", bundle["artists"])
+        setattr(library_section, "_syncra_album_index_cache", bundle["albums"])
         setattr(library_section, "_syncra_path_index_cache", bundle["paths"])
     except Exception:
         pass
     if session_key is not None:
         with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
             payload = _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.setdefault(session_key, {})
-            payload["all_tracks"] = all_tracks
             payload["bundle"] = bundle
+            if fingerprint is not None:
+                payload["fingerprint"] = dict(fingerprint)
     return bundle
+
+
+def _restore_library_match_bundle(library_section):
+    cache_attr = "_syncra_match_index_bundle"
+    if hasattr(library_section, cache_attr):
+        return getattr(library_section, cache_attr)
+    session_key = _get_library_match_session_key(library_section)
+    if not session_key:
+        return None
+    with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
+        payload = _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.get(session_key, {})
+        bundle = payload.get("bundle")
+        fingerprint = payload.get("fingerprint")
+    if bundle:
+        return _store_library_match_bundle(library_section, bundle, fingerprint=fingerprint)
+    return None
+
+
+def _get_cached_library_fingerprint(library_section):
+    session_key = _get_library_match_session_key(library_section)
+    if not session_key:
+        return None
+    with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
+        payload = _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.get(session_key, {})
+        fingerprint = payload.get("fingerprint")
+        if fingerprint:
+            return dict(fingerprint)
+    return None
+
+
+def _probe_library_match_fingerprint(library_section):
+    session_key = _get_library_match_session_key(library_section)
+    server = getattr(library_section, "_server", None)
+    server_id = str(getattr(server, "machineIdentifier", "") or "").strip()
+    section_id = str(getattr(library_section, "key", "") or "").strip()
+    total_tracks = 0
+    newest_added_at = ""
+    newest_updated_at = ""
+
+    try:
+        latest_updated = _query_library_tracks_page(library_section, start=0, size=1, sort="updatedAt:desc")
+        total_tracks = int(latest_updated.attrib.get("totalSize") or latest_updated.attrib.get("size") or 0)
+        updated_items = _iter_track_elements(latest_updated)
+        if updated_items:
+            newest_updated_at = str(updated_items[0].attrib.get("updatedAt", "") or "").strip()
+            newest_added_at = str(updated_items[0].attrib.get("addedAt", "") or "").strip()
+    except Exception:
+        pass
+
+    if total_tracks > 0 and not newest_added_at:
+        try:
+            latest_added = _query_library_tracks_page(library_section, start=0, size=1, sort="addedAt:desc")
+            added_items = _iter_track_elements(latest_added)
+            if added_items:
+                newest_added_at = str(added_items[0].attrib.get("addedAt", "") or "").strip()
+        except Exception:
+            pass
+
+    fingerprint = {
+        "session_key": session_key,
+        "server_id": server_id,
+        "section_id": section_id,
+        "track_total": int(total_tracks or 0),
+        "newest_added_at": newest_added_at,
+        "newest_updated_at": newest_updated_at,
+    }
+    if not total_tracks and not newest_added_at and not newest_updated_at:
+        cached = _get_cached_library_fingerprint(library_section)
+        if cached:
+            return cached
+    if session_key:
+        with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
+            payload = _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.setdefault(session_key, {})
+            payload["fingerprint"] = dict(fingerprint)
+    return fingerprint
+
+
+def _library_fingerprint_matches(meta, fingerprint):
+    if not meta or not fingerprint:
+        return False
+    return (
+        str(meta.get("session_key", "") or "") == str(fingerprint.get("session_key", "") or "")
+        and int(meta.get("track_total", 0) or 0) == int(fingerprint.get("track_total", 0) or 0)
+        and str(meta.get("newest_added_at", "") or "") == str(fingerprint.get("newest_added_at", "") or "")
+        and str(meta.get("newest_updated_at", "") or "") == str(fingerprint.get("newest_updated_at", "") or "")
+    )
+
+
+def _build_library_match_indexes(library_section, progress_cb=None, force_rebuild=False, stop_check=None, progress_range=(0, 100)):
+    session_key = _get_library_match_session_key(library_section)
+    if not session_key:
+        raise ValueError("Smart Match cache requires a valid server and library section")
+
+    def report(message, percentage):
+        clamped = max(progress_range[0], min(progress_range[1], int(percentage)))
+        if progress_cb:
+            progress_cb(message, clamped)
+
+    if stop_check and stop_check():
+        raise RuntimeError("Smart matching canceled.")
+
+    existing_bundle = _restore_library_match_bundle(library_section)
+    previous_fingerprint = _get_cached_library_fingerprint(library_section)
+
+    report("Checking Smart Match Cache...", progress_range[0])
+    fingerprint = _probe_library_match_fingerprint(library_section)
+    if existing_bundle and not force_rebuild and previous_fingerprint and _library_fingerprint_matches(previous_fingerprint, fingerprint):
+        return existing_bundle
+    if existing_bundle and not force_rebuild:
+        _clear_library_match_caches(library_section=library_section, session_key=session_key, clear_disk=False)
+
+    persist_cache = bool(_SYNCRA_SMART_MATCH_RUNTIME_SETTINGS.get("persist_cache", True))
+    if persist_cache and not force_rebuild:
+        try:
+            store = _get_smart_match_cache_store()
+            meta = store.get_meta(session_key)
+            if _library_fingerprint_matches(meta, fingerprint):
+                report("Loading Smart Match Cache...", progress_range[0] + 2)
+                rows = store.load_rows(session_key)
+                if rows:
+                    bundle = _build_bundle_from_rows(rows)
+                    return _store_library_match_bundle(library_section, bundle, fingerprint=fingerprint)
+        except Exception as cache_error:
+            logging.warning(f"Could not load Smart Match cache: {cache_error}")
+
+    with _SYNCRA_LIBRARY_MATCH_BUILD_STATES_LOCK:
+        active_state = _SYNCRA_LIBRARY_MATCH_BUILD_STATES.get(session_key)
+        if active_state:
+            wait_event = active_state["event"]
+        else:
+            wait_event = None
+            active_state = {
+                "event": threading.Event(),
+                "message": "Checking Smart Match Cache...",
+                "progress": progress_range[0],
+                "error": None,
+            }
+            _SYNCRA_LIBRARY_MATCH_BUILD_STATES[session_key] = active_state
+
+    if wait_event is not None:
+        while not wait_event.wait(0.2):
+            if stop_check and stop_check():
+                raise RuntimeError("Smart matching canceled.")
+            report(active_state.get("message", "Waiting for Smart Match cache..."), active_state.get("progress", progress_range[0]))
+        if active_state.get("error"):
+            raise RuntimeError(active_state["error"])
+        bundle = _restore_library_match_bundle(library_section)
+        if bundle:
+            return bundle
+        raise RuntimeError("Smart Match cache build completed without a usable result.")
+
+    try:
+        page_size = 250
+        total_tracks = int(fingerprint.get("track_total", 0) or 0)
+        processed = 0
+        rows = []
+
+        while True:
+            if stop_check and stop_check():
+                raise RuntimeError("Smart matching canceled.")
+            container = _query_library_tracks_page(library_section, start=processed, size=page_size)
+            track_elements = _iter_track_elements(container)
+            if not track_elements:
+                break
+            for track_elem in track_elements:
+                row = _extract_index_row_from_track_element(track_elem)
+                if row:
+                    rows.append(row)
+            processed += len(track_elements)
+            pct = progress_range[0] + int((processed / max(total_tracks or processed, 1)) * max(progress_range[1] - progress_range[0], 1))
+            message = f"Building Smart Match Index ({processed:,} / {max(total_tracks, processed):,})"
+            active_state["message"] = message
+            active_state["progress"] = pct
+            report(message, pct)
+            if len(track_elements) < page_size:
+                break
+
+        bundle = _build_bundle_from_rows(rows)
+        _store_library_match_bundle(library_section, bundle, fingerprint=fingerprint)
+        if persist_cache:
+            try:
+                _get_smart_match_cache_store().save_rows(session_key, fingerprint, rows)
+            except Exception as cache_error:
+                logging.warning(f"Could not persist Smart Match cache: {cache_error}")
+        active_state["message"] = f"Smart Match index ready ({len(rows):,} tracks)"
+        active_state["progress"] = progress_range[1]
+        return bundle
+    except Exception as exc:
+        active_state["error"] = str(exc)
+        raise
+    finally:
+        active_state["event"].set()
+        with _SYNCRA_LIBRARY_MATCH_BUILD_STATES_LOCK:
+            _SYNCRA_LIBRARY_MATCH_BUILD_STATES.pop(session_key, None)
 
 
 def _get_library_title_index_cached(library_section):
@@ -354,9 +874,76 @@ def _get_library_path_index_cached(library_section):
     return _build_library_match_indexes(library_section)["paths"]
 
 
-def _prime_library_match_caches(library_section):
+def _get_library_match_rows_cached(library_section):
+    cache_attr = "_syncra_match_rows_cache"
+    if hasattr(library_section, cache_attr):
+        return getattr(library_section, cache_attr)
+    return _build_library_match_indexes(library_section)["rows"]
+
+
+def _get_library_match_rows_by_key_cached(library_section):
+    cache_attr = "_syncra_match_rows_by_key_cache"
+    if hasattr(library_section, cache_attr):
+        return getattr(library_section, cache_attr)
+    return _build_library_match_indexes(library_section)["rows_by_key"]
+
+
+def _prime_library_match_caches(library_section, progress_cb=None, force_rebuild=False, stop_check=None, progress_range=(0, 100)):
     """Warm all match caches once so the first lookup does not stall the worker."""
-    _build_library_match_indexes(library_section)
+    return _build_library_match_indexes(
+        library_section,
+        progress_cb=progress_cb,
+        force_rebuild=force_rebuild,
+        stop_check=stop_check,
+        progress_range=progress_range,
+    )
+
+
+def _clear_library_match_caches(library_section=None, session_key=None, clear_disk=False):
+    target_session_key = session_key or _get_library_match_session_key(library_section) if library_section is not None else session_key
+    if target_session_key:
+        with _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK:
+            _SYNCRA_LIBRARY_MATCH_SESSION_CACHE.pop(target_session_key, None)
+    if library_section is not None:
+        for attr in (
+            "_syncra_match_index_bundle",
+            "_syncra_match_rows_cache",
+            "_syncra_match_rows_by_key_cache",
+            "_syncra_title_index_cache",
+            "_syncra_artist_index_cache",
+            "_syncra_album_index_cache",
+            "_syncra_path_index_cache",
+        ):
+            if hasattr(library_section, attr):
+                try:
+                    delattr(library_section, attr)
+                except Exception:
+                    pass
+    if clear_disk and target_session_key:
+        try:
+            _get_smart_match_cache_store().clear_library(target_session_key)
+        except Exception as cache_error:
+            logging.warning(f"Could not clear Smart Match cache on disk: {cache_error}")
+
+
+def _format_track_duration_ms(duration_ms):
+    try:
+        value = int(duration_ms or 0)
+    except Exception:
+        value = 0
+    if value <= 0:
+        return "Unknown"
+    return f"{value // 60000}:{(value % 60000) // 1000:02d}"
+
+
+def _build_playlist_editor_row(track):
+    return {
+        "track": track,
+        "title": str(getattr(track, "title", "") or "").strip() or "Unknown",
+        "artist": _extract_plex_track_artist_name(track) or "Unknown",
+        "album": _extract_plex_track_album_name(track) or "Unknown",
+        "duration": _format_track_duration_ms(getattr(track, "duration", None)),
+    }
 
 
 def _strip_leading_track_tokens(value):
@@ -446,13 +1033,19 @@ def _apply_smart_filter_penalty(score, album_title, parent_widget):
         return score
 
 
-def _score_plex_track_candidate(source_track, plex_track, parent_widget=None):
+def _score_candidate_values(source_track, target_title, target_artist, target_album, target_mbid="", parent_widget=None):
     src_title = str(source_track.get("title", "") or "").strip()
     src_artist = str(source_track.get("artist", "") or "").strip()
+    src_artists = [str(value or "").strip() for value in (source_track.get("artists") or []) if str(value or "").strip()]
     src_album = str(source_track.get("album", "") or "").strip()
     src_mbid = str(source_track.get("recording_mbid", "") or "").strip().lower()
+    src_isrc = str(source_track.get("isrc", "") or "").strip().upper()
+    try:
+        src_duration_ms = int(source_track.get("duration_ms", 0) or 0)
+    except Exception:
+        src_duration_ms = 0
 
-    target_title = str(getattr(plex_track, "title", "") or "").strip()
+    target_title = str(target_title or "").strip()
     if not src_title or not target_title:
         return None
 
@@ -475,12 +1068,36 @@ def _score_plex_track_candidate(source_track, plex_track, parent_widget=None):
     if title_score < 45:
         return None
 
-    target_artist = _extract_plex_track_artist_name(plex_track)
-    target_album = _extract_plex_track_album_name(plex_track)
+    target_artist = str(target_artist or "").strip()
+    target_album = str(target_album or "").strip()
+    try:
+        target_duration_ms = int(source_track.get("_target_duration_ms", 0) or 0)
+    except Exception:
+        target_duration_ms = 0
+    target_isrc = str(source_track.get("_target_isrc", "") or "").strip().upper()
 
     norm_src_artist = "" if _is_generic_artist_name(src_artist) else _normalize_match_text(src_artist)
     norm_target_artist = _normalize_match_text(target_artist)
-    artist_score = float(fuzz.token_set_ratio(norm_src_artist, norm_target_artist)) if (norm_src_artist and norm_target_artist) else 0.0
+    artist_candidates = []
+    if norm_src_artist:
+        artist_candidates.append(norm_src_artist)
+    for candidate in src_artists:
+        norm_candidate = _normalize_match_text(candidate)
+        if norm_candidate and norm_candidate not in artist_candidates and not _is_generic_artist_name(candidate):
+            artist_candidates.append(norm_candidate)
+    if len(src_artists) > 1:
+        joined_artists = _normalize_match_text(", ".join(src_artists))
+        if joined_artists and joined_artists not in artist_candidates:
+            artist_candidates.append(joined_artists)
+
+    artist_score = 0.0
+    if norm_target_artist and artist_candidates:
+        for candidate in artist_candidates:
+            artist_score = max(
+                artist_score,
+                float(fuzz.token_set_ratio(candidate, norm_target_artist)),
+                float(fuzz.token_sort_ratio(candidate, norm_target_artist)),
+            )
 
     norm_src_album = _normalize_match_text(src_album)
     norm_src_album_core = norm_src_album
@@ -509,6 +1126,32 @@ def _score_plex_track_candidate(source_track, plex_track, parent_widget=None):
         combined_score = (title_score * 0.68) + (artist_score * 0.32)
     else:
         combined_score = title_score
+
+    duration_score = 0.0
+    duration_delta_ms = 0
+    if src_duration_ms > 0 and target_duration_ms > 0:
+        duration_delta_ms = abs(src_duration_ms - target_duration_ms)
+        duration_delta_sec = duration_delta_ms / 1000.0
+        if duration_delta_sec <= 1.5:
+            duration_score = 100.0
+            combined_score += 8
+        elif duration_delta_sec <= 3.0:
+            duration_score = 96.0
+            combined_score += 6
+        elif duration_delta_sec <= 6.0:
+            duration_score = 90.0
+            combined_score += 4
+        elif duration_delta_sec <= 10.0:
+            duration_score = 82.0
+            combined_score += 2
+        elif duration_delta_sec >= 45.0:
+            duration_score = 0.0
+            combined_score -= 18
+        elif duration_delta_sec >= 20.0:
+            duration_score = max(0.0, 100.0 - duration_delta_sec)
+            combined_score -= 8
+        else:
+            duration_score = max(0.0, 100.0 - duration_delta_sec)
 
     if norm_src_artist and artist_score < 35:
         # Some path-only M3Us synthesize "Artist - Compilation Album" folder names where
@@ -550,19 +1193,57 @@ def _score_plex_track_candidate(source_track, plex_track, parent_widget=None):
     combined_score = _apply_smart_filter_penalty(combined_score, target_album, parent_widget)
 
     if src_mbid:
-        target_mbid = _extract_recording_mbid_from_plex_track_for_matching(plex_track)
+        target_mbid = str(target_mbid or "").strip().lower()
         if target_mbid and target_mbid == src_mbid:
             combined_score = 100.0
 
+    if src_isrc and target_isrc and src_isrc == target_isrc:
+        combined_score = 100.0
+
     return {
-        "track": plex_track,
         "score": combined_score,
         "title_score": title_score,
         "artist_score": artist_score,
         "album_score": album_score,
+        "duration_score": duration_score,
+        "duration_delta_ms": duration_delta_ms,
         "artist": target_artist,
         "album": target_album,
+        "title": target_title,
     }
+
+
+def _score_plex_track_candidate(source_track, plex_track, parent_widget=None):
+    track_source = dict(source_track or {})
+    track_source["_target_duration_ms"] = int(getattr(plex_track, "duration", 0) or 0)
+    scored = _score_candidate_values(
+        track_source,
+        getattr(plex_track, "title", ""),
+        _extract_plex_track_artist_name(plex_track),
+        _extract_plex_track_album_name(plex_track),
+        _extract_recording_mbid_from_plex_track_for_matching(plex_track),
+        parent_widget=parent_widget,
+    )
+    if scored:
+        scored["track"] = plex_track
+        scored["rating_key"] = str(getattr(plex_track, "ratingKey", "") or "")
+    return scored
+
+
+def _score_indexed_track_candidate(source_track, candidate_row, parent_widget=None):
+    track_source = dict(source_track or {})
+    track_source["_target_duration_ms"] = int(candidate_row.get("duration_ms", 0) or 0)
+    scored = _score_candidate_values(
+        track_source,
+        candidate_row.get("title", ""),
+        candidate_row.get("artist", ""),
+        candidate_row.get("album", ""),
+        "",
+        parent_widget=parent_widget,
+    )
+    if scored:
+        scored["rating_key"] = str(candidate_row.get("rating_key", "") or "")
+    return scored
 
 
 def _collect_plex_track_candidates(library_section, title, artist="", album=""):
@@ -570,13 +1251,13 @@ def _collect_plex_track_candidates(library_section, title, artist="", album=""):
     seen = set()
 
     def add_results(results):
-        for track in results or []:
-            rating_key = str(getattr(track, "ratingKey", "") or "")
+        for row in results or []:
+            rating_key = str(row.get("rating_key", "") or "")
             if rating_key and rating_key in seen:
                 continue
             if rating_key:
                 seen.add(rating_key)
-            candidates.append(track)
+            candidates.append(row)
 
     title_index = _get_library_title_index_cached(library_section)
     for variant in _normalize_title_variants(title):
@@ -604,10 +1285,10 @@ def _rank_plex_track_matches(library_section, source_track, parent_widget=None):
     seen = set()
     initial_candidates = _collect_plex_track_candidates(library_section, title, artist, album)
     for candidate in initial_candidates:
-        scored = _score_plex_track_candidate(source_track, candidate, parent_widget)
+        scored = _score_indexed_track_candidate(source_track, candidate, parent_widget)
         if not scored:
             continue
-        rating_key = str(getattr(candidate, "ratingKey", "") or "")
+        rating_key = str(candidate.get("rating_key", "") or "")
         if rating_key:
             seen.add(rating_key)
         ranked.append(scored)
@@ -617,11 +1298,11 @@ def _rank_plex_track_matches(library_section, source_track, parent_widget=None):
     # cached full-library pass and let the scorer decide.
     needs_full_scan = not ranked and not initial_candidates
     if needs_full_scan:
-        for candidate in _get_all_library_tracks_cached(library_section):
-            rating_key = str(getattr(candidate, "ratingKey", "") or "")
+        for candidate in _get_library_match_rows_cached(library_section):
+            rating_key = str(candidate.get("rating_key", "") or "")
             if rating_key and rating_key in seen:
                 continue
-            scored = _score_plex_track_candidate(source_track, candidate, parent_widget)
+            scored = _score_indexed_track_candidate(source_track, candidate, parent_widget)
             if not scored:
                 continue
             if rating_key:
@@ -630,6 +1311,55 @@ def _rank_plex_track_matches(library_section, source_track, parent_widget=None):
 
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
+
+
+def _get_plex_track_by_rating_key(library_section, rating_key):
+    cache = getattr(library_section, "_syncra_plex_track_object_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            setattr(library_section, "_syncra_plex_track_object_cache", cache)
+        except Exception:
+            pass
+    key = str(rating_key or "").strip()
+    if not key:
+        return None
+    if key in cache:
+        return cache[key]
+    try:
+        track = library_section._server.fetchItem(int(key))
+    except Exception:
+        try:
+            track = library_section._server.fetchItem(key)
+        except Exception:
+            track = None
+    if track is not None:
+        cache[key] = track
+    return track
+
+
+def _hydrate_ranked_match_track(library_section, scored_match):
+    if not scored_match:
+        return None
+    track = scored_match.get("track")
+    if track is not None:
+        return track
+    rating_key = str(scored_match.get("rating_key", "") or "")
+    return _get_plex_track_by_rating_key(library_section, rating_key)
+
+
+def _hydrate_plex_tracks_by_rating_keys(library_section, rating_keys):
+    hydrated = []
+    seen = set()
+    for rating_key in rating_keys or []:
+        key = str(rating_key or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        track = _get_plex_track_by_rating_key(library_section, key)
+        if track is not None:
+            hydrated.append(track)
+    return hydrated
 
 
 def _parse_display_track_text(display_text, folder_artist="", prefer_artist_first=False):
@@ -1301,33 +2031,36 @@ class LoadPlaylistTracksThread(QThread):
     def __init__(self, playlist, parent=None):
         super().__init__(parent)
         self.playlist = playlist
+        self.stop_requested = False
 
     def run(self):
         try:
             # Emit initial progress
             self.progress_update.emit(0, 0)
-            
-            # Load tracks with progress tracking
+
+            # Fetch playlist items off the UI thread. We cannot get true incremental
+            # progress from Plex here, so do not add a fake per-track loop that slows
+            # the dialog down.
             tracks = list(self.playlist.items())
+            if self.stop_requested:
+                return
             total_tracks = len(tracks)
-            
-            # Emit progress updates
-            for i, track in enumerate(tracks):
-                if i % 10 == 0:  # Update every 10 tracks
-                    self.progress_update.emit(i, total_tracks)
-                # Small delay to make progress visible and keep UI responsive
-                if i % 50 == 0:
-                    self.msleep(10)
-            
-            # Final progress update
-            self.progress_update.emit(total_tracks, total_tracks)
-            
-            # Emit the complete tracks list
-            self.tracks_loaded.emit(tracks)
-            
+            row_payloads = []
+            for index, track in enumerate(tracks, start=1):
+                if self.stop_requested:
+                    return
+                row_payloads.append(_build_playlist_editor_row(track))
+                if index == 1 or index % 25 == 0 or index == total_tracks:
+                    self.progress_update.emit(index, total_tracks)
+
+            self.tracks_loaded.emit(row_payloads)
+
         except Exception as e:
             logging.error(f"Error loading tracks: {str(e)}")
             self.error.emit(str(e))
+
+    def stop(self):
+        self.stop_requested = True
 
 class BackupThread(QThread):
     progress_update = pyqtSignal(str, int)  # message, percentage
@@ -2675,13 +3408,22 @@ class PlaylistTrackTable(QTableWidget):
             event.ignore()
             return
 
-        drop_row = self.rowAt(event.pos().y())
+        drop_point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        drop_row = self.rowAt(drop_point.y())
         if drop_row == -1:
             drop_row = self.rowCount() - 1
         drop_row = max(0, min(drop_row, self.rowCount() - 1))
 
         row_data = self._drag_row_items
         from_row = self._drag_row
+
+        if drop_row == from_row:
+            event.accept()
+            self.selectRow(drop_row)
+            self._drag_row = -1
+            self._drag_track_id = None
+            self._drag_row_items = []
+            return
 
         self.removeRow(from_row)
         if drop_row > from_row:
@@ -3234,11 +3976,21 @@ class PlaylistEditorDialog(QDialog):
         self.plex_server = plex_server
         self.tracks_loaded = False
         self.tracks = []
+        self.track_rows = []
         self.track_lookup = {}  # Maps identifiers to Plex track objects
+        self.original_track_order = {}
+        self.original_track_ids = []
         self.load_tracks_thread = None
         self.cover_load_thread = None
         self.pending_cover_path = ""
         self.current_cover_url = ""
+        self.current_cover_is_custom = False
+        self.highlight_duplicates_enabled = False
+        self._allow_close_without_prompt = False
+        self._pending_render_tracks = []
+        self._render_cursor = 0
+        self._render_batch_size = 60
+        self._loading_started = False
         self.setWindowTitle(f"Edit Playlist: {playlist.title}")
         self.setObjectName("playlistEditorDialog")
         self.setModal(True)
@@ -3249,9 +4001,12 @@ class PlaylistEditorDialog(QDialog):
         # Setup UI immediately (non-blocking)
         self.setup_ui()
         self.load_cover_preview()
-        
-        # Start loading tracks immediately but asynchronously
-        self.start_background_loading()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._loading_started:
+            self._loading_started = True
+            QTimer.singleShot(0, self.start_background_loading)
 
     def _dialog_stylesheet(self):
         return """
@@ -3423,9 +4178,9 @@ class PlaylistEditorDialog(QDialog):
 
         # Playlist info header
         info_layout = QHBoxLayout()
-        title_label = QLabel(f"Editing Playlist: {self.playlist.title}")
-        title_label.setObjectName("editorTitleLabel")
-        info_layout.addWidget(title_label)
+        self.editor_title_label = QLabel(f"Editing Playlist: {self.playlist.title}")
+        self.editor_title_label.setObjectName("editorTitleLabel")
+        info_layout.addWidget(self.editor_title_label)
 
         self.track_count_label = QLabel("Tracks: Loading...")
         self.track_count_label.setObjectName("editorTrackCount")
@@ -3603,6 +4358,19 @@ class PlaylistEditorDialog(QDialog):
         self.move_down_button.setEnabled(False)
         button_layout.addWidget(self.move_down_button)
 
+        self.sort_button = QPushButton("Sort...")
+        self.sort_button.setObjectName("editorBtnNeutral")
+        self.sort_button.clicked.connect(self.show_sort_menu)
+        self.sort_button.setEnabled(False)
+        button_layout.addWidget(self.sort_button)
+
+        self.highlight_duplicates_button = QPushButton("Highlight Duplicates")
+        self.highlight_duplicates_button.setObjectName("editorBtnNeutral")
+        self.highlight_duplicates_button.setCheckable(True)
+        self.highlight_duplicates_button.toggled.connect(self.toggle_duplicate_highlighting)
+        self.highlight_duplicates_button.setEnabled(False)
+        button_layout.addWidget(self.highlight_duplicates_button)
+
         button_layout.addStretch()
 
         self.save_button = QPushButton("Save Changes")
@@ -3667,8 +4435,49 @@ class PlaylistEditorDialog(QDialog):
         return True
 
     def _playlist_cover_url(self):
+        self.current_cover_is_custom = False
+        try:
+            posters = self.plex_server.query(f"/library/metadata/{self.playlist.ratingKey}/posters")
+            selected_default = ""
+            fallback_custom = ""
+            for poster in posters:
+                try:
+                    poster_key = str(poster.attrib.get("key", "") or "").strip()
+                    poster_thumb = str(poster.attrib.get("thumb", "") or "").strip()
+                    poster_rating_key = str(poster.attrib.get("ratingKey", "") or "").strip()
+                    is_selected = str(poster.attrib.get("selected", "0") or "0") == "1"
+                    is_default = poster_rating_key == "default://"
+                    candidate = poster_thumb or poster_key
+                    if not candidate:
+                        continue
+                    if is_selected and not is_default:
+                        self.current_cover_is_custom = True
+                        if candidate.startswith("http://") or candidate.startswith("https://"):
+                            return candidate
+                        if candidate.startswith("/"):
+                            return self.plex_server.url(candidate, includeToken=True)
+                    if not is_default and not fallback_custom:
+                        fallback_custom = candidate
+                    elif is_default and is_selected and not selected_default:
+                        selected_default = candidate
+                except Exception:
+                    continue
+
+            for candidate in (fallback_custom, selected_default):
+                clean = str(candidate or "").strip()
+                if not clean:
+                    continue
+                if clean.startswith("http://") or clean.startswith("https://"):
+                    self.current_cover_is_custom = clean == fallback_custom and bool(fallback_custom)
+                    return clean
+                if clean.startswith("/"):
+                    self.current_cover_is_custom = clean == fallback_custom and bool(fallback_custom)
+                    return self.plex_server.url(clean, includeToken=True)
+        except Exception:
+            pass
+
         candidates = []
-        for attr in ("thumb", "composite", "art"):
+        for attr in ("composite", "art", "thumb"):
             try:
                 value = getattr(self.playlist, attr, None)
                 if value:
@@ -3716,7 +4525,7 @@ class PlaylistEditorDialog(QDialog):
         if self.pending_cover_path:
             return
         if self._set_cover_from_bytes(image_bytes):
-            self.cover_status_label.setText("Using current Plex cover.")
+            self.cover_status_label.setText("Using custom Plex cover." if self.current_cover_is_custom else "Using current Plex cover.")
         else:
             self.cover_status_label.setText("Unable to render current cover.")
 
@@ -3740,6 +4549,7 @@ class PlaylistEditorDialog(QDialog):
             self.pending_cover_path = path
             self.cover_status_label.setText(f"Pending cover change: {os.path.basename(path)}")
             self.clear_cover_btn.setEnabled(True)
+            self._update_dirty_state()
         else:
             QMessageBox.warning(self, "Invalid Image", "The selected file could not be loaded as an image.")
 
@@ -3751,21 +4561,124 @@ class PlaylistEditorDialog(QDialog):
         else:
             self._set_cover_placeholder("No cover")
             self.cover_status_label.setText("Using current Plex cover.")
+        self._update_dirty_state()
 
     def _resolve_track(self, track_id):
         """Return the registered track object for a given identifier."""
         return self.track_lookup.get(track_id)
 
-    def _render_tracks(self, tracks):
+    def _current_track_ids(self):
+        track_ids = []
+        for row in range(self.tracks_table.rowCount()):
+            item = self.tracks_table.item(row, 0)
+            if not item:
+                continue
+            track_id = item.data(Qt.UserRole)
+            if track_id is not None:
+                track_ids.append(track_id)
+        return track_ids
+
+    def _has_unsaved_changes(self):
+        if not self.tracks_loaded:
+            return bool(self.pending_cover_path)
+        if self.pending_cover_path:
+            return True
+        return self._current_track_ids() != self.original_track_ids
+
+    def _update_dirty_state(self):
+        is_dirty = self._has_unsaved_changes()
+        title_suffix = " • Modified" if is_dirty else ""
+        self.editor_title_label.setText(f"Editing Playlist: {self.playlist.title}{title_suffix}")
+        if self.tracks_loaded:
+            self.setWindowTitle(
+                f"Editing: {self.playlist.title} ({len(self.tracks)} tracks){title_suffix}"
+            )
+            self.save_button.setEnabled(is_dirty)
+        return is_dirty
+
+    def _mark_saved_state(self):
+        self.original_track_ids = self._current_track_ids()
+        self.original_track_order = {
+            track_id: index for index, track_id in enumerate(self.original_track_ids)
+        }
+        self.pending_cover_path = ""
+        self.clear_cover_btn.setEnabled(False)
+        self._update_dirty_state()
+
+    def _row_duplicate_signature(self, row_data):
+        return (
+            _normalize_match_text(row_data.get("title", "")),
+            _normalize_match_text(row_data.get("artist", "")),
+            _normalize_match_text(row_data.get("album", "")),
+        )
+
+    def _snapshot_row_signature(self, row):
+        title_item = self.tracks_table.item(row, 0)
+        artist_item = self.tracks_table.item(row, 1)
+        album_item = self.tracks_table.item(row, 2)
+        return (
+            _normalize_match_text(title_item.text() if title_item else ""),
+            _normalize_match_text(artist_item.text() if artist_item else ""),
+            _normalize_match_text(album_item.text() if album_item else ""),
+        )
+
+    def _apply_duplicate_highlighting(self):
+        duplicate_counts = {}
+        for row in self._snapshot_table_rows():
+            signature = self._row_duplicate_signature(row)
+            if any(signature):
+                duplicate_counts[signature] = duplicate_counts.get(signature, 0) + 1
+
+        duplicate_color = QColor("#4b355f")
+        normal_color = QColor()
+        for row in range(self.tracks_table.rowCount()):
+            signature = self._snapshot_row_signature(row)
+            is_duplicate = self.highlight_duplicates_enabled and duplicate_counts.get(signature, 0) > 1
+            tooltip = "Possible duplicate track" if is_duplicate else ""
+            for col in range(self.tracks_table.columnCount()):
+                item = self.tracks_table.item(row, col)
+                if not item:
+                    continue
+                item.setBackground(duplicate_color if is_duplicate else normal_color)
+                item.setToolTip(tooltip)
+
+    def toggle_duplicate_highlighting(self, enabled):
+        self.highlight_duplicates_enabled = bool(enabled)
+        self.highlight_duplicates_button.setText("Hide Duplicates" if enabled else "Highlight Duplicates")
+        self._apply_duplicate_highlighting()
+
+    def _select_duplicate_group_for_row(self, row):
+        target_signature = self._snapshot_row_signature(row)
+        if not any(target_signature):
+            return
+        self.tracks_table.clearSelection()
+        for current_row in range(self.tracks_table.rowCount()):
+            if self._snapshot_row_signature(current_row) == target_signature:
+                self.tracks_table.selectRow(current_row)
+
+    def _confirm_discard_changes(self):
+        if not self._has_unsaved_changes():
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Discard Changes?",
+            "You have unsaved playlist changes. Close the editor and discard them?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _render_tracks(self, track_rows, start_row=0, end_row=None):
         """Render the provided track list into the table."""
-        for row, track in enumerate(tracks):
-            title_item = QTableWidgetItem(track.title or 'Unknown')
-            artist = track.originalTitle or (track.artist().title if hasattr(track, 'artist') and track.artist() else 'Unknown')
-            artist_item = QTableWidgetItem(artist)
-            album = track.album().title if hasattr(track, 'album') and track.album() else 'Unknown'
-            album_item = QTableWidgetItem(album)
-            duration = f"{track.duration // 60000}:{(track.duration % 60000) // 1000:02d}" if getattr(track, 'duration', None) else 'Unknown'
-            duration_item = QTableWidgetItem(duration)
+        if end_row is None:
+            end_row = len(track_rows)
+        for row in range(start_row, min(end_row, len(track_rows))):
+            row_data = track_rows[row]
+            track = row_data["track"]
+            title_item = QTableWidgetItem(row_data["title"])
+            artist_item = QTableWidgetItem(row_data["artist"])
+            album_item = QTableWidgetItem(row_data["album"])
+            duration_item = QTableWidgetItem(row_data["duration"])
 
             for item in (title_item, artist_item, album_item, duration_item):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -3801,30 +4714,71 @@ class PlaylistEditorDialog(QDialog):
             # Indeterminate progress
             self.loading_progress.setValue(50)
             self.loading_detail.setText("Loading playlist data...")
-        
-        # Keep UI responsive
-        QApplication.processEvents()
     
-    def on_tracks_loaded(self, tracks):
-        """Handle tracks loaded from background thread with smooth transition"""
+    def on_tracks_loaded(self, track_rows):
+        """Handle tracks loaded from background thread without blocking the dialog."""
         try:
+            self.track_rows = list(track_rows)
+            self.tracks = [row["track"] for row in self.track_rows]
+            self.original_track_order = {}
+            for original_index, row in enumerate(self.track_rows):
+                track = row.get("track")
+                track_id = self._register_track(track)
+                self.original_track_order[track_id] = original_index
+            self.original_track_ids = [
+                track_id
+                for track_id in (self._register_track(row.get("track")) for row in self.track_rows)
+                if track_id is not None
+            ]
+            self.track_lookup.clear()
+            for row in self.track_rows:
+                track = row.get("track")
+                self._register_track(track)
+            self.tracks_table.clearContents()
+            self.tracks_table.setRowCount(len(self.tracks))
+            self.track_count_label.setText(f"🎵 Tracks: {len(self.tracks)}")
+            self._pending_render_tracks = self.track_rows
+            self._render_cursor = 0
+
             self.loading_progress.setValue(90)
-            self.loading_detail.setText("Processing tracks...")
-            QApplication.processEvents()
-            
-            self.tracks = list(tracks)
-            self.populate_tracks_table(self.tracks)
-            
-            # Smooth transition to editor
-            self.loading_progress.setValue(100)
-            self.loading_detail.setText("Ready!")
-            QApplication.processEvents()
-            
-            # Small delay for visual feedback, then switch views
-            QTimer.singleShot(180, self.show_editor)
-                
+            self.loading_detail.setText("Rendering tracks...")
+            QTimer.singleShot(0, self._render_next_chunk)
+
         except Exception as e:
             logging.error(f"Error processing loaded tracks: {str(e)}")
+            self.on_tracks_error(str(e))
+
+    def _render_next_chunk(self):
+        """Render the loaded tracks in UI-sized chunks to keep the dialog responsive."""
+        try:
+            total_tracks = len(self._pending_render_tracks)
+            if total_tracks == 0:
+                self.loading_progress.setValue(100)
+                self.loading_detail.setText("Ready!")
+                QTimer.singleShot(0, self.show_editor)
+                return
+
+            end_index = min(self._render_cursor + self._render_batch_size, total_tracks)
+            self._render_tracks(self._pending_render_tracks, start_row=self._render_cursor, end_row=end_index)
+            self._render_cursor = end_index
+
+            if self._render_cursor < total_tracks:
+                render_fraction = self._render_cursor / total_tracks
+                percentage = 90 + int(render_fraction * 9)
+                self.loading_progress.setValue(min(99, percentage))
+                self.loading_detail.setText(f"Rendering tracks... ({self._render_cursor}/{total_tracks})")
+                QTimer.singleShot(0, self._render_next_chunk)
+                return
+
+            self._refresh_internal_track_list()
+            self.loading_progress.setValue(100)
+            self.loading_detail.setText("Ready!")
+            self._pending_render_tracks = []
+            self._apply_duplicate_highlighting()
+            QTimer.singleShot(0, self.show_editor)
+
+        except Exception as e:
+            logging.error(f"Error rendering playlist tracks: {str(e)}")
             self.on_tracks_error(str(e))
     
     def populate_tracks_table(self, tracks):
@@ -3837,11 +4791,8 @@ class PlaylistEditorDialog(QDialog):
 
         # Render the tracks into the table
         self._render_tracks(tracks)
-
-        # Keep UI responsive during any lengthy fills
-        QApplication.processEvents()
-
         self._refresh_internal_track_list()
+        self._apply_duplicate_highlighting()
 
     def show_editor(self):
         """Show the editor interface with smooth transition"""
@@ -3856,7 +4807,9 @@ class PlaylistEditorDialog(QDialog):
         self.delete_button.setEnabled(True)
         self.move_up_button.setEnabled(True)
         self.move_down_button.setEnabled(True)
-        self.save_button.setEnabled(True)
+        self.sort_button.setEnabled(True)
+        self.highlight_duplicates_button.setEnabled(True)
+        self.save_button.setEnabled(False)
         self.change_cover_btn.setEnabled(True)
         self.clear_cover_btn.setEnabled(bool(self.pending_cover_path))
         
@@ -3864,6 +4817,7 @@ class PlaylistEditorDialog(QDialog):
         
         # Update window title
         self.setWindowTitle(f"Editing: {self.playlist.title} ({len(self.tracks)} tracks)")
+        self._update_dirty_state()
     
     def filter_tracks(self, search_text):
         """Filter tracks based on search text"""
@@ -3926,6 +4880,9 @@ class PlaylistEditorDialog(QDialog):
         move_to_top_action = menu.addAction("⬆️ Move to Top")
         move_to_bottom_action = menu.addAction("⬇️ Move to Bottom")
         menu.addSeparator()
+        select_duplicates_action = menu.addAction("🧩 Select Duplicate Group")
+        copy_track_action = menu.addAction("📋 Copy Title / Artist")
+        menu.addSeparator()
         delete_action = menu.addAction("🗑️ Delete Track")
         
         # Show menu and handle selection
@@ -3937,8 +4894,181 @@ class PlaylistEditorDialog(QDialog):
             self.move_track_to_position(row, 0)
         elif action == move_to_bottom_action:
             self.move_track_to_position(row, self.tracks_table.rowCount() - 1)
+        elif action == select_duplicates_action:
+            self._select_duplicate_group_for_row(row)
+        elif action == copy_track_action:
+            title_item = self.tracks_table.item(row, 0)
+            artist_item = self.tracks_table.item(row, 1)
+            title = title_item.text() if title_item else ""
+            artist = artist_item.text() if artist_item else ""
+            QApplication.clipboard().setText(f"{title} - {artist}".strip(" -"))
         elif action == delete_action:
             self.delete_track_at_row(row)
+
+    def _duration_sort_value(self, value):
+        text = str(value or "").strip()
+        if not text or text.lower() == "unknown":
+            return 0
+        parts = text.split(":")
+        try:
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + int(parts[1])
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        except Exception:
+            return 0
+        return 0
+
+    def _snapshot_table_rows(self):
+        rows = []
+        for row in range(self.tracks_table.rowCount()):
+            title_item = self.tracks_table.item(row, 0)
+            artist_item = self.tracks_table.item(row, 1)
+            album_item = self.tracks_table.item(row, 2)
+            duration_item = self.tracks_table.item(row, 3)
+            rows.append(
+                {
+                    "title": title_item.text() if title_item else "",
+                    "artist": artist_item.text() if artist_item else "",
+                    "album": album_item.text() if album_item else "",
+                    "duration": duration_item.text() if duration_item else "",
+                    "track_id": title_item.data(Qt.UserRole) if title_item else None,
+                }
+            )
+        return rows
+
+    def _rebuild_table_from_rows(self, rows, selected_track_ids=None):
+        self.tracks_table.setRowCount(len(rows))
+        self.tracks_table.clearSelection()
+
+        for row_index, row_data in enumerate(rows):
+            items = [
+                QTableWidgetItem(row_data.get("title", "")),
+                QTableWidgetItem(row_data.get("artist", "")),
+                QTableWidgetItem(row_data.get("album", "")),
+                QTableWidgetItem(row_data.get("duration", "")),
+            ]
+            for item in items:
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            items[0].setData(Qt.UserRole, row_data.get("track_id"))
+
+            for col, item in enumerate(items):
+                self.tracks_table.setItem(row_index, col, item)
+
+            if selected_track_ids and row_data.get("track_id") in selected_track_ids:
+                self.tracks_table.selectRow(row_index)
+
+        self.track_count_label.setText(f"🎵 Tracks: {len(rows)}")
+        self._refresh_internal_track_list()
+        self.filter_tracks(self.search_input.text())
+        self._apply_duplicate_highlighting()
+
+    def sort_tracks(self, mode):
+        if not self.tracks_loaded:
+            QMessageBox.warning(self, "Loading", "Please wait for tracks to finish loading.")
+            return
+
+        rows = self._snapshot_table_rows()
+        if not rows:
+            return
+
+        selected_track_ids = set()
+        for item in self.tracks_table.selectedItems():
+            track_id = self.tracks_table.item(item.row(), 0).data(Qt.UserRole)
+            if track_id is not None:
+                selected_track_ids.add(track_id)
+
+        reverse = False
+        if mode == "title_asc":
+            key_fn = lambda row: (_normalize_match_text(row["title"]), _normalize_match_text(row["artist"]), _normalize_match_text(row["album"]))
+        elif mode == "title_desc":
+            key_fn = lambda row: (_normalize_match_text(row["title"]), _normalize_match_text(row["artist"]), _normalize_match_text(row["album"]))
+            reverse = True
+        elif mode == "artist_asc":
+            key_fn = lambda row: (_normalize_match_text(row["artist"]), _normalize_match_text(row["title"]), _normalize_match_text(row["album"]))
+        elif mode == "artist_desc":
+            key_fn = lambda row: (_normalize_match_text(row["artist"]), _normalize_match_text(row["title"]), _normalize_match_text(row["album"]))
+            reverse = True
+        elif mode == "album_asc":
+            key_fn = lambda row: (_normalize_match_text(row["album"]), _normalize_match_text(row["artist"]), _normalize_match_text(row["title"]))
+        elif mode == "album_desc":
+            key_fn = lambda row: (_normalize_match_text(row["album"]), _normalize_match_text(row["artist"]), _normalize_match_text(row["title"]))
+            reverse = True
+        elif mode == "duration_short":
+            key_fn = lambda row: (self._duration_sort_value(row["duration"]), _normalize_match_text(row["artist"]), _normalize_match_text(row["title"]))
+        elif mode == "duration_long":
+            key_fn = lambda row: (self._duration_sort_value(row["duration"]), _normalize_match_text(row["artist"]), _normalize_match_text(row["title"]))
+            reverse = True
+        elif mode == "duplicates":
+            key_fn = lambda row: (
+                _normalize_match_text(row["title"]),
+                _normalize_match_text(row["artist"]),
+                _normalize_match_text(row["album"]),
+                self._duration_sort_value(row["duration"]),
+            )
+        elif mode == "artist_album_title":
+            key_fn = lambda row: (
+                _normalize_match_text(row["artist"]),
+                _normalize_match_text(row["album"]),
+                _normalize_match_text(row["title"]),
+            )
+        elif mode == "original_order":
+            key_fn = lambda row: (
+                self.original_track_order.get(
+                    row.get("track_id"),
+                    10**9,
+                ),
+                _normalize_match_text(row["artist"]),
+                _normalize_match_text(row["album"]),
+                _normalize_match_text(row["title"]),
+            )
+        else:
+            return
+
+        rows.sort(key=key_fn, reverse=reverse)
+        self._rebuild_table_from_rows(rows, selected_track_ids=selected_track_ids)
+        self._update_dirty_state()
+
+    def show_sort_menu(self):
+        if not self.tracks_loaded:
+            QMessageBox.warning(self, "Loading", "Please wait for tracks to finish loading.")
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #142238;
+                color: #e4f0ff;
+                border: 1px solid #38567f;
+                border-radius: 6px;
+            }
+            QMenu::item {
+                padding: 8px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #2d5a8f;
+                color: #ffffff;
+            }
+        """)
+
+        actions = {
+            menu.addAction("Original Playlist Order"): "original_order",
+            menu.addSeparator(): None,
+            menu.addAction("Title A–Z"): "title_asc",
+            menu.addAction("Title Z–A"): "title_desc",
+            menu.addAction("Artist A–Z"): "artist_asc",
+            menu.addAction("Artist Z–A"): "artist_desc",
+            menu.addAction("Album A–Z"): "album_asc",
+            menu.addAction("Album Z–A"): "album_desc",
+            menu.addAction("Duration: Shortest First"): "duration_short",
+            menu.addAction("Duration: Longest First"): "duration_long",
+            menu.addAction("Duplicate Finder (Title / Artist / Album)"): "duplicates",
+            menu.addAction("Artist / Album / Title"): "artist_album_title",
+        }
+
+        chosen = menu.exec(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
+        if chosen in actions and actions[chosen]:
+            self.sort_tracks(actions[chosen])
     
     def handle_row_reorder(self, from_row, to_row):
         """Handle internal drag-and-drop row reordering."""
@@ -3962,6 +5092,8 @@ class PlaylistEditorDialog(QDialog):
         target_item = self.tracks_table.item(to_row, 0)
         if target_item:
             self.tracks_table.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
+        self._apply_duplicate_highlighting()
+        self._update_dirty_state()
 
     def set_track_position(self, current_row):
         """Allow user to set specific position for a track"""
@@ -4025,6 +5157,8 @@ class PlaylistEditorDialog(QDialog):
         target_item = self.tracks_table.item(to_row, 0)
         if target_item:
             self.tracks_table.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
+        self._apply_duplicate_highlighting()
+        self._update_dirty_state()
 
         return to_row
 
@@ -4056,6 +5190,9 @@ class PlaylistEditorDialog(QDialog):
         if reply == QMessageBox.Yes:
             self.tracks_table.removeRow(row)
             self.track_count_label.setText(f"🎵 Tracks: {self.tracks_table.rowCount()}")
+            self._refresh_internal_track_list()
+            self._apply_duplicate_highlighting()
+            self._update_dirty_state()
             # Show success message instead of statusBar
             QMessageBox.information(self, "Deleted", f"Deleted '{track_title}'")
 
@@ -4111,6 +5248,9 @@ class PlaylistEditorDialog(QDialog):
                        
             # Update track count
             self.track_count_label.setText(f"🎵 Tracks: {self.tracks_table.rowCount()}")
+            self._refresh_internal_track_list()
+            self._apply_duplicate_highlighting()
+            self._update_dirty_state()
                 
     def move_up(self):
         current_row = self.tracks_table.currentRow()
@@ -4141,7 +5281,6 @@ class PlaylistEditorDialog(QDialog):
             # Show saving progress
             self.save_button.setText("Saving...")
             self.save_button.setEnabled(False)
-            QApplication.processEvents()
             
             # Get current track order - Look at column 0 (title)
             tracks = []
@@ -4188,6 +5327,8 @@ class PlaylistEditorDialog(QDialog):
                 if cover_updated:
                     success_msg += "\nCover image updated."
                 QMessageBox.information(self, "Success", success_msg)
+            self._mark_saved_state()
+            self._allow_close_without_prompt = True
             self.accept()
             
         except Exception as e:
@@ -4199,13 +5340,22 @@ class PlaylistEditorDialog(QDialog):
     
     def closeEvent(self, event):
         """Handle dialog close event"""
+        if not self._allow_close_without_prompt and not self._confirm_discard_changes():
+            event.ignore()
+            return
         if self.load_tracks_thread and self.load_tracks_thread.isRunning():
-            self.load_tracks_thread.terminate()
-            self.load_tracks_thread.wait(1000)
+            self.load_tracks_thread.stop()
+            self.load_tracks_thread.wait(150)
         if self.cover_load_thread and self.cover_load_thread.isRunning():
             self.cover_load_thread.terminate()
             self.cover_load_thread.wait(500)
         event.accept()
+
+    def reject(self):
+        if not self._allow_close_without_prompt and not self._confirm_discard_changes():
+            return
+        self._allow_close_without_prompt = True
+        super().reject()
 
 class PlaylistMergerDialog(QDialog):
     def __init__(self, playlists, plex_server, parent=None):
@@ -4362,12 +5512,50 @@ class PlaylistMergerDialog(QDialog):
             logging.error(f"Error merging playlists: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to merge playlists: {str(e)}")
 
+class SmartMatchIndexBuildThread(QThread):
+    progress_update = pyqtSignal(str, int)
+    build_complete = pyqtSignal(dict)
+    build_error = pyqtSignal(str)
+
+    def __init__(self, library_section, force_rebuild=False, parent=None):
+        super().__init__(parent)
+        self.library_section = library_section
+        self.force_rebuild = bool(force_rebuild)
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        try:
+            bundle = _prime_library_match_caches(
+                self.library_section,
+                progress_cb=self.progress_update.emit,
+                force_rebuild=self.force_rebuild,
+                stop_check=lambda: self.stop_requested,
+                progress_range=(0, 100),
+            )
+            session_key = _get_library_match_session_key(self.library_section)
+            fingerprint = _get_cached_library_fingerprint(self.library_section) or {}
+            self.build_complete.emit({
+                "session_key": session_key,
+                "track_total": int(fingerprint.get("track_total", 0) or 0),
+                "row_count": len(bundle.get("rows", []) or []),
+                "built_at": datetime.now().isoformat(),
+            })
+        except Exception as e:
+            if str(e).strip().lower() == "smart matching canceled.":
+                self.build_error.emit("Smart matching canceled.")
+            else:
+                self.build_error.emit(str(e))
+
+
 class SmartM3UUploadThread(QThread):
     """Thread for smart M3U upload to prevent UI freezing"""
     progress_update = pyqtSignal(str, int)  # message, percentage
     track_found = pyqtSignal(object)  # matched track
     track_prompt_needed = pyqtSignal(str, str, list, int, int, object)  # title, artist, candidates, index, total, result_holder
-    upload_complete = pyqtSignal(int, int, list)  # matched_count, total_count, not_found_list
+    upload_complete = pyqtSignal(int, int, list, object)  # matched_count, total_count, not_found_list, matched_tracks
     upload_error = pyqtSignal(str)
 
     def __init__(self, m3u_path, track_infos, library_section, parent=None):
@@ -4375,7 +5563,7 @@ class SmartM3UUploadThread(QThread):
         self.m3u_path = m3u_path
         self.track_infos = track_infos
         self.library_section = library_section
-        self.matched_tracks = []
+        self.matched_rating_keys = []
         self.not_found = []
         self.parent_widget = parent
         self.stop_requested = False
@@ -4387,12 +5575,17 @@ class SmartM3UUploadThread(QThread):
         """Run the smart matching process in background thread"""
         try:
             total_tracks = len(self.track_infos)
-            self.progress_update.emit("Indexing Plex library for smart matching...", 1)
-            _prime_library_match_caches(self.library_section)
+            self.progress_update.emit("Checking Smart Match Cache...", 1)
+            _prime_library_match_caches(
+                self.library_section,
+                progress_cb=self.progress_update.emit,
+                stop_check=lambda: self.stop_requested,
+                progress_range=(1, 45),
+            )
             if self.stop_requested:
                 self.upload_error.emit("Smart matching canceled.")
                 return
-            self.progress_update.emit("Library index ready. Starting track matching...", 3)
+            self.progress_update.emit("Matching playlist tracks... (0/{})".format(total_tracks), 46)
 
             for i, track_info in enumerate(self.track_infos):
                 if self.stop_requested:
@@ -4403,8 +5596,8 @@ class SmartM3UUploadThread(QThread):
                     artist = str(track_info.get('artist', '') or '').strip()
                     album = str(track_info.get('album', '') or '').strip()
 
-                    self.progress_update.emit(f"Finding tracks... ({i+1}/{total_tracks})",
-                                            int((i + 1) / total_tracks * 100))
+                    match_progress = 46 + int(((i + 1) / max(total_tracks, 1)) * 54)
+                    self.progress_update.emit(f"Matching playlist tracks ({i+1}/{total_tracks})", match_progress)
 
                     scored_matches = _rank_plex_track_matches(
                         self.library_section,
@@ -4413,17 +5606,19 @@ class SmartM3UUploadThread(QThread):
                     )
 
                     if scored_matches:
-                        best_match = scored_matches[0]["track"]
                         best_score = scored_matches[0]["score"]
                         best_artist_score = scored_matches[0]["artist_score"]
 
                         if best_score >= 82 and (not artist or best_artist_score >= 40 or best_score >= 100):
-                            self.matched_tracks.append(best_match)
+                            best_rating_key = str(scored_matches[0].get("rating_key", "") or "")
+                            if best_rating_key:
+                                self.matched_rating_keys.append(best_rating_key)
                         elif best_score >= 68:
                             prompt_candidates = [
-                                (match["track"], match["score"], match["artist"])
+                                (_hydrate_ranked_match_track(self.library_section, match), match["score"], match["artist"])
                                 for match in scored_matches[:5]
                             ]
+                            prompt_candidates = [candidate for candidate in prompt_candidates if candidate[0] is not None]
                             result_holder = {'track': None}
                             self.track_prompt_needed.emit(
                                 title, artist, prompt_candidates, i + 1, total_tracks, result_holder
@@ -4438,7 +5633,9 @@ class SmartM3UUploadThread(QThread):
                                 timeout += 1
 
                             if result_holder.get('track'):
-                                self.matched_tracks.append(result_holder['track'])
+                                selected_key = str(getattr(result_holder['track'], 'ratingKey', '') or '')
+                                if selected_key:
+                                    self.matched_rating_keys.append(selected_key)
                             else:
                                 self.not_found.append(f"{title} - {artist}" if artist else title)
                         else:
@@ -4454,7 +5651,7 @@ class SmartM3UUploadThread(QThread):
                     self.not_found.append(f"{track_info.get('title', 'Unknown')} - {track_info.get('artist', '')}")
 
             # Upload complete
-            self.upload_complete.emit(len(self.matched_tracks), total_tracks, self.not_found)
+            self.upload_complete.emit(len(self.matched_rating_keys), total_tracks, self.not_found, list(self.matched_rating_keys))
 
         except Exception as e:
             logging.error(f"Smart M3U upload thread error: {str(e)}")
@@ -4626,71 +5823,15 @@ class SyncThread(QThread):
 
     def get_spotify_tracks(self, url):
         try:
-            # Get playlist metadata using cookie token + spclient endpoint
-            token = self.spotify_auth.get_token()
-            client_id = self.spotify_auth.cached_client_id
             playlist_id = url.split('/')[-1].split('?')[0]
-
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Client-Id': client_id,
-                'User-Agent': self.spotify_auth.user_agent,
-                'Accept': 'application/json',
-            }
-
-            # Get track URIs from spclient (all at once)
-            response = requests.get(
-                f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}',
-                headers=headers,
-                timeout=30
+            tracks, _, _ = fetch_spotify_playlist_tracks_enriched(
+                playlist_id,
+                self.spotify_auth,
+                stop_check=lambda: self.stop_requested,
             )
-            response.raise_for_status()
-            playlist_data = response.json()
-
-            # Extract track IDs from URIs
-            track_ids = []
-            contents = playlist_data.get('contents', {})
-            items = contents.get('items', [])
-            for item in items:
-                uri = item.get('uri', '')
-                if uri.startswith('spotify:track:'):
-                    track_id = uri.split(':')[-1]
-                    track_ids.append(track_id)
-
-            # Get track details using OAuth (one at a time, like friend's code)
-            oauth_app = SpotifyOAuthApp()
-            oauth_token = oauth_app.get_token()
-            oauth_headers = {
-                'Authorization': f'Bearer {oauth_token}',
-                'User-Agent': self.spotify_auth.user_agent,
-            }
-
-            tracks = []
-            for track_id in track_ids:
-                time.sleep(0.1)  # Small delay between requests
-                track_url = f'https://api.spotify.com/v1/tracks/{track_id}'
-                track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
-
-                if track_response.status_code == 200:
-                    track = track_response.json()
-                    title = (track.get('name') or '').strip()
-                    if not title:
-                        continue
-                    artist_name = track['artists'][0]['name'] if track.get('artists') else ''
-                    album_name = ((track.get('album') or {}).get('name') or '').strip()
-                    parsed = f"{title} - {artist_name}" if artist_name else title
-                    tracks.append({
-                        "title": title,
-                        "artist": artist_name,
-                        "album": album_name,
-                        "parsed": parsed,
-                        "path": None,
-                        "source": "spotify",
-                    })
-                else:
-                    logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
-
             return tracks
+        except SyncCancelled:
+            return []
         except Exception as e:
             logging.error(f"Error getting Spotify tracks: {str(e)}")
             return []
@@ -4843,7 +5984,9 @@ class SyncThread(QThread):
             if best["score"] >= min_score:
                 if artist and best["artist_score"] < 40 and best["score"] < 100:
                     return None
-                best_track = best["track"]
+                best_track = _hydrate_ranked_match_track(library_section, best)
+                if not best_track:
+                    return None
                 logging.debug(
                     f"Best match for '{title}': {best_track.title} from '{best['album']}' "
                     f"(score: {best['score']:.1f}, artist: {best['artist']})"
@@ -4878,21 +6021,21 @@ class SyncThread(QThread):
             exact_matches = path_index["exact"].get(search_path, [])
             if len(exact_matches) == 1:
                 logging.info(f"Found exact path match for: {file_path}")
-                return exact_matches[0]
+                return _get_plex_track_by_rating_key(library_section, exact_matches[0].get("rating_key"))
 
             if len(path_parts) >= 3:
                 suffix3 = "/".join(path_parts[-3:])
                 suffix3_matches = path_index["suffix3"].get(suffix3, [])
                 if len(suffix3_matches) == 1:
                     logging.info(f"Found suffix-3 path match for: {file_path}")
-                    return suffix3_matches[0]
+                    return _get_plex_track_by_rating_key(library_section, suffix3_matches[0].get("rating_key"))
 
             if len(path_parts) >= 2:
                 suffix2 = "/".join(path_parts[-2:])
                 suffix2_matches = path_index["suffix2"].get(suffix2, [])
                 if len(suffix2_matches) == 1:
                     logging.info(f"Found suffix-2 path match for: {file_path}")
-                    return suffix2_matches[0]
+                    return _get_plex_track_by_rating_key(library_section, suffix2_matches[0].get("rating_key"))
 
             logging.debug(f"No path match found for: {file_path}")
             return None
@@ -5035,6 +6178,18 @@ class SyncThread(QThread):
             track["album"] = album
             track["parsed"] = parsed
             track["path"] = track.get("path")
+            artists = track.get("artists") or []
+            if isinstance(artists, (list, tuple)):
+                track["artists"] = [str(value or "").strip() for value in artists if str(value or "").strip()]
+            elif artists:
+                track["artists"] = [str(artists).strip()]
+            else:
+                track["artists"] = []
+            track["isrc"] = str(track.get("isrc", "") or "").strip().upper()
+            try:
+                track["duration_ms"] = int(track.get("duration_ms", 0) or 0)
+            except Exception:
+                track["duration_ms"] = 0
             if not track.get("recording_mbid"):
                 track["recording_mbid"] = self._extract_recording_mbid(track)
             return track
@@ -5134,62 +6289,12 @@ class PlaylistSortingThread(QThread):
             return []
 
     def get_spotify_tracks(self):
-        """Get Spotify tracks using spclient + OAuth"""
+        """Get Spotify tracks using the shared enriched playlist fetch."""
         try:
             auth = SpotifyAnonymousAuth()
-            token = auth.get_token()
-            client_id = auth.cached_client_id
-
             playlist_id = self.streaming_url.split('/')[-1].split('?')[0]
-
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Client-Id': client_id,
-                'User-Agent': auth.user_agent,
-                'Accept': 'application/json',
-            }
-
-            # Get track URIs from spclient
-            response = requests.get(
-                f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}',
-                headers=headers,
-                timeout=30
-            )
-            response.raise_for_status()
-            playlist_data = response.json()
-
-            # Extract track IDs from URIs
-            track_ids = []
-            contents = playlist_data.get('contents', {})
-            items = contents.get('items', [])
-            for item in items:
-                uri = item.get('uri', '')
-                if uri.startswith('spotify:track:'):
-                    track_id = uri.split(':')[-1]
-                    track_ids.append(track_id)
-
-            # Get track details using OAuth
-            oauth_app = SpotifyOAuthApp()
-            oauth_token = oauth_app.get_token()
-            oauth_headers = {
-                'Authorization': f'Bearer {oauth_token}',
-                'User-Agent': auth.user_agent,
-            }
-
-            tracks = []
-            for track_id in track_ids:
-                time.sleep(0.1)  # Small delay between requests
-                track_url = f'https://api.spotify.com/v1/tracks/{track_id}'
-                track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
-
-                if track_response.status_code == 200:
-                    track = track_response.json()
-                    artist_name = track['artists'][0]['name'] if track['artists'] else 'Unknown Artist'
-                    tracks.append(f"{track['name']} - {artist_name}")
-                else:
-                    logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
-
-            return tracks
+            tracks, _, _ = fetch_spotify_playlist_tracks_enriched(playlist_id, auth)
+            return [str(track.get("parsed") or f"{track.get('title', '')} - {track.get('artist', '')}".strip(" -")) for track in tracks]
         except Exception as e:
             logging.error(f"Error getting Spotify tracks: {str(e)}")
             return []
@@ -6826,8 +7931,8 @@ def get_public_spotify_token():
 class SpotifyOAuthApp:
     """
     OAuth App authentication for Spotify API calls.
-    Required due to Spotify restrictions introduced Dec 22, 2025.
-    Uses Client Credentials OAuth Flow for track/playlist API calls.
+    Currently used only for OAuth-backed endpoints that still accept
+    application credentials, such as some playlist artwork lookups.
     """
     def __init__(self):
         self.client_id = SP_APP_CLIENT_ID
@@ -6853,18 +7958,6 @@ class SpotifyOAuthApp:
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         return session
-
-    def _respect_rate_limit(self):
-        """Enforce minimum interval between API requests to avoid rate limiting"""
-        global SPOTIFY_LAST_REQUEST_TIME
-        now = time.time()
-        time_since_last_request = now - SPOTIFY_LAST_REQUEST_TIME
-
-        if time_since_last_request < SPOTIFY_REQUEST_MIN_INTERVAL:
-            sleep_time = SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last_request
-            time.sleep(sleep_time)
-
-        SPOTIFY_LAST_REQUEST_TIME = time.time()
 
     def initialize_client(self):
         """Initialize Spotipy client with Client Credentials flow"""
@@ -6927,50 +8020,295 @@ class SpotifyOAuthApp:
             logging.error(f"Failed to get OAuth app token: {e}")
             raise
 
-    def get_track(self, track_id):
-        """Get track information using OAuth app credentials"""
-        if not self.spotify_client:
-            self.initialize_client()
+def _spotify_respect_global_rate_limit():
+    global SPOTIFY_LAST_REQUEST_TIME
+    now = time.time()
+    time_since_last = now - SPOTIFY_LAST_REQUEST_TIME
+    if time_since_last < SPOTIFY_REQUEST_MIN_INTERVAL:
+        time.sleep(SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last)
+    SPOTIFY_LAST_REQUEST_TIME = time.time()
 
-        self._respect_rate_limit()
+
+def _extract_spotify_track_id_from_playlist_item(item):
+    if not isinstance(item, dict):
+        return ""
+    uri = str(item.get("uri", "") or "").strip()
+    if uri.startswith("spotify:track:"):
+        return uri.split(":")[-1].strip()
+
+    track_node = item.get("itemV2") or item.get("track") or {}
+    data_node = track_node.get("data") if isinstance(track_node, dict) else {}
+    uri = str(data_node.get("uri", "") or "").strip()
+    if uri.startswith("spotify:track:"):
+        return uri.split(":")[-1].strip()
+    return ""
+
+
+def _fetch_spotify_track_page_payload(track_id, spotify_auth):
+    track_id = str(track_id or "").strip()
+    if not track_id:
+        return None
+
+    headers = {
+        "User-Agent": spotify_auth.user_agent or "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://open.spotify.com/",
+    }
+    track_url = f"https://open.spotify.com/track/{track_id}"
+
+    for attempt in range(3):
+        _spotify_respect_global_rate_limit()
+        response = requests.get(track_url, headers=headers, timeout=30)
+        if response.status_code == 429 and attempt < 2:
+            retry_after = int(response.headers.get("Retry-After", 2) or 2)
+            time.sleep(max(1, min(retry_after, 5)))
+            continue
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        text = response.text or ""
+
+        def meta_value(key):
+            patterns = [
+                rf'<meta[^>]+property=["\']{re.escape(key)}["\'][^>]+content=["\']([^"\']+)["\']',
+                rf'<meta[^>]+name=["\']{re.escape(key)}["\'][^>]+content=["\']([^"\']+)["\']',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    return html.unescape(match.group(1).strip())
+            return ""
+
+        title = meta_value("og:title")
+        description = meta_value("og:description")
+        image_url = meta_value("og:image")
+        release_date = meta_value("music:release_date")
+        duration_raw = meta_value("music:duration")
+        musician_values = re.findall(
+            r'<meta[^>]+(?:property|name)=["\']music:musician_description["\'][^>]+content=["\']([^"\']+)["\']',
+            text,
+            re.IGNORECASE,
+        )
+        musician_values = [html.unescape(value.strip()) for value in musician_values if value and value.strip()]
+
+        parts = [part.strip() for part in description.split("·")] if description else []
+        artist_block = musician_values[0] if musician_values else (parts[0] if len(parts) >= 1 else "")
+        album_name = parts[1] if len(parts) >= 2 else ""
+        artist_list = [segment.strip() for segment in artist_block.split(",") if segment.strip()]
+        primary_artist = artist_list[0] if artist_list else artist_block.strip()
+
         try:
-            return self.spotify_client.track(track_id)
-        except Exception as e:
-            logging.error(f"Failed to get track {track_id}: {e}")
-            raise
+            duration_ms = int(float(duration_raw) * 1000) if duration_raw else 0
+        except Exception:
+            duration_ms = 0
 
-    def get_playlist(self, playlist_id):
-        """Get playlist information using OAuth app credentials"""
-        if not self.spotify_client:
-            self.initialize_client()
+        release_year = None
+        if release_date:
+            try:
+                release_year = int(str(release_date).split("-", 1)[0])
+            except Exception:
+                release_year = None
 
-        self._respect_rate_limit()
-        try:
-            # Use lower-level API call to avoid additional_types parameter
-            return self.spotify_client.playlist(playlist_id, fields=None, market=None, additional_types=())
-        except Exception as e:
-            logging.error(f"Failed to get playlist {playlist_id}: {e}")
-            raise
+        if not title:
+            return None
 
-    def get_playlist_tracks(self, playlist_id, limit=50, offset=0):
-        """Get playlist tracks using OAuth app credentials"""
-        if not self.spotify_client:
-            self.initialize_client()
+        return {
+            "title": title,
+            "artist": primary_artist,
+            "artists": artist_list or ([primary_artist] if primary_artist else []),
+            "album": album_name,
+            "release_date": release_date,
+            "release_year": release_year,
+            "release_art_url": image_url,
+            "duration_ms": duration_ms,
+            "isrc": "",
+            "spotify_track_id": track_id,
+            "platform_id": track_id,
+            "platform_url": track_url,
+            "explicit": False,
+            "popularity": None,
+            "parsed": f"{title} - {primary_artist}" if primary_artist else title,
+            "path": None,
+            "source": "spotify",
+        }
 
-        self._respect_rate_limit()
-        try:
-            # Use lower-level API call to avoid additional_types parameter
-            return self.spotify_client.playlist_tracks(
-                playlist_id,
-                fields=None,
-                limit=limit,
-                offset=offset,
-                market=None,
-                additional_types=()
+    return None
+
+
+def fetch_spotify_playlist_tracks_enriched(playlist_id, spotify_auth, progress_cb=None, stop_check=None):
+    playlist_id = str(playlist_id or "").strip()
+    if not playlist_id:
+        raise ValueError("Missing Spotify playlist id.")
+
+    token = spotify_auth.refresh_token_if_needed()
+    client_id = spotify_auth.cached_client_id
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Client-Id": client_id,
+        "Content-Type": "application/json",
+        "User-Agent": spotify_auth.user_agent,
+        "Accept": "application/json",
+        "Referer": "https://open.spotify.com/",
+    }
+
+    def emit(message, value):
+        if progress_cb:
+            progress_cb(message, int(max(0, min(100, value))))
+
+    _spotify_respect_global_rate_limit()
+    response = requests.get(
+        f"https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}",
+        headers=headers,
+        timeout=30,
+    )
+    if response.status_code == 401:
+        spotify_auth.cached_access_token = None
+        token = spotify_auth.refresh_token_if_needed()
+        headers["Authorization"] = f"Bearer {token}"
+        _spotify_respect_global_rate_limit()
+        response = requests.get(
+            f"https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}",
+            headers=headers,
+            timeout=30,
+        )
+    if response.status_code == 403:
+        raise ValueError("Access denied. Playlist may be private or unavailable.")
+    if response.status_code == 404:
+        raise ValueError("Playlist not found. Please check the URL.")
+    response.raise_for_status()
+
+    playlist_data = response.json()
+    playlist_name = playlist_data.get("attributes", {}).get("name", "Unknown Playlist")
+    playlist_image_url = None
+    try:
+        extractor_owner = PlaylistConverterThread.__new__(PlaylistConverterThread)
+        extractor_owner.spotify_auth = spotify_auth
+        playlist_image_url = extractor_owner._extract_spotify_playlist_image_candidate(playlist_data)
+        if not playlist_image_url:
+            playlist_image_url = extractor_owner._resolve_spotify_playlist_image_url(playlist_id, playlist_image_url)
+    except Exception as image_error:
+        logging.warning(f"Could not resolve Spotify playlist artwork: {image_error}")
+
+    total_tracks = int(playlist_data.get("length", 0) or 0)
+    track_page_limit = 100
+    offset = 0
+    max_pages = max(1, int(math.ceil(max(total_tracks, 1) / max(track_page_limit, 1))) + 2) if total_tracks > 0 else 25
+    track_ids = []
+    seen_track_ids = set()
+    previous_page_signature = None
+
+    emit("Scanning Spotify playlist...", 5)
+    for page_number in range(max_pages):
+        if stop_check and stop_check():
+            raise SyncCancelled()
+
+        page_start = offset + 1
+        page_end = min(offset + track_page_limit, total_tracks) if total_tracks > 0 else (offset + track_page_limit)
+        emit(
+            f"Scanning Spotify playlist... ({page_start}-{page_end})",
+            5 + int((min(offset, total_tracks) / max(total_tracks, 1)) * 20) if total_tracks > 0 else 10,
+        )
+        logging.info(f"Spotify playlist scan request: playlist={playlist_id} offset={offset} limit={track_page_limit}")
+        _spotify_respect_global_rate_limit()
+        page_response = requests.get(
+            f"https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}",
+            headers=headers,
+            params={"offset": offset, "limit": track_page_limit},
+            timeout=30,
+        )
+        if page_response.status_code == 401:
+            spotify_auth.cached_access_token = None
+            token = spotify_auth.refresh_token_if_needed()
+            headers["Authorization"] = f"Bearer {token}"
+            headers["Client-Id"] = spotify_auth.cached_client_id
+            _spotify_respect_global_rate_limit()
+            page_response = requests.get(
+                f"https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}",
+                headers=headers,
+                params={"offset": offset, "limit": track_page_limit},
+                timeout=30,
             )
-        except Exception as e:
-            logging.error(f"Failed to get playlist tracks {playlist_id}: {e}")
-            raise
+        if page_response.status_code == 429:
+            retry_after = int(page_response.headers.get("Retry-After", 2) or 2)
+            capped_retry = max(1, min(retry_after, 15))
+            logging.warning(f"Spotify playlist scan rate limited, waiting {capped_retry}s")
+            time.sleep(capped_retry)
+            continue
+        page_response.raise_for_status()
+        page_payload = page_response.json() or {}
+        items = ((page_payload.get("contents") or {}).get("items") or [])
+        if not items:
+            break
+
+        page_track_ids = []
+        for item in items:
+            track_id = _extract_spotify_track_id_from_playlist_item(item)
+            if track_id:
+                page_track_ids.append(track_id)
+
+        page_signature = tuple(page_track_ids[:10])
+        if previous_page_signature is not None and page_signature == previous_page_signature:
+            logging.warning(f"Spotify playlist scan repeated page at offset {offset}; stopping early.")
+            break
+        previous_page_signature = page_signature
+
+        new_track_count = 0
+        for track_id in page_track_ids:
+            if track_id in seen_track_ids:
+                continue
+            seen_track_ids.add(track_id)
+            track_ids.append(track_id)
+            new_track_count += 1
+
+        if new_track_count == 0:
+            logging.warning(f"Spotify playlist scan returned no new track ids at offset {offset}; stopping early.")
+            break
+
+        offset += len(items)
+        if total_tracks > 0:
+            emit(
+                f"Scanning Spotify playlist... ({min(len(track_ids), total_tracks)}/{total_tracks})",
+                5 + int((min(len(track_ids), total_tracks) / max(total_tracks, 1)) * 20),
+            )
+        else:
+            emit(f"Scanning Spotify playlist... ({len(track_ids)} found)", 25)
+
+        if total_tracks > 0 and len(track_ids) >= total_tracks:
+            break
+        if len(items) < track_page_limit:
+            break
+
+    effective_total = total_tracks if total_tracks > 0 else len(track_ids)
+    tracks = []
+    if track_ids:
+        ordered_tracks = [None] * len(track_ids)
+        total_to_fetch = len(track_ids)
+        max_workers = min(8, max(2, (os.cpu_count() or 4)))
+        emit("Loading Spotify track metadata...", 30)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(_fetch_spotify_track_page_payload, track_id, spotify_auth): index
+                for index, track_id in enumerate(track_ids)
+            }
+            completed = 0
+            for future in as_completed(future_to_index):
+                if stop_check and stop_check():
+                    raise SyncCancelled()
+                index = future_to_index[future]
+                track_id = track_ids[index]
+                try:
+                    ordered_tracks[index] = future.result()
+                except Exception as e:
+                    logging.warning(f"Failed to load Spotify track page for {track_id}: {e}")
+                completed += 1
+                emit(
+                    f"Loading Spotify track metadata... ({completed}/{total_to_fetch})",
+                    30 + int((completed / max(total_to_fetch, 1)) * 65),
+                )
+        tracks = [track for track in ordered_tracks if track]
+
+    emit(f"Loaded Spotify playlist '{playlist_name}' ({len(tracks)} tracks)", 95)
+    return tracks, playlist_name, playlist_image_url
 
 
 class TidalClient:
@@ -7228,7 +8566,7 @@ class PlaylistConverterThread(QThread):
                 if normalized:
                     return normalized
             else:
-                logging.warning(f"Spotify cover lookup returned HTTP {response.status_code}")
+                logging.info(f"Spotify cover lookup returned HTTP {response.status_code}; falling back to public artwork sources.")
         except Exception as e:
             logging.warning(f"Spotify cover lookup failed: {e}")
 
@@ -7289,214 +8627,15 @@ class PlaylistConverterThread(QThread):
             try:
                 playlist_id = self.playlist_source.split('/')[-1].split('?')[0]
                 logging.info(f"Processing Spotify playlist ID: {playlist_id} (attempt {retry_count + 1})")
-
-                # Respect global rate limiting
-                global SPOTIFY_LAST_REQUEST_TIME
-                now = time.time()
-                time_since_last = now - SPOTIFY_LAST_REQUEST_TIME
-                if time_since_last < SPOTIFY_REQUEST_MIN_INTERVAL:
-                    time.sleep(SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last)
-                SPOTIFY_LAST_REQUEST_TIME = time.time()
-
-                # Get cookie-based token and client ID
-                token = self.spotify_auth.refresh_token_if_needed()
-                client_id = self.spotify_auth.cached_client_id
-                headers = {
-                    'Authorization': f'Bearer {token}',
-                    'Client-Id': client_id,  # CRITICAL: Required for cookie-based tokens (Dec 22, 2025 change)
-                    'Content-Type': 'application/json',
-                    'User-Agent': self.spotify_auth.user_agent,
-                    'Accept': 'application/json',
-                    'Referer': 'https://open.spotify.com/',
-                }
-
-                # Use spclient endpoint (required for cookie-based auth as of Dec 22, 2025)
-                response = requests.get(
-                    f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}',
-                    headers=headers,
-                    timeout=30
+                tracks, playlist_name, playlist_image_url = fetch_spotify_playlist_tracks_enriched(
+                    playlist_id,
+                    self.spotify_auth,
+                    progress_cb=lambda message, value: (
+                        self.progress_message.emit(message),
+                        self.progress_update.emit(int(value)),
+                    ),
+                    stop_check=lambda: getattr(self, "_cancel_requested", False),
                 )
-
-                # Handle different HTTP status codes
-                if response.status_code == 200:
-                    playlist_data = response.json()
-
-                    # Parse spclient response structure
-                    playlist_name = playlist_data.get('attributes', {}).get('name', 'Unknown Playlist')
-                    playlist_image_url = self._extract_spotify_playlist_image_candidate(playlist_data)
-                    total_tracks = playlist_data.get('length', 0)
-
-                elif response.status_code == 401:  # Unauthorized
-                    logging.warning("Token expired or invalid, attempting to refresh...")
-                    self.spotify_auth.cached_access_token = None
-                    retry_count += 1
-                    time.sleep(2)
-                    continue
-                elif response.status_code == 429:  # Rate limited
-                    retry_after = int(response.headers.get('Retry-After', base_wait_time * (2 ** retry_count)))
-                    logging.warning(f"Rate limited, waiting {retry_after} seconds...")
-                    time.sleep(retry_after)
-                    retry_count += 1
-                    continue
-                elif response.status_code == 403:  # Forbidden
-                    raise ValueError("Access denied. Playlist may be private or unavailable.")
-                elif response.status_code == 404:  # Not found
-                    raise ValueError("Playlist not found. Please check the URL.")
-                else:
-                    response.raise_for_status()
-                    playlist_data = response.json()
-                    playlist_name = playlist_data.get('attributes', {}).get('name', 'Unknown Playlist')
-                    playlist_image_url = self._extract_spotify_playlist_image_candidate(playlist_data)
-                    total_tracks = playlist_data.get('length', 0)
-
-                if not playlist_image_url:
-                    playlist_image_url = self._resolve_spotify_playlist_image_url(playlist_id, playlist_image_url)
-
-                logging.info(f"Found playlist: {playlist_name} with {total_tracks} tracks")
-
-                # Get all tracks with pagination
-                tracks = []
-                processed_tracks = 0
-                offset = 0
-                limit = 50
-
-                while processed_tracks < total_tracks:
-                    try:
-                        self._ensure_not_cancelled()
-                        logging.info(f"Fetching tracks batch: {processed_tracks}/{total_tracks}")
-
-                        # Respect rate limiting between requests
-                        now = time.time()
-                        time_since_last = now - SPOTIFY_LAST_REQUEST_TIME
-                        if time_since_last < SPOTIFY_REQUEST_MIN_INTERVAL:
-                            time.sleep(SPOTIFY_REQUEST_MIN_INTERVAL - time_since_last)
-                        SPOTIFY_LAST_REQUEST_TIME = time.time()
-
-                        # Fetch tracks using spclient endpoint (required as of Dec 22, 2025)
-                        tracks_url = f'https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}?offset={offset}&limit={limit}'
-                        response = requests.get(tracks_url, headers=headers, timeout=30)
-
-                        # Handle rate limiting for tracks
-                        if response.status_code == 429:
-                            # Try public token fallback
-                            public_token = get_public_spotify_token()
-                            if public_token:
-                                logging.info("Using public token fallback for track fetching...")
-                                headers['Authorization'] = f'Bearer {public_token}'
-                                time.sleep(1)
-                                continue
-
-                            # If no fallback, wait for rate limit
-                            retry_after = int(response.headers.get('Retry-After', 5))
-                            logging.warning(f"Rate limited on tracks, waiting {retry_after} seconds...")
-                            time.sleep(retry_after)
-                            continue
-                        elif response.status_code == 401:
-                            logging.warning("Token expired during track fetching, refreshing...")
-                            token = self.spotify_auth.get_token()
-                            headers['Authorization'] = f'Bearer {token}'
-                            continue
-
-                        response.raise_for_status()
-                        tracks_data = response.json()
-
-                        # spclient returns items with URIs only
-                        items = tracks_data.get('contents', {}).get('items', [])
-
-                        # Extract track IDs from URIs
-                        track_ids = []
-                        for item in items:
-                            if item and item.get('uri'):
-                                uri = item['uri']
-                                if uri.startswith('spotify:track:'):
-                                    track_id = uri.split(':')[-1]
-                                    track_ids.append(track_id)
-
-                        # Fetch track details ONE AT A TIME using OAuth (like friend's code)
-                        # Get OAuth token for track API calls
-                        oauth_app = SpotifyOAuthApp()
-                        oauth_token = oauth_app.get_token()
-                        oauth_headers = {
-                            'Authorization': f'Bearer {oauth_token}',
-                            'User-Agent': self.spotify_auth.user_agent,
-                        }
-
-                        for track_id in track_ids:
-                            try:
-                                # Add small delay between track requests
-                                time.sleep(0.1)
-
-                                track_url = f'https://api.spotify.com/v1/tracks/{track_id}'
-                                track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
-
-                                if track_response.status_code == 200:
-                                    track = track_response.json()
-                                    if track and track.get('name'):
-                                        title = (track.get('name') or '').strip()
-                                        artist_name = ''
-                                        if track.get('artists') and len(track['artists']) > 0:
-                                            artist_name = track['artists'][0]['name']
-                                        album_name = ((track.get('album') or {}).get('name') or '').strip()
-                                        parsed = f"{title} - {artist_name}" if artist_name else title
-                                        tracks.append({
-                                            "title": title,
-                                            "artist": artist_name,
-                                            "album": album_name,
-                                            "parsed": parsed,
-                                            "path": None,
-                                            "source": "spotify",
-                                        })
-                                        processed_tracks += 1
-
-                                        # Update progress
-                                        if total_tracks > 0:
-                                            progress = int((processed_tracks / total_tracks) * 50)
-                                            self.progress_update.emit(progress)
-                                elif track_response.status_code == 429:
-                                    # If rate limited, wait and retry this track
-                                    retry_after = int(track_response.headers.get('Retry-After', 2))
-                                    logging.warning(f"Rate limited on track, waiting {retry_after}s")
-                                    time.sleep(retry_after)
-                                    # Retry same track with OAuth
-                                    track_response = requests.get(track_url, headers=oauth_headers, timeout=30)
-                                    if track_response.status_code == 200:
-                                        track = track_response.json()
-                                        if track and track.get('name'):
-                                            title = (track.get('name') or '').strip()
-                                            artist_name = ''
-                                            if track.get('artists') and len(track['artists']) > 0:
-                                                artist_name = track['artists'][0]['name']
-                                            album_name = ((track.get('album') or {}).get('name') or '').strip()
-                                            parsed = f"{title} - {artist_name}" if artist_name else title
-                                            tracks.append({
-                                                "title": title,
-                                                "artist": artist_name,
-                                                "album": album_name,
-                                                "parsed": parsed,
-                                                "path": None,
-                                                "source": "spotify",
-                                            })
-                                            processed_tracks += 1
-                                else:
-                                    logging.warning(f"Failed to fetch track {track_id}: {track_response.status_code}")
-                                    processed_tracks += 1
-
-                            except Exception as e:
-                                logging.warning(f"Error fetching track {track_id}: {e}")
-                                processed_tracks += 1
-
-                        # Move to next batch
-                        offset += limit
-
-                    except requests.exceptions.Timeout:
-                        logging.warning("Request timeout, retrying...")
-                        time.sleep(2)
-                        continue
-                    except requests.exceptions.ConnectionError:
-                        logging.warning("Connection error, retrying...")
-                        time.sleep(5)
-                        continue
-        
                 logging.info(f"Successfully fetched {len(tracks)} tracks from Spotify playlist '{playlist_name}'")
                 return tracks, playlist_name, playlist_image_url
                 
@@ -7651,7 +8790,7 @@ class PlaylistConverterThread(QThread):
         best_artist_score = 0
 
         if scored_tracks:
-            best_match = scored_tracks[0]["track"]
+            best_match = _hydrate_ranked_match_track(library_section, scored_tracks[0])
             best_score = scored_tracks[0]["score"]
             best_artist_score = scored_tracks[0]["artist_score"]
 
@@ -7793,6 +8932,64 @@ class PlaylistConverterThread(QThread):
             elif isinstance(value, list):
                 fields_to_scan.extend(value)
         return None
+
+    def normalize_source_track(self, track_info):
+        if isinstance(track_info, dict):
+            track = dict(track_info)
+            title = str(track.get("title", "") or "").strip()
+            artist = str(track.get("artist", "") or "").strip()
+            album = str(track.get("album", "") or "").strip()
+            parsed = str(track.get("parsed", "") or "").strip()
+            if not parsed and title:
+                parsed = f"{title} - {artist}" if artist else title
+            if not title and parsed:
+                if " - " in parsed:
+                    parts = parsed.split(" - ", 1)
+                    title = parts[0].strip()
+                    if not artist:
+                        artist = parts[1].strip()
+                else:
+                    title = parsed
+
+            track["title"] = title
+            track["artist"] = artist
+            track["album"] = album
+            track["parsed"] = parsed
+            track["path"] = track.get("path")
+            artists = track.get("artists") or []
+            if isinstance(artists, (list, tuple)):
+                track["artists"] = [str(value or "").strip() for value in artists if str(value or "").strip()]
+            elif artists:
+                track["artists"] = [str(artists).strip()]
+            else:
+                track["artists"] = []
+            track["isrc"] = str(track.get("isrc", "") or "").strip().upper()
+            try:
+                track["duration_ms"] = int(track.get("duration_ms", 0) or 0)
+            except Exception:
+                track["duration_ms"] = 0
+            if not track.get("recording_mbid"):
+                track["recording_mbid"] = self._extract_recording_mbid(track)
+            return track
+
+        text = str(track_info or "").strip()
+        title = text
+        artist = ""
+        if " - " in text:
+            parts = text.split(" - ", 1)
+            title = parts[0].strip()
+            artist = parts[1].strip()
+        return {
+            "title": title,
+            "artist": artist,
+            "album": "",
+            "recording_mbid": "",
+            "parsed": text,
+            "path": None,
+            "artists": [artist] if artist else [],
+            "isrc": "",
+            "duration_ms": 0,
+        }
 
     def parse_track_info(self, track):
         if isinstance(track, dict):
@@ -8530,8 +9727,10 @@ class UserSelectionDialog(QDialog):
 
 
 class PlexPlaylistManager(QMainWindow):
-    def __init__(self):
+    def __init__(self, startup_splash=None):
         super().__init__()
+        self._startup_splash = startup_splash
+        self._startup_splash_active = startup_splash is not None
         self.playlists = []
         self.playlist_data = []  # Store playlist objects with track counts
         self.plex_server = None
@@ -8553,10 +9752,15 @@ class PlexPlaylistManager(QMainWindow):
         self.path_mappings = []  # Store user-defined path mappings
         self.plex_library_paths = []  # Cache Plex library root paths
         self.feature_flags = APP_CONFIG_DEFAULTS.get("features", {}).copy()
+        self.smart_match_settings = APP_CONFIG_DEFAULTS.get("smart_match", {}).copy()
         self.metadata_settings = APP_CONFIG_DEFAULTS.get("metadata", {}).copy()
         self.metadata_service = None
         self._suspend_settings_apply = True
         self._startup_auto_fetch_pending = False
+        self.smart_match_preload_thread = None
+        self.smart_match_preload_session_key = ""
+        self.smart_match_preload_show_dialog = False
+        self._pending_smart_match_import = None
         self.apple_music_library_data = None
         self.plex_server_profiles = []
         self.source_server_playlists = []
@@ -8575,59 +9779,32 @@ class PlexPlaylistManager(QMainWindow):
         self.is_admin = True  # Whether current user is administrator
         self.plex_account = None  # MyPlexAccount instance for user management
 
+        self._update_startup_progress("Loading interface...", 8)
         self.initUI()
+        self._update_startup_progress("Loading configuration...", 28)
+        _set_smart_match_runtime_settings(self.smart_match_settings)
         self.load_config()
+        self._update_startup_progress("Applying settings...", 72)
         self._suspend_settings_apply = False
         self.apply_settings_from_controls(save=False, show_message=False)
+        self._update_startup_progress("Preparing metadata services...", 84)
         self.setup_metadata_service()
+        self._update_startup_progress("Finalizing window...", 94)
         self.setStyleSheet(self.get_stylesheet())
         self.setWindowTitle('Syncra - Playlist Manager')
         self.setWindowIcon(QIcon('Syncra Icon.ico'))
         self.setMinimumSize(860, 540)
         self.resize(1280, 780)
+        self._update_startup_progress("Ready", 100)
+
+    def _update_startup_progress(self, message, value=None):
+        splash = getattr(self, "_startup_splash", None)
+        if splash and getattr(self, "_startup_splash_active", False):
+            splash.update_progress(message, value)
         
     def get_logo_svg(self):
         """Return the complete SVG logo code"""
-        return """
-        <svg width="250" height="100" xmlns="http://www.w3.org/2000/svg">
-            <defs>
-                <!-- Original vibrant gradient -->
-                <linearGradient id="mainGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" style="stop-color:#00E676"/>
-                    <stop offset="50%" style="stop-color:#00BCD4"/>
-                    <stop offset="100%" style="stop-color:#2196F3"/>
-                </linearGradient>
-                
-                <!-- Text gradient - Subtle blue gradient -->
-                <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-                    <stop offset="0%" style="stop-color:#42A5F5"/>
-                    <stop offset="100%" style="stop-color:#2196F3"/>
-                </linearGradient>
-                
-                <!-- Radial gradient for depth -->
-                <radialGradient id="radialGrad" cx="50%" cy="30%">
-                    <stop offset="0%" style="stop-color:#00E676"/>
-                    <stop offset="100%" style="stop-color:#2196F3"/>
-                </radialGradient>
-            </defs>
-            
-            <!-- Overlapping vinyl records -->
-            <g transform="translate(10, 20)">
-                <!-- First record -->
-                <circle cx="25" cy="30" r="25" fill="none" stroke="url(#mainGrad)" stroke-width="4"/>
-                <circle cx="25" cy="30" r="15" fill="none" stroke="url(#mainGrad)" stroke-width="2" opacity="0.7"/>
-                <circle cx="25" cy="30" r="5" fill="url(#mainGrad)"/>
-                
-                <!-- Second record (overlapping) -->
-                <circle cx="45" cy="30" r="25" fill="none" stroke="url(#mainGrad)" stroke-width="4" opacity="0.8"/>
-                <circle cx="45" cy="30" r="15" fill="none" stroke="url(#mainGrad)" stroke-width="2" opacity="0.6"/>
-                <circle cx="45" cy="30" r="5" fill="url(#mainGrad)" opacity="0.8"/>
-                
-                <!-- SYNCRA text -->
-                <text x="85" y="40" font-family="Inter, sans-serif" font-size="32" font-weight="800" fill="url(#textGrad)" letter-spacing="-1px">SYNCRA</text>
-            </g>
-        </svg>
-        """
+        return get_syncra_logo_svg()
 
     def initUI(self):
         central_widget = QWidget()
@@ -10117,6 +11294,7 @@ class PlexPlaylistManager(QMainWindow):
             has_source_playlist = bool(getattr(self, "source_server_playlists", []))
             self.server_sync_transfer_btn.setEnabled(bool(self.plex_server) and has_source_playlist)
         self.update_dashboard_metrics()
+        self.refresh_smart_match_cache_status()
 
     def update_dashboard_metrics(self):
         if hasattr(self, "metric_playlists"):
@@ -10136,6 +11314,12 @@ class PlexPlaylistManager(QMainWindow):
             "ui_refresh_v2": self.ui_refresh_feature_cb.isChecked() if hasattr(self, "ui_refresh_feature_cb") else self.feature_flags.get("ui_refresh_v2", False),
             "auto_fetch_playlists_on_startup": self.auto_fetch_on_startup_cb.isChecked() if hasattr(self, "auto_fetch_on_startup_cb") else self.feature_flags.get("auto_fetch_playlists_on_startup", False),
         }
+        self.smart_match_settings = {
+            "persist_cache": bool(self.smart_match_settings.get("persist_cache", True)),
+            "preload_on_connect": bool(self.smart_match_settings.get("preload_on_connect", True)),
+            "cache_db": str(self.smart_match_settings.get("cache_db", APP_CONFIG_DEFAULTS["smart_match"]["cache_db"]) or APP_CONFIG_DEFAULTS["smart_match"]["cache_db"]).strip(),
+        }
+        _set_smart_match_runtime_settings(self.smart_match_settings)
 
         if hasattr(self, "metadata_user_agent_input"):
             self.metadata_settings["user_agent"] = self.metadata_user_agent_input.text().strip() or APP_CONFIG_DEFAULTS["metadata"]["user_agent"]
@@ -10152,6 +11336,7 @@ class PlexPlaylistManager(QMainWindow):
         if not self.plex_server:
             self._startup_auto_fetch_pending = bool(self.feature_flags.get("auto_fetch_playlists_on_startup", False))
         self.refresh_feature_dependent_ui()
+        self.refresh_smart_match_cache_status()
         if save:
             self.save_config()
         if show_message:
@@ -10465,6 +11650,30 @@ class PlexPlaylistManager(QMainWindow):
         path_warning.setTextFormat(Qt.RichText)
         path_warning.setStyleSheet("color: #ffc56a; font-style: italic; padding: 10px; background-color: #1a2435; border: 1px solid #7a6436; border-radius: 6px; margin: 5px 0;")
         matching_mode_layout.addWidget(path_warning)
+
+        smart_match_cache_group = QGroupBox("Smart Match Cache")
+        smart_match_cache_layout = QVBoxLayout(smart_match_cache_group)
+
+        self.smart_match_cache_status_label = QLabel("Status: No library selected")
+        self.smart_match_cache_status_label.setWordWrap(True)
+        self.smart_match_cache_status_label.setStyleSheet("color: #dceaff; padding: 6px 0;")
+        smart_match_cache_layout.addWidget(self.smart_match_cache_status_label)
+
+        self.smart_match_cache_detail_label = QLabel("Built: n/a • Indexed tracks: 0")
+        self.smart_match_cache_detail_label.setStyleSheet("color: #9cb2d2; font-size: 12px;")
+        smart_match_cache_layout.addWidget(self.smart_match_cache_detail_label)
+
+        smart_match_cache_buttons = QHBoxLayout()
+        self.smart_match_rebuild_btn = ModernButton("Rebuild Smart Match Index")
+        self.smart_match_rebuild_btn.clicked.connect(lambda: self.start_smart_match_preload(force_rebuild=True, show_dialog=True))
+        smart_match_cache_buttons.addWidget(self.smart_match_rebuild_btn)
+        self.smart_match_clear_btn = ModernButton("Clear Smart Match Cache")
+        self.smart_match_clear_btn.clicked.connect(self.clear_smart_match_cache)
+        smart_match_cache_buttons.addWidget(self.smart_match_clear_btn)
+        smart_match_cache_buttons.addStretch()
+        smart_match_cache_layout.addLayout(smart_match_cache_buttons)
+
+        matching_mode_layout.addWidget(smart_match_cache_group)
 
         matching_mode_group.setLayout(matching_mode_layout)
         layout.addWidget(matching_mode_group)
@@ -11065,6 +12274,7 @@ class PlexPlaylistManager(QMainWindow):
         self.section_combo = QComboBox()
         self.section_combo.addItem("Library Section")
         self.section_combo.setCurrentIndex(0)
+        self.section_combo.currentIndexChanged.connect(self.on_library_section_changed)
         form_layout.addWidget(self.section_combo)
 
         layout.addLayout(form_layout)
@@ -11146,17 +12356,17 @@ class PlexPlaylistManager(QMainWindow):
         self.playlist_input.setPlaceholderText("Path to .m3u Playlist or Directory")
         import_layout.addWidget(self.playlist_input)
         
-        browse_button = ModernButton('Browse')
-        browse_button.setObjectName("importBrowseButton")
-        browse_button.clicked.connect(self.browse_files)
-        import_layout.setAlignment(browse_button, Qt.AlignmentFlag.AlignTop)
-        import_layout.addWidget(browse_button)
-        
-        import_button = ModernButton('Import Playlist(s)')
-        import_button.setObjectName("importPlaylistButton")
-        import_button.clicked.connect(self.import_playlist)
-        import_layout.setAlignment(import_button, Qt.AlignmentFlag.AlignTop)
-        import_layout.addWidget(import_button)
+        self.import_browse_button = ModernButton('Browse')
+        self.import_browse_button.setObjectName("importBrowseButton")
+        self.import_browse_button.clicked.connect(self.browse_files)
+        import_layout.setAlignment(self.import_browse_button, Qt.AlignmentFlag.AlignTop)
+        import_layout.addWidget(self.import_browse_button)
+
+        self.import_playlist_button = ModernButton('Import Playlist(s)')
+        self.import_playlist_button.setObjectName("importPlaylistButton")
+        self.import_playlist_button.clicked.connect(self.import_playlist)
+        import_layout.setAlignment(self.import_playlist_button, Qt.AlignmentFlag.AlignTop)
+        import_layout.addWidget(self.import_playlist_button)
         
         ie_layout.addLayout(import_layout)
         
@@ -11587,7 +12797,7 @@ class PlexPlaylistManager(QMainWindow):
     def set_all_apple_music_playlist_checks(self, checked):
         if not hasattr(self, "apple_music_playlist_list"):
             return
-        check_state = Qt.Checked if checked else Qt.Unchecked
+        check_state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for row in range(self.apple_music_playlist_list.count()):
             item = self.apple_music_playlist_list.item(row)
             if item:
@@ -11750,7 +12960,7 @@ class PlexPlaylistManager(QMainWindow):
                     item = QListWidgetItem(item_label)
                     item.setData(Qt.UserRole, playlist)
                     item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    item.setCheckState(Qt.Checked)
+                    item.setCheckState(Qt.CheckState.Checked)
                     self.apple_music_playlist_list.addItem(item)
 
             playlist_count = len(parsed.get("playlists", []))
@@ -11775,7 +12985,8 @@ class PlexPlaylistManager(QMainWindow):
             item = self.apple_music_playlist_list.item(row)
             if not item:
                 continue
-            if item.checkState() == Qt.Checked or item.isSelected():
+            item_checked = item.checkState() == Qt.CheckState.Checked
+            if item_checked or item.isSelected():
                 playlist_data = item.data(Qt.UserRole)
                 if isinstance(playlist_data, dict):
                     selected.append(playlist_data)
@@ -12186,9 +13397,13 @@ class PlexPlaylistManager(QMainWindow):
                     self.loading_dialog.update_progress(f"Importing '{playlist_name}'...", progress)
                 QApplication.processEvents()
 
-                temp_fd, temp_m3u_path = tempfile.mkstemp(prefix="syncra_apple_", suffix=".m3u")
+                safe_playlist_name = re.sub(r'[<>:"/\\\\|?*]+', '_', playlist_name).strip().rstrip('. ')
+                if not safe_playlist_name:
+                    safe_playlist_name = "Apple Playlist"
+                temp_dir = tempfile.mkdtemp(prefix="syncra_apple_")
+                temp_m3u_path = os.path.join(temp_dir, f"{safe_playlist_name}.m3u")
                 try:
-                    with os.fdopen(temp_fd, "w", encoding="utf-8", newline="\n") as handle:
+                    with open(temp_m3u_path, "w", encoding="utf-8", newline="\n") as handle:
                         handle.write("#EXTM3U\n")
                         for path_value in track_paths:
                             handle.write(f"{path_value}\n")
@@ -12207,6 +13422,11 @@ class PlexPlaylistManager(QMainWindow):
                     try:
                         if os.path.exists(temp_m3u_path):
                             os.remove(temp_m3u_path)
+                    except Exception:
+                        pass
+                    try:
+                        if os.path.isdir(temp_dir):
+                            os.rmdir(temp_dir)
                     except Exception:
                         pass
 
@@ -12556,12 +13776,18 @@ class PlexPlaylistManager(QMainWindow):
                 
                 try:
                     dialog = PlaylistEditorDialog(playlist, self.plex_server, self)
-                    
-                    if dialog.exec() == QDialog.Accepted:
-                        # Refresh playlist list after editing and invalidate cache for this playlist
-                        playlist_id = str(playlist.ratingKey)  # Convert to string
-                        self.playlist_cache.remove_playlist(playlist_id)
-                        self.fetch_playlists()
+                    dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                    if not hasattr(self, "_open_playlist_editors"):
+                        self._open_playlist_editors = []
+                    self._open_playlist_editors.append(dialog)
+                    dialog.finished.connect(
+                        lambda result, playlist_ref=playlist, dialog_ref=dialog: self._on_playlist_editor_finished(
+                            result,
+                            playlist_ref,
+                            dialog_ref,
+                        )
+                    )
+                    dialog.open()
                         
                 except Exception as dialog_error:
                     logging.error(f"Error opening playlist editor: {str(dialog_error)}")
@@ -12572,6 +13798,18 @@ class PlexPlaylistManager(QMainWindow):
         except Exception as e:
             logging.error(f"Error editing playlist: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to edit playlist: {str(e)}")
+
+    def _on_playlist_editor_finished(self, result, playlist, dialog):
+        try:
+            if hasattr(self, "_open_playlist_editors"):
+                self._open_playlist_editors = [editor for editor in self._open_playlist_editors if editor is not dialog]
+
+            if result == QDialog.DialogCode.Accepted:
+                playlist_id = str(playlist.ratingKey)
+                self.playlist_cache.remove_playlist(playlist_id)
+                self.fetch_playlists()
+        except Exception as e:
+            logging.error(f"Error finalizing playlist editor close: {str(e)}")
     
     def show_loading(self, message="Loading...", detail="Please wait...", can_cancel=False, cancel_callback=None, cancel_text="Cancel"):
         """Show loading dialog"""
@@ -14222,11 +15460,174 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     logging.info(f"Restored previously selected music library: {self.section_combo.currentText()}")
                 else:
                     logging.info(f"Auto-selected music library: {self.section_combo.currentText()}")
+                self.refresh_smart_match_cache_status()
+                if self.plex_server and bool(self.smart_match_settings.get("preload_on_connect", True)):
+                    QTimer.singleShot(0, lambda: self.start_smart_match_preload(force_rebuild=False, show_dialog=False))
             elif self.section_combo.count() == 0:
                 QMessageBox.warning(self, "No Music Sections", "No music library sections found in your Plex server.")
         except Exception as e:
             logging.error(f"Error populating library sections: {str(e)}", exc_info=True)
             QMessageBox.warning(self, "Section Error", f"Error loading library sections: {str(e)}")
+
+    def _current_smart_match_library_section(self):
+        if not self.plex_server or not hasattr(self, "section_combo"):
+            return None
+        section_id = self.section_combo.currentData()
+        if not section_id:
+            return None
+        try:
+            return self.plex_server.library.sectionByID(section_id)
+        except Exception:
+            return None
+
+    def refresh_smart_match_cache_status(self):
+        if not hasattr(self, "smart_match_cache_status_label"):
+            return
+        library_section = self._current_smart_match_library_section()
+        if not library_section:
+            self.smart_match_cache_status_label.setText("Status: No library selected")
+            if hasattr(self, "smart_match_cache_detail_label"):
+                self.smart_match_cache_detail_label.setText("Built: n/a • Indexed tracks: 0")
+            if hasattr(self, "smart_match_rebuild_btn"):
+                self.smart_match_rebuild_btn.setEnabled(False)
+            if hasattr(self, "smart_match_clear_btn"):
+                self.smart_match_clear_btn.setEnabled(False)
+            return
+
+        if getattr(self, "_startup_splash_active", False):
+            self._update_startup_progress("Checking Smart Match Cache...", 56)
+
+        session_key = _get_library_match_session_key(library_section)
+        meta = None
+        state = None
+        if session_key:
+            try:
+                meta = _get_smart_match_cache_store().get_meta(session_key)
+            except Exception:
+                meta = None
+            with _SYNCRA_LIBRARY_MATCH_BUILD_STATES_LOCK:
+                state = _SYNCRA_LIBRARY_MATCH_BUILD_STATES.get(session_key)
+
+        fingerprint = None
+        if meta:
+            try:
+                fingerprint = _probe_library_match_fingerprint(library_section)
+            except Exception:
+                fingerprint = None
+
+        if state and not state.get("event").is_set():
+            status_text = f"Status: Building • {state.get('message', 'Preparing Smart Match cache...')}"
+        elif meta and fingerprint and _library_fingerprint_matches(meta, fingerprint):
+            status_text = "Status: Ready"
+        elif meta:
+            status_text = "Status: Stale"
+        else:
+            status_text = "Status: Missing"
+        self.smart_match_cache_status_label.setText(status_text)
+
+        built_at = str(meta.get("built_at", "") or "n/a") if meta else "n/a"
+        row_count = int(meta.get("row_count", 0) or 0) if meta else 0
+        if hasattr(self, "smart_match_cache_detail_label"):
+            self.smart_match_cache_detail_label.setText(f"Built: {built_at} • Indexed tracks: {row_count:,}")
+        if hasattr(self, "smart_match_rebuild_btn"):
+            self.smart_match_rebuild_btn.setEnabled(True)
+        if hasattr(self, "smart_match_clear_btn"):
+            self.smart_match_clear_btn.setEnabled(bool(meta))
+        if getattr(self, "_startup_splash_active", False):
+            splash_message = status_text.replace("Status:", "Smart Match Cache:").strip()
+            self._update_startup_progress(splash_message, 66)
+
+    def on_library_section_changed(self):
+        self.last_section_id = self.section_combo.currentData() if hasattr(self, "section_combo") else None
+        if not self._suspend_settings_apply:
+            self.save_config()
+        self.refresh_smart_match_cache_status()
+        if self.plex_server and bool(self.smart_match_settings.get("preload_on_connect", True)):
+            QTimer.singleShot(0, lambda: self.start_smart_match_preload(force_rebuild=False, show_dialog=False))
+
+    def start_smart_match_preload(self, force_rebuild=False, show_dialog=False):
+        library_section = self._current_smart_match_library_section()
+        if not library_section:
+            self.refresh_smart_match_cache_status()
+            return
+
+        session_key = _get_library_match_session_key(library_section) or ""
+        existing_thread = getattr(self, "smart_match_preload_thread", None)
+        if existing_thread and existing_thread.isRunning():
+            if self.smart_match_preload_session_key == session_key and show_dialog:
+                self.smart_match_preload_show_dialog = True
+                self.show_loading("Smart Match Cache", "Preparing Smart Match cache...", can_cancel=True, cancel_callback=self.cancel_smart_match_preload, cancel_text="Cancel Build")
+            return
+
+        self.smart_match_preload_thread = SmartMatchIndexBuildThread(library_section, force_rebuild=force_rebuild, parent=self)
+        self.smart_match_preload_session_key = session_key
+        self.smart_match_preload_show_dialog = bool(show_dialog)
+        self.smart_match_preload_thread.progress_update.connect(self.on_smart_match_preload_progress)
+        self.smart_match_preload_thread.build_complete.connect(self.on_smart_match_preload_complete)
+        self.smart_match_preload_thread.build_error.connect(self.on_smart_match_preload_error)
+        self.smart_match_preload_thread.finished.connect(self.on_smart_match_preload_finished)
+        if show_dialog:
+            self.show_loading("Smart Match Cache", "Preparing Smart Match cache...", can_cancel=True, cancel_callback=self.cancel_smart_match_preload, cancel_text="Cancel Build")
+        self.smart_match_preload_thread.start()
+        self.refresh_smart_match_cache_status()
+
+    def on_smart_match_preload_progress(self, message, percentage):
+        if self.loading_dialog:
+            self.loading_dialog.update_progress(message, percentage)
+        self.statusBar().showMessage(message)
+        self.refresh_smart_match_cache_status()
+
+    def on_smart_match_preload_complete(self, result):
+        if self.loading_dialog and self.loading_dialog.windowTitle() == "Smart Match Cache":
+            self.hide_loading()
+        row_count = int(result.get("row_count", 0) or 0)
+        self.statusBar().showMessage(f"Smart Match cache ready ({row_count:,} tracks).", 4000)
+        self.refresh_smart_match_cache_status()
+
+    def on_smart_match_preload_error(self, error_message):
+        if self.loading_dialog and self.loading_dialog.windowTitle() == "Smart Match Cache":
+            self.hide_loading()
+        if str(error_message or "").strip().lower() != "smart matching canceled.":
+            logging.error(f"Smart Match preload failed: {error_message}")
+            if self.smart_match_preload_show_dialog:
+                QMessageBox.warning(self, "Smart Match Cache", f"Failed to build Smart Match cache:\n{error_message}")
+        self.refresh_smart_match_cache_status()
+
+    def on_smart_match_preload_finished(self):
+        self.smart_match_preload_thread = None
+        self.smart_match_preload_session_key = ""
+        self.smart_match_preload_show_dialog = False
+        self.refresh_smart_match_cache_status()
+
+    def cancel_smart_match_preload(self):
+        thread = getattr(self, "smart_match_preload_thread", None)
+        if thread and thread.isRunning():
+            thread.stop()
+        if self.loading_dialog:
+            self.loading_dialog.detail_label.setText("Cancel requested. Finishing current step...")
+            self.loading_dialog.cancel_button.setEnabled(False)
+
+    def clear_smart_match_cache(self):
+        library_section = self._current_smart_match_library_section()
+        if not library_section:
+            QMessageBox.warning(self, "Smart Match Cache", "Select a music library section first.")
+            return
+        session_key = _get_library_match_session_key(library_section)
+        if not session_key:
+            QMessageBox.warning(self, "Smart Match Cache", "Could not determine the current library cache key.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Clear Smart Match Cache",
+            "Clear the Smart Match cache for the current Plex music library?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        _clear_library_match_caches(library_section=library_section, session_key=session_key, clear_disk=True)
+        self.refresh_smart_match_cache_status()
+        self.statusBar().showMessage("Smart Match cache cleared.", 3000)
 
     def populate_sync_playlist_combo(self):
         """Populate the sync playlist combo box"""
@@ -15237,6 +16638,11 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     def _perform_smart_m3u_upload(self, m3u_path, playlist_name):
         """Upload M3U playlist using smart matching (for remote/NAS servers)"""
         try:
+            current_thread = getattr(self, "_smart_upload_thread", None)
+            if current_thread and current_thread.isRunning():
+                self.statusBar().showMessage("A smart match import is already running.")
+                QMessageBox.information(self, "Import In Progress", "Wait for the current smart match import to finish or cancel it first.")
+                return
             # Reset auto-skip flag for new upload
             self._auto_skip_uncertain = False
             self._smart_upload_progress_state = ("Preparing smart matching...", 0)
@@ -15308,6 +16714,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 cancel_callback=self.cancel_smart_upload,
                 cancel_text="Cancel Import",
             )
+            self._set_playlist_import_busy(True)
             if self.loading_dialog:
                 self.loading_dialog.setWindowTitle("Smart Match Import")
                 self.loading_dialog.progress_bar.setValue(0)
@@ -15321,10 +16728,17 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self._smart_upload_thread.start()
 
         except Exception as e:
+            self._set_playlist_import_busy(False)
             error_message = f"Failed to start smart M3U upload. Error: {str(e)}"
             self.statusBar().showMessage(error_message)
             QMessageBox.critical(self, "Import Error", error_message)
             logging.error(f"Smart M3U upload failed: {str(e)}")
+
+    def _set_playlist_import_busy(self, busy):
+        for attr_name in ("import_playlist_button", "import_browse_button"):
+            widget = getattr(self, attr_name, None)
+            if widget:
+                widget.setEnabled(not busy)
 
     def _on_smart_upload_progress(self, message, percentage):
         """Handle progress updates from smart upload thread"""
@@ -15364,16 +16778,20 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 self.loading_dialog.setWindowTitle("Smart Match Import")
                 self.loading_dialog.progress_bar.setValue(max(0, min(100, int(percentage))))
 
-    def _on_smart_upload_complete(self, matched_count, total_count, not_found_list):
+    def _on_smart_upload_complete(self, matched_count, total_count, not_found_list, matched_rating_keys):
         """Handle upload completion from thread"""
         try:
             self.hide_loading()
+            self._set_playlist_import_busy(False)
             playlist_name = self._pending_playlist_name
 
             # Create playlist with matched tracks
+            library_section_id = self.section_combo.currentData()
+            library_section = self.plex_server.library.sectionByID(library_section_id) if library_section_id else None
+            matched_tracks = _hydrate_plex_tracks_by_rating_keys(library_section, matched_rating_keys or []) if library_section else []
+            matched_count = len(matched_tracks)
             if matched_count > 0:
                 self.statusBar().showMessage(f"Creating playlist with {matched_count} tracks...")
-                matched_tracks = self._smart_upload_thread.matched_tracks
                 new_playlist = self.plex_server.createPlaylist(playlist_name, items=matched_tracks)
                 logging.info(f"Created playlist '{playlist_name}' with {matched_count} tracks")
 
@@ -15396,14 +16814,19 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 raise Exception("No tracks could be matched in your Plex library")
 
         except Exception as e:
+            self._set_playlist_import_busy(False)
             error_message = f"Failed to create playlist. Error: {str(e)}"
             self.statusBar().showMessage(error_message)
             QMessageBox.critical(self, "Import Error", error_message)
             logging.error(f"Smart M3U playlist creation failed: {str(e)}")
+        finally:
+            self._smart_upload_thread = None
 
     def _on_smart_upload_error(self, error_msg):
         """Handle error from smart upload thread"""
         self.hide_loading()
+        self._set_playlist_import_busy(False)
+        self._smart_upload_thread = None
         if str(error_msg or "").strip().lower() == "smart matching canceled.":
             self.statusBar().showMessage("Smart match import canceled.")
             return
@@ -16134,6 +17557,8 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         username = config.get('plex_username', '')
         self.plex_username_input.setText(username)
         self.feature_flags = config.get("features", APP_CONFIG_DEFAULTS.get("features", {})).copy()
+        self.smart_match_settings = config.get("smart_match", APP_CONFIG_DEFAULTS.get("smart_match", {})).copy()
+        _set_smart_match_runtime_settings(self.smart_match_settings)
         self.metadata_settings = config.get("metadata", APP_CONFIG_DEFAULTS.get("metadata", {})).copy()
         if hasattr(self, "metadata_fixer_feature_cb"):
             self.metadata_fixer_feature_cb.setChecked(self.feature_flags.get("metadata_fixer", False))
@@ -16256,6 +17681,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             QTimer.singleShot(0, self.connect_to_plex)
 
         self.refresh_feature_dependent_ui()
+        self.refresh_smart_match_cache_status()
 
     def save_config(self):
         """Save configuration while preserving existing settings"""
@@ -16317,6 +17743,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 "path_mappings": self.path_mappings,
                 "m3u_use_smart_matching": self.m3u_smart_matching_radio.isChecked(),
                 "features": self.feature_flags,
+                "smart_match": self.smart_match_settings,
                 "metadata": self.metadata_settings,
             })
             
@@ -16379,6 +17806,18 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             if self.server_sync_job_thread and self.server_sync_job_thread.isRunning():
                 self.server_sync_job_thread.terminate()
                 self.server_sync_job_thread.wait(3000)
+
+            if self.smart_match_preload_thread and self.smart_match_preload_thread.isRunning():
+                self.smart_match_preload_thread.stop()
+                self.smart_match_preload_thread.wait(3000)
+
+            if hasattr(self, 'name_fetch_thread') and self.name_fetch_thread and self.name_fetch_thread.isRunning():
+                self.name_fetch_thread.terminate()
+                self.name_fetch_thread.wait(2000)
+
+            if hasattr(self, 'converter_thread') and self.converter_thread and self.converter_thread.isRunning():
+                self.converter_thread.request_cancel()
+                self.converter_thread.wait(3000)
             
             # Stop track count loading threads
             for thread in list(self.track_count_threads.values()):
@@ -16606,8 +18045,13 @@ def main():
     initialize_config()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # This can help with some styling issues
-    ex = PlexPlaylistManager()
+    splash = StartupSplashScreen()
+    splash.show()
+    splash.update_progress("Starting Syncra...", 5)
+    ex = PlexPlaylistManager(startup_splash=splash)
     ex.show()
+    splash.finish_for(ex)
+    ex._startup_splash_active = False
     sys.exit(app.exec())
 
 if __name__ == '__main__':
