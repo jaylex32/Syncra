@@ -18,7 +18,7 @@ import socket
 import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.20.3"
+__version__ = "2.20.5"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -326,23 +326,56 @@ def _set_smart_match_runtime_settings(settings):
         _SYNCRA_SMART_MATCH_CACHE_STORE = None
 
 
+def _get_syncra_app_data_dir():
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        base_dir = os.path.join(local_app_data, "Syncra")
+    else:
+        base_dir = os.path.join(Path.home(), ".syncra")
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.abspath(base_dir)
+
+
 def _get_smart_match_cache_db_path():
     cache_name = str(_SYNCRA_SMART_MATCH_RUNTIME_SETTINGS.get("cache_db", "smart_match_cache.sqlite") or "smart_match_cache.sqlite").strip()
-    return os.path.abspath(cache_name)
+    if not cache_name:
+        cache_name = "smart_match_cache.sqlite"
+    if os.path.isabs(cache_name):
+        db_path = cache_name
+    else:
+        db_path = os.path.join(_get_syncra_app_data_dir(), cache_name)
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    return os.path.abspath(db_path)
 
 
 class SmartMatchCacheStore:
     def __init__(self, db_path):
-        self.db_path = db_path
+        self.db_path = os.path.abspath(db_path)
         self._ensure_schema()
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = sqlite3.connect(self.db_path, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
         return conn
 
-    def _ensure_schema(self):
+    def _recover_database(self, reason):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_path = self.db_path
+        for suffix in ("", "-wal", "-shm"):
+            target = f"{base_path}{suffix}"
+            if not os.path.exists(target):
+                continue
+            try:
+                backup = f"{target}.broken_{timestamp}"
+                os.replace(target, backup)
+            except Exception as move_error:
+                logging.warning(f"Could not quarantine Smart Match cache file {target}: {move_error}")
+        logging.warning(f"Recovered Smart Match cache database after error: {reason}")
+
+    def _ensure_schema_once(self):
         with self._connect() as conn:
             conn.execute(
                 """
@@ -378,16 +411,29 @@ class SmartMatchCacheStore:
                 "CREATE INDEX IF NOT EXISTS idx_smart_match_rows_session ON smart_match_rows(session_key)"
             )
 
+    def _ensure_schema(self):
+        try:
+            self._ensure_schema_once()
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+            self._recover_database(error)
+            self._ensure_schema_once()
+
     def get_meta(self, session_key):
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT session_key, server_id, section_id, track_total, newest_added_at,
-                       newest_updated_at, built_at, row_count
-                FROM smart_match_meta WHERE session_key = ?
-                """,
-                (session_key,),
-            ).fetchone()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT session_key, server_id, section_id, track_total, newest_added_at,
+                           newest_updated_at, built_at, row_count
+                    FROM smart_match_meta WHERE session_key = ?
+                    """,
+                    (session_key,),
+                ).fetchone()
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+            logging.warning(f"Smart Match cache meta read failed, resetting cache database: {error}")
+            self._recover_database(error)
+            self._ensure_schema_once()
+            return None
         if not row:
             return None
         return {
@@ -403,79 +449,102 @@ class SmartMatchCacheStore:
 
     def load_rows(self, session_key):
         rows = []
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                SELECT rating_key, title, artist, album, title_variants_json,
-                       exact_paths_json, suffix3_json, suffix2_json
-                FROM smart_match_rows
-                WHERE session_key = ?
-                """,
-                (session_key,),
-            )
-            for row in cursor.fetchall():
-                rows.append({
-                    "rating_key": str(row[0] or ""),
-                    "title": str(row[1] or ""),
-                    "artist": str(row[2] or ""),
-                    "album": str(row[3] or ""),
-                    "title_variants": json.loads(row[4] or "[]"),
-                    "exact_paths": json.loads(row[5] or "[]"),
-                    "suffix3": json.loads(row[6] or "[]"),
-                    "suffix2": json.loads(row[7] or "[]"),
-                })
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    SELECT rating_key, title, artist, album, title_variants_json,
+                           exact_paths_json, suffix3_json, suffix2_json
+                    FROM smart_match_rows
+                    WHERE session_key = ?
+                    """,
+                    (session_key,),
+                )
+                for row in cursor.fetchall():
+                    rows.append({
+                        "rating_key": str(row[0] or ""),
+                        "title": str(row[1] or ""),
+                        "artist": str(row[2] or ""),
+                        "album": str(row[3] or ""),
+                        "title_variants": json.loads(row[4] or "[]"),
+                        "exact_paths": json.loads(row[5] or "[]"),
+                        "suffix3": json.loads(row[6] or "[]"),
+                        "suffix2": json.loads(row[7] or "[]"),
+                    })
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+            logging.warning(f"Smart Match cache row load failed, resetting cache database: {error}")
+            self._recover_database(error)
+            self._ensure_schema_once()
+            return []
         return rows
 
     def save_rows(self, session_key, fingerprint, rows):
         built_at = datetime.now().isoformat()
-        with self._connect() as conn:
-            conn.execute("DELETE FROM smart_match_rows WHERE session_key = ?", (session_key,))
-            conn.execute("DELETE FROM smart_match_meta WHERE session_key = ?", (session_key,))
-            conn.executemany(
-                """
-                INSERT INTO smart_match_rows (
-                    session_key, rating_key, title, artist, album, title_variants_json,
-                    exact_paths_json, suffix3_json, suffix2_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        session_key,
-                        str(row.get("rating_key", "") or ""),
-                        str(row.get("title", "") or ""),
-                        str(row.get("artist", "") or ""),
-                        str(row.get("album", "") or ""),
-                        json.dumps(list(row.get("title_variants", []) or [])),
-                        json.dumps(list(row.get("exact_paths", []) or [])),
-                        json.dumps(list(row.get("suffix3", []) or [])),
-                        json.dumps(list(row.get("suffix2", []) or [])),
+        payload_rows = [
+            (
+                session_key,
+                str(row.get("rating_key", "") or ""),
+                str(row.get("title", "") or ""),
+                str(row.get("artist", "") or ""),
+                str(row.get("album", "") or ""),
+                json.dumps(list(row.get("title_variants", []) or [])),
+                json.dumps(list(row.get("exact_paths", []) or [])),
+                json.dumps(list(row.get("suffix3", []) or [])),
+                json.dumps(list(row.get("suffix2", []) or [])),
+            )
+            for row in rows
+        ]
+        meta_row = (
+            session_key,
+            str(fingerprint.get("server_id", "") or ""),
+            str(fingerprint.get("section_id", "") or ""),
+            int(fingerprint.get("track_total", 0) or 0),
+            str(fingerprint.get("newest_added_at", "") or ""),
+            str(fingerprint.get("newest_updated_at", "") or ""),
+            built_at,
+            len(rows),
+        )
+        for attempt in range(2):
+            try:
+                with self._connect() as conn:
+                    conn.execute("DELETE FROM smart_match_rows WHERE session_key = ?", (session_key,))
+                    conn.execute("DELETE FROM smart_match_meta WHERE session_key = ?", (session_key,))
+                    conn.executemany(
+                        """
+                        INSERT INTO smart_match_rows (
+                            session_key, rating_key, title, artist, album, title_variants_json,
+                            exact_paths_json, suffix3_json, suffix2_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        payload_rows,
                     )
-                    for row in rows
-                ],
-            )
-            conn.execute(
-                """
-                INSERT INTO smart_match_meta (
-                    session_key, server_id, section_id, track_total, newest_added_at,
-                    newest_updated_at, built_at, row_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_key,
-                    str(fingerprint.get("server_id", "") or ""),
-                    str(fingerprint.get("section_id", "") or ""),
-                    int(fingerprint.get("track_total", 0) or 0),
-                    str(fingerprint.get("newest_added_at", "") or ""),
-                    str(fingerprint.get("newest_updated_at", "") or ""),
-                    built_at,
-                    len(rows),
-                ),
-            )
+                    conn.execute(
+                        """
+                        INSERT INTO smart_match_meta (
+                            session_key, server_id, section_id, track_total, newest_added_at,
+                            newest_updated_at, built_at, row_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        meta_row,
+                    )
+                return
+            except (sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+                if attempt == 0:
+                    logging.warning(f"Smart Match cache write failed, resetting cache database: {error}")
+                    self._recover_database(error)
+                    self._ensure_schema_once()
+                    continue
+                raise
 
     def clear_library(self, session_key):
-        with self._connect() as conn:
-            conn.execute("DELETE FROM smart_match_rows WHERE session_key = ?", (session_key,))
-            conn.execute("DELETE FROM smart_match_meta WHERE session_key = ?", (session_key,))
+        try:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM smart_match_rows WHERE session_key = ?", (session_key,))
+                conn.execute("DELETE FROM smart_match_meta WHERE session_key = ?", (session_key,))
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+            logging.warning(f"Smart Match cache clear failed, resetting cache database: {error}")
+            self._recover_database(error)
+            self._ensure_schema_once()
 
 
 def _get_smart_match_cache_store():
@@ -807,6 +876,7 @@ def _build_library_match_indexes(library_section, progress_cb=None, force_rebuil
         processed = 0
         rows = []
 
+        build_span = max(progress_range[1] - progress_range[0] - 2, 1)
         while True:
             if stop_check and stop_check():
                 raise RuntimeError("Smart matching canceled.")
@@ -819,7 +889,8 @@ def _build_library_match_indexes(library_section, progress_cb=None, force_rebuil
                 if row:
                     rows.append(row)
             processed += len(track_elements)
-            pct = progress_range[0] + int((processed / max(total_tracks or processed, 1)) * max(progress_range[1] - progress_range[0], 1))
+            pct = progress_range[0] + int((processed / max(total_tracks or processed, 1)) * build_span)
+            pct = min(progress_range[1] - 2, pct)
             message = f"Building Smart Match Index ({processed:,} / {max(total_tracks, processed):,})"
             active_state["message"] = message
             active_state["progress"] = pct
@@ -829,6 +900,9 @@ def _build_library_match_indexes(library_section, progress_cb=None, force_rebuil
 
         bundle = _build_bundle_from_rows(rows)
         _store_library_match_bundle(library_section, bundle, fingerprint=fingerprint)
+        active_state["message"] = "Finalizing Smart Match Index..."
+        active_state["progress"] = max(progress_range[0], progress_range[1] - 1)
+        report(active_state["message"], active_state["progress"])
         if persist_cache:
             try:
                 _get_smart_match_cache_store().save_rows(session_key, fingerprint, rows)
@@ -836,6 +910,7 @@ def _build_library_match_indexes(library_section, progress_cb=None, force_rebuil
                 logging.warning(f"Could not persist Smart Match cache: {cache_error}")
         active_state["message"] = f"Smart Match index ready ({len(rows):,} tracks)"
         active_state["progress"] = progress_range[1]
+        report(active_state["message"], active_state["progress"])
         return bundle
     except Exception as exc:
         active_state["error"] = str(exc)
@@ -13816,6 +13891,7 @@ class PlexPlaylistManager(QMainWindow):
         if not self.loading_dialog:
             self.loading_dialog = LoadingDialog(self)
         
+        self.loading_dialog.setWindowTitle(message or "Loading...")
         self.loading_dialog.message_label.setText(message)
         self.loading_dialog.detail_label.setText(detail)
         self.loading_dialog.progress_bar.setValue(0)
@@ -15508,19 +15584,12 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             with _SYNCRA_LIBRARY_MATCH_BUILD_STATES_LOCK:
                 state = _SYNCRA_LIBRARY_MATCH_BUILD_STATES.get(session_key)
 
-        fingerprint = None
-        if meta:
-            try:
-                fingerprint = _probe_library_match_fingerprint(library_section)
-            except Exception:
-                fingerprint = None
-
         if state and not state.get("event").is_set():
             status_text = f"Status: Building • {state.get('message', 'Preparing Smart Match cache...')}"
-        elif meta and fingerprint and _library_fingerprint_matches(meta, fingerprint):
+        elif meta and _restore_library_match_bundle(library_section):
             status_text = "Status: Ready"
         elif meta:
-            status_text = "Status: Stale"
+            status_text = "Status: Cached"
         else:
             status_text = "Status: Missing"
         self.smart_match_cache_status_label.setText(status_text)
@@ -15575,17 +15644,18 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         if self.loading_dialog:
             self.loading_dialog.update_progress(message, percentage)
         self.statusBar().showMessage(message)
-        self.refresh_smart_match_cache_status()
+        if hasattr(self, "smart_match_cache_status_label"):
+            self.smart_match_cache_status_label.setText(f"Status: Building • {message}")
 
     def on_smart_match_preload_complete(self, result):
-        if self.loading_dialog and self.loading_dialog.windowTitle() == "Smart Match Cache":
+        if self.loading_dialog:
             self.hide_loading()
         row_count = int(result.get("row_count", 0) or 0)
         self.statusBar().showMessage(f"Smart Match cache ready ({row_count:,} tracks).", 4000)
         self.refresh_smart_match_cache_status()
 
     def on_smart_match_preload_error(self, error_message):
-        if self.loading_dialog and self.loading_dialog.windowTitle() == "Smart Match Cache":
+        if self.loading_dialog:
             self.hide_loading()
         if str(error_message or "").strip().lower() != "smart matching canceled.":
             logging.error(f"Smart Match preload failed: {error_message}")

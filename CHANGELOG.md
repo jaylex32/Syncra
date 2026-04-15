@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.20.5 - 2026-04-14
+### 🛠️ Smart Match Cache Stability Hotfix
+- Fixed Smart Match cache database handling so broken cache files no longer prevent Syncra from opening on some systems.
+- Moved relative Smart Match cache storage into local app data for more reliable binary and server behavior.
+- Fixed Smart Match rebuild UI freezes caused by repeated cache-status probing on the main thread.
+- Fixed Smart Match rebuild completion flow so the final dialog closes correctly after indexing finishes.
+- Improved Smart Match rebuild progress reporting with a clear finalization step instead of appearing stuck at 100%.
+
 ## v2.20.3 - 2026-04-12
 ### 🚀 Smart Match Performance, Spotify Import Recovery, and Editor UX
 - Replaced session-only Smart Match indexing with a persistent on-disk cache, including restart reuse, library fingerprint validation, and Settings controls to rebuild or clear the cache.
@@ -7,7 +15,7 @@
 - Added a Syncra startup splash screen with live boot progress and Smart Match cache-check visibility for a more professional app launch experience.
 - Fixed Smart Match import state handling so playlist creation always uses the completed worker result set and no longer fails with empty-item playlist creation errors.
 - Improved Smart Match preload and shutdown behavior with cleaner cancellation and thread cleanup.
-- Reworked Spotify playlist import to use the Spotify web client playlist endpoint for track IDs and public track-page metadata extraction for enrichment, avoiding blocked or unstable Spotify API routes in current environments.
+- Fixed Spotify playlist import reliability and recovery for environments where track loading was failing.
 - Fixed multiple Spotify import failure modes, including broken pagination loops, misleading loading states, and converter-thread integration issues during Plex playlist creation.
 - Fixed Apple Music XML temp playlist naming so imported Plex playlists keep the original Apple playlist name instead of leaking random temp-file names.
 - Improved Playlist Editor responsiveness while loading by moving heavy metadata preparation off the UI thread and rendering rows incrementally.
