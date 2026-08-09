@@ -101,3 +101,23 @@ secrets/
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
+
+# Credential caches. .spotify_oauth_cache holds a live access token.
+.spotify_oauth_cache
+
+# Local caches and databases written at runtime
+smart_match_cache.sqlite
+syncra_library_data.sqlite
+cover_cache/
+
+# Local working data and build output
+Backup/
+releases/
+playlist_temp/
+playlist_full.json
+spotlistr_js/
+spotlistr_page.html
+duplicate_deletion_log_*.txt
+
+# Editor workspace
+*.code-workspace

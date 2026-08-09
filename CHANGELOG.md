@@ -1,5 +1,125 @@
 # Changelog
 
+## v2.21.0 - 2026-08-09
+
+A cover-art overhaul of the Playlists and Sync Manager pages, playlist renaming, Sonic
+Discovery, a headless sync CLI, a much faster duplicate scan, and a set of startup and
+logging fixes — including one that meant the application log file was never written.
+
+### 🪵 Logging and Startup Noise
+- **Fixed: the log file was never written.** Importing the main module constructs the credential manager at module scope, which logs — and a logging call with no handlers installed makes Python run `basicConfig()` implicitly. By the time `setup_logging()` ran, the root logger already had a handler, and `basicConfig()` is documented to do *nothing* in that case. So the `FileHandler` was never installed: `plex_playlist_manager.log` stayed empty, and every diagnostic the app thought it was recording went nowhere.
+- **Fixed: every console line printed twice**, once as `WARNING:root:...` and once timestamped — the two handlers left behind by the same problem.
+- **Fixed: two "Skipping save_config()" warnings on every launch.** Loading the configuration sets the M3U matching checkboxes, whose change handler saves — which ran before the load had finished, tripping the guard that protects against overwriting settings with empty defaults. Saving is now suspended for the duration of a load, so the signals fired while populating widgets no longer try to write back what was just read. The guard itself is unchanged and still fires outside a load.
+
+### 🏷️ Rename Playlists
+- **Added renaming for existing playlists** — right-click a cover, or press **F2**. The app previously had no way to rename a playlist at all; the only "Rename" prompts were import-time collision dialogs offering to rename an *incoming* playlist before uploading it.
+- **A rename carries its sync configuration with it.** Sync configurations are keyed by playlist name, so renaming without updating the configuration would have silently orphaned it and the next sync would look for a playlist that no longer exists.
+- Duplicate names are refused, surrounding whitespace is collapsed (Plex keeps padding, which makes two playlists look identical in a list), and a server refusal is reported rather than leaving the UI showing a name that was never applied.
+- Uses `editTitle()`; `Playlist.edit()` is deprecated in plexapi 4.17 and emits a warning. Verified against Plex 1.43.3.
+
+### 🔄 Sync Manager Rebuild
+- **Two-column layout.** The page was a single stack of six cards, so on a wide monitor the configuration table was a few rows tall with everything else pushed off-screen. Configurations and manual actions now take the main column while automation settings and the log move into a side column, and the progress bar spans the full width beneath both.
+- **A summary strip across the top** — configured count, auto-sync state, next scheduled run, and last successful sync — so the page answers "is anything actually syncing?" without reading four separate cards.
+- **Playlist cover art in each row**, reusing the Playlists page's cache, plus a colour-coded service badge for Spotify, Deezer, TIDAL, ListenBrainz and local files.
+- **Fixed: the Delete button was clipped.** Source and Actions were both set to stretch, so they fought over the same space. Source is now the only stretch column, and sections have a minimum width so it can no longer collapse to 47px.
+- **Fixed: per-row buttons were hardcoded Material green and red** — the one palette the rest of the app never uses. They take the shared primary and danger variants now, and fit the row height instead of overflowing it.
+- Row-building code existed in three near-identical copies; they now share one `add_sync_config_row`.
+- Automatic Sync stacks its label and field like Scheduled Sync does, instead of clipping its own checkbox label in the narrower column.
+
+### 🖼️ Playlists as a Cover Wall
+- **The Playlists page is now a grid of album art** instead of a column of "Title (N tracks)" strings. Each playlist is a card with its Plex poster, its name, and its size and playing time.
+- **Track counts and durations appear immediately.** `leafCount` and `duration` already arrive with the playlist listing, so "138 tracks · 9h 7m" is shown for free on first paint — the old "click to load tracks..." placeholder was only ever there because the count was assumed to be unknown until you clicked.
+- **Covers load in the background and are cached on disk.** A poster is ~29KB and ~126ms from the server, so a 60-playlist wall would be about 7.5s of network time on every visit. They are now fetched four at a time and re-read from a bounded LRU cache afterwards, so later visits paint instantly. The cache key ignores the Plex token, so signing in again does not invalidate it. "Clear Cache" clears the art too.
+- **Playlists with no artwork get a generated tile** — a gradient derived from the title with the playlist's initials — so the wall never has holes in it. The colours are stable for a given playlist between launches.
+- **Tiles stretch to fill the window.** Qt's icon grid uses fixed cells and leaves whatever does not divide evenly as a dead column on the right; the grid now recomputes its cell size so the covers stay flush with both edges at any width, and re-tiles when the scrollbar appears rather than being left one column short.
+- **Covers shrink as the window narrows**, so a small window shows more of them rather than two oversized tiles. Column count is chosen by rounding rather than flooring, with a floor on how small a cover may get.
+- **Fixed: the Playlists page could not be narrowed at all.** One long non-wrapping label gave it a ~1500px minimum width, and the five action buttons in a plain row added their widths together for another ~980px, so narrowing the window produced a horizontal scrollbar instead of a reflow. The label wraps and the actions use a flow layout that wraps onto a second line; the page's minimum is now 411px and the grid actually reflows.
+- Added a **filter box** and a **Grid / List** switch; the choice is remembered. List mode is the previous compact view, and it skips downloading art nobody is going to see.
+- Selection is unchanged: tick the box on a cover to include it in delete, export and sync actions.
+- **Fixed: a ticked row was invisible.** The theme styled `QCheckBox::indicator` but nothing for item views, and once a stylesheet is active Qt stops drawing the native checkmark — so a checked playlist looked exactly like an unchecked one. This affected every checkable list and tree in the app, not just the Playlists page.
+
+### 📦 Packaging and Window Identity
+- **Fixed: dialogs without an explicit title showed "python".** Nothing set `QApplication.applicationName()`, so Qt fell back to the executable basename — visible on the duplicate-deletion progress window. The app now sets its name, display name and organisation at startup, which fixes the fallback for every window.
+- **Fixed: the window icon never loaded in a build.** It was loaded as `QIcon('Syncra Icon.ico')` — a bare relative path that resolves against the working directory — and the file was not in the PyInstaller `datas` at all, only set as the executable's own file icon. It is now bundled and loaded through `resource_path()`, and applied to the QApplication so every dialog inherits it.
+- **Fixed: `resource_path()` fell back to the current working directory**, so bundled resources only resolved when the app happened to be launched from the project root. It now derives the project root from the module location.
+- The deletion progress window has an explicit title and icon.
+
+### 🔍 Library Duplicate Scan
+- **Roughly 30x faster.** The scan made two HTTP round trips for every track — `track.artist()` and `track.album()`, measured at 25ms and 20ms against a live server — to read names the search response already contained. On a 14,753-track library that alone was about 11 minutes; it is now free via `grandparentTitle` / `parentTitle`.
+- **Playlist membership is indexed once.** It previously re-fetched every playlist's contents for every duplicate track (60 playlists x 71ms = 4.2s *per track*, so minutes to hours on a real result set). One pass now builds a ratingKey lookup and every track is answered from it.
+- A full scan of a 14,753-track library with playlist checking now takes **~72 seconds** and finds 1,976 duplicate groups.
+- Added a **Stop and Show Results** button. Stopping keeps everything found so far and opens the manager with it, instead of discarding the work.
+- Duplicate matching now uses the same fingerprint as Match Memory and Missing Tracks, so remaster suffixes, featured-artist credits and punctuation no longer hide a duplicate.
+- Groups are ordered largest first, so the worst offenders are at the top.
+- Closing the app during a scan now asks the thread to stop before falling back to `terminate()`, which could previously kill it mid-request.
+- **Rebuilt the results screen.** It was rendering in hardcoded white and light green against the dark app, with near-invisible text, and gave each track a ~230px card so only two or three copies fitted on screen. It is now a themed tree with one row per track, showing album, quality, size, duration, playlists and file path in sortable columns, plus a filter box and expand/collapse.
+- Building the results at real scale (1,976 groups) went from **6.4s to 0.11s** by inserting tree rows in bulk instead of one at a time.
+- **Fixed: bitrate always showed "Unknown".** `track.bitrate` is always None; the value lives on the Media element. The quality ranking behind "keep the best copy" was therefore comparing zeroes, and now compares real bitrates and codecs.
+- **Fixed: Auto-Select never ticked anything.** `update_ui_selections()` was an empty stub, so the count changed but every checkbox stayed clear.
+- Sizes are formatted per unit, so a large total reads "101.8 GB" rather than "~104199.7MB".
+
+### 🎧 Sonic Discovery
+- Added playlist generation driven by **Plex's own audio analysis** of your library. Nothing is sent to an external service and there are no rate limits — the server already knows what your files sound like.
+  - **More Like This** — seed with **one track or many**, and get a blended mix, with a similarity control from "Very close" to "Adventurous".
+    Plex's `/nearest` endpoint answers per track, so several seeds are merged client-side with reciprocal rank fusion: a track sitting near *several* seeds outranks one sitting very near a single seed, which makes the result sound like the set rather than like whichever seed was queried first. A seed that fails or has no neighbours is skipped and reported rather than sinking the whole mix.
+  - **Sonic Adventure** — pick a start and an end track and Plex plots the gradual path between them.
+- The result is an **editable playlist workbench**, not a fixed list:
+  - **Lock** any track and press Generate again — locked rows stay put while the rest reshuffles.
+  - **Variety** control: *Focused* reproduces the same mix every time, *Balanced* and *Surprising* sample a widening window so each Generate gives something new.
+  - **Remove**, **Move Up/Down**, **Shuffle** and **Add From Search** to hand-finish the list before saving.
+  - **Hide repeats of the same song** collapses a recording that exists on a single, an album and a compilation into one entry. Deduplicating on Plex ratingKey alone missed these, which is why duplicates were showing up.
+  - Running total of track count and playing time, and the saved playlist is whatever is on screen, including manual edits.
+- The dialog is laid out in **two columns** — controls in a fixed-width panel on the left, the playlist filling the right — behind a draggable splitter. Stacking everything vertically had given the setup card most of the window and left the playlist showing two rows, so seeing the result meant scrolling or making the window very tall.
+- Both are available from Tools & Utilities, and **Find Similar Tracks…** was added to the track right-click menu in the Playlist Editor. The editor already allowed multi-select, so every highlighted row becomes a seed and the menu says how many.
+- Results are previewed in a table before anything is written; saving creates a normal Plex playlist.
+- Generation runs on a worker thread — on a large library Plex can take several seconds and the dialog previously would have appeared frozen.
+- Track selection is a **search-as-you-type picker that matches artists and albums, not just track titles** — typing "cosa nuestra" finds the album's tracks, "feid" finds that artist's tracks, even where the text appears in neither track title. Built on Plex's unified `hubSearch` (~67ms against a live library, versus ~1270ms for an `artist.title` track filter), with artist and album hits expanded into their tracks. Keystrokes are debounced into a single request and out-of-order responses from a slower earlier query are discarded.
+- Similarity presets are anchored on the server's own default (`maxDistance=0.25`, per the PMS API docs for `/library/metadata/{id}/nearest`) rather than a guessed value.
+- Verified against Plex 1.43.3. Artist-level `station()`, `popularTracks()` and `sonicallySimilar()` return nothing usable on that version — the artist-radio endpoint 404s even when requested directly with a correctly formed URL — so nothing depends on them. When a library has not been analysed, the dialog explains how to fix it instead of failing silently.
+### ⌨️ Headless Sync (CLI)
+- Added a command-line entry point so syncs can run without opening the app, driven by Task Scheduler, cron, systemd, or a container next to Plex. Previously auto-sync only ran while the main window was open, which made the Sync Manager's intervals and schedules ineffective once you closed it.
+  - `syncra --list` — show sync configurations and their last run
+  - `syncra --sync-all` — sync every configured playlist
+  - `syncra --sync "Name"` — sync one playlist (repeatable)
+  - `--dry-run` — resolve and diff without writing to Plex
+  - `--json` — machine-readable output for logging
+  - `-v` — stream per-track progress to stderr
+  - `--log-file PATH` — append output to a file, for scheduled runs with no console
+- Headless runs write to the same sync-history database as the app, so they appear in Sync History and can be reverted from the UI. Unmatched tracks are added to Missing Tracks exactly as they are from a manual run.
+- **Fixed: the CLI produced no output at all from the packaged binary.** Syncra is built with PyInstaller `--windowed`, which yields a GUI-subsystem executable whose `stdout`/`stderr` are `None`, so every message was silently discarded. The CLI now attaches to the calling terminal's console on Windows, and `--log-file` covers runs that have no console at all.
+- Exit codes: `0` success, `1` failure, `2` partial (some playlists synced, some failed).
+- **Fixed: Track Matching Filters were never saved.** The smart-filter options existed only as checkbox state, so every launch silently reset them to defaults. They are now stored under `match_filters` in `app_config.json` and restored on load.
+- Decoupled the sync engine from the UI: the M3U matching mode, ListenBrainz token, and matching filters are resolved into a `SyncOptions` value object at the start of a run instead of being read off parent widgets mid-sync. This is what makes a GUI-less run possible, and makes the sync path testable for the first time.
+### 🚑 Startup Reliability
+- **Fixed the app hanging on the loading screen when saved Plex credentials stopped working.** Auto-connect was being dispatched during window construction (the splash screen's `processEvents()` call fired the pending zero-delay timer early), so a rejected token opened an error dialog parented to a window that had not been shown yet. That dialog started a nested modal loop behind the always-on-top splash, where it was invisible and un-dismissable, and the main window could never finish loading.
+- Auto-connect now runs only after the main window is visible and the splash has closed.
+- Connection failures are now classified with actionable guidance instead of a raw exception string: rejected credentials, connection timeout, unreachable host, and wrong endpoint each get their own message.
+- A rejected token is cleared automatically, and the app jumps to the Connection page so the next launch asks for credentials instead of failing silently forever. A network failure no longer discards a working token.
+- Connection problems now appear in a persistent banner on the Connection page rather than only in a modal dialog.
+- Added a 10-second Plex connection timeout (plexapi defaults to 30s per request), so an unreachable or renamed server fails fast instead of appearing frozen.
+- Startup errors of any kind now close the splash and report, instead of leaving it stranded on screen.
+- Fixed log records containing emoji being silently dropped on Windows by forcing UTF-8 on the log file handler.
+
+### 🎯 Missing Tracks
+- Added a **Missing Tracks** workspace (Tools & Utilities) that accumulates every track an import or sync could not find, deduplicated across runs, with the playlists that wanted it and a request counter.
+- Added **Re-check Library**, which re-runs the matcher over the whole list after you add music and marks anything now present as resolved.
+- Added per-track resolve / ignore / remove actions, text and CSV export for use as a shopping list, and clipboard copy.
+- Unmatched tracks are now captured from M3U smart imports, streaming imports, and playlist syncs, instead of being shown once in a truncated dialog and discarded.
+- Added a Missing Tracks count to the Home dashboard.
+
+### 🧠 Match Memory
+- Syncra now remembers manual match corrections. Confirming or picking a track in the match dialogs stores that decision, and later imports of the same track resolve the same way without asking again.
+- Remembered decisions also cover "this track is not in my library", so known-missing tracks stop being re-guessed.
+- Decisions are scoped per Plex library and survive formatting differences in the source (remaster suffixes, featured-artist credits, punctuation).
+- Stale decisions pointing at deleted tracks fall back to normal scoring automatically.
+- Added a **Match Memory** dialog (Tools & Utilities) to review, count usage of, and forget learned decisions.
+
+### 🕘 Sync Preview, History, and Revert
+- Added **Preview Changes** to the Sync Manager: resolves every source track and reports exactly what would be added, removed, and left unmatched, without writing anything to Plex.
+- Every sync run now records the playlist contents before and after it ran.
+- Added a **Sync History** dialog with a per-run diff of added and removed tracks.
+- Added **Revert This Run**, which restores a playlist to its contents from before a sync — a safety net for `Clear on Sync`. Reverts abort safely rather than clearing a playlist they cannot restore.
+
 ## v2.20.5 - 2026-04-14
 ### 🛠️ Smart Match Cache Stability Hotfix
 - Fixed Smart Match cache database handling so broken cache files no longer prevent Syncra from opening on some systems.

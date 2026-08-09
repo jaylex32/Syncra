@@ -17,12 +17,20 @@ APP_CONFIG_DEFAULTS = {
     "apple_music_xml_path": "",
     "apple_music_import_ratings": True,
     "last_section": None,
+    "playlist_view_mode": "grid",
     "auto_backup": True,
     "backup_interval": 24,
     "features": {
         "metadata_fixer": False,
         "ui_refresh_v2": False,
         "auto_fetch_playlists_on_startup": False,
+    },
+    "match_filters": {
+        "enabled": True,
+        "avoid_live": True,
+        "avoid_compilation": True,
+        "deprioritize_remaster": False,
+        "deprioritize_deluxe": False,
     },
     "smart_match": {
         "persist_cache": True,

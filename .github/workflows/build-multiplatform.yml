@@ -53,22 +53,22 @@ jobs:
     - name: Build executable (Windows)
       if: matrix.os == 'windows-latest'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra-Windows" --icon="Syncra Icon.ico" --add-data "assets;assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        pyinstaller --onefile --windowed --name="Syncra-Windows" --icon="Syncra Icon.ico" --add-data "assets;assets" --add-data "Syncra Icon.ico;." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (Linux)
       if: matrix.os == 'ubuntu-latest'
       run: |
-        xvfb-run -a pyinstaller --onefile --windowed --name="Syncra-Linux" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        xvfb-run -a pyinstaller --onefile --windowed --name="Syncra-Linux" --add-data "assets:assets" --add-data "Syncra Icon.ico:." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (macOS Apple Silicon)
       if: matrix.name == 'macOS-AppleSilicon'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra-macOS-AppleSilicon" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        pyinstaller --onefile --windowed --name="Syncra-macOS-AppleSilicon" --add-data "assets:assets" --add-data "Syncra Icon.ico:." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (macOS Intel)
       if: matrix.name == 'macOS-Intel'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra-macOS-Intel" --add-data "assets:assets" --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        pyinstaller --onefile --windowed --name="Syncra-macOS-Intel" --add-data "assets:assets" --add-data "Syncra Icon.ico:." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: List build output (Windows)
       if: matrix.os == 'windows-latest'

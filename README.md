@@ -18,8 +18,14 @@
 
 ## ✨ Features
 
+- 🖼️ **Cover-art playlist wall** — browse your playlists as posters with track counts and playing time, with a filter box and a compact list view when you want one. Rename any playlist with F2 or the right-click menu
+- 🔄 **Sync Manager** with cover art, per-service badges, and an at-a-glance summary of what is configured and when it last ran
 - 🎛️ **Advanced Playlist Editor** with search, filtering, and drag-and-drop reordering
 - 🔄 **Auto-Sync** from Spotify, Deezer, Tidal, and ListenBrainz playlists
+- 🎧 **Sonic Discovery** — build playlists from Plex's own audio analysis: "More Like This" from any track, or a **Sonic Adventure** that plots the gradual path between two tracks. Entirely local, no external service
+- 🎯 **Missing Tracks workspace** - a running, deduplicated list of everything your imports couldn't find, with re-check and CSV export
+- 🧠 **Match Memory** - Syncra learns from your manual match corrections and stops asking twice
+- 👁️ **Sync Preview & Revert** - see exactly what a sync will change before it runs, and undo it afterwards
 - 🔀 **Playlist Merger** with intelligent duplicate detection
 - 🛠️ **Tools & Utilities** including backup, restore, and library analysis
 - 🧬 **File Metadata Fixer** (feature-flagged) using MusicBrainz + Cover Art Archive proposals
@@ -47,10 +53,42 @@ Get the latest version for your platform from the [Releases](https://github.com/
 ## 🎯 Quick Start
 
 1. **Connect to Plex**: Enter your server details in the Connection tab
-2. **Fetch Playlists**: Click "Fetch Playlists" to load your collection
-3. **Edit Playlists**: Double-click any playlist to open the advanced editor
+2. **Fetch Playlists**: Click "Fetch Playlists" to load your collection as a wall of cover art
+3. **Edit Playlists**: Double-click any cover to open the advanced editor; tick the box on a cover to include it in delete, export and sync actions
 4. **Sync from Streaming**: Paste Spotify/Deezer/Tidal/ListenBrainz URLs to auto-sync
 5. **Explore Tools**: Check out the Tools & Utilities for advanced features
+
+## ⌨️ Headless Sync (CLI)
+
+Run syncs without opening the app — for Task Scheduler, cron, systemd, or a container
+alongside Plex. Configure your playlists once in the Sync Manager, then:
+
+```bash
+syncra --list                    # show configs and last run
+syncra --sync-all                # sync everything
+syncra --sync "Baila Reggaeton"  # sync one playlist (repeatable)
+syncra --sync-all --dry-run      # preview changes, write nothing
+syncra --sync-all --json         # machine-readable output
+syncra --sync-all --log-file sync.log   # append output to a file
+```
+
+Running from source, use `python main.py --sync-all`.
+
+Headless runs are recorded in the same history the app reads, so they show up in
+**Sync History** and can be reverted from the UI. Exit codes: `0` success, `1` failure,
+`2` partial (some playlists synced, some failed).
+
+**Windows Task Scheduler example** — sync every night at 3am:
+
+```
+Program:   C:\Path\To\Syncra-Windows.exe
+Arguments: --sync-all --log-file "%LOCALAPPDATA%\Syncra\sync.log"
+```
+
+> **Use `--log-file` for scheduled runs.** Syncra ships as a windowed executable, so
+> when it is launched without a terminal there is nowhere for it to print. The sync
+> still runs correctly, but you would have no record of it. Run from a terminal and
+> output appears normally — the CLI attaches to the calling console.
 
 ## 🔄 Auto-Sync Setup
 

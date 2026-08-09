@@ -18,10 +18,11 @@ import socket
 import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.20.5"
+__version__ = "2.21.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
+from plexapi.exceptions import BadRequest, NotFound, Unauthorized
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QFileDialog, QListWidget,
                              QCheckBox, QListWidgetItem, QProgressBar, QTextEdit,
@@ -29,9 +30,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
                              QSplitter, QTabWidget, QSpinBox, QDateTimeEdit, QSlider, QDoubleSpinBox,
                              QFormLayout, QGridLayout, QScrollArea, QFrame, QInputDialog, QMenu, QProgressDialog,
-                             QButtonGroup, QRadioButton, QStyle)
-from PyQt6.QtCore import QThread, pyqtSignal, QTimer, QDateTime, QSettings, QSize
-from PyQt6.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QDrag
+                             QButtonGroup, QRadioButton, QStyle, QSizePolicy,
+                             QLayout, QTreeWidget, QTreeWidgetItem)
+from PyQt6.QtCore import (QThread, pyqtSignal, QTimer, QDateTime, QSettings, QSize,
+                          QPointF)
+from PyQt6.QtGui import (QIcon, QPixmap, QFont, QColor, QPalette, QDrag, QPainter,
+                         QPainterPath, QKeySequence, QShortcut)
 #from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtSvgWidgets import QSvgWidget
@@ -65,10 +69,65 @@ from syncra.services.listenbrainz_client import ListenBrainzClient
 from syncra.services.metadata_fixer_service import MetadataFixerService
 from syncra.services.musicbrainz_provider import MusicBrainzProvider
 from syncra.models.metadata import TrackIdentity
-from syncra.theme.styles import MAIN_STYLESHEET
+from syncra.theme.styles import (
+    ACTION_BUTTON_WIDTH,
+    CONTROL_HEIGHT,
+    FIELD_MAX_WIDTH,
+    FIELD_MIN_WIDTH,
+    FIELD_SPACING,
+    GROUP_MARGIN,
+    GROUP_SPACING,
+    LABEL_COLUMN,
+    MAIN_STYLESHEET,
+    PAGE_MARGIN,
+    PAGE_SPACING,
+    SPACE_LG,
+    SIDE_FIELD_MIN,
+    SIDE_LABEL_COLUMN,
+    SPACE_MD,
+    SPACE_SM,
+    SPACE_XL,
+    SPACE_XS,
+)
+from syncra.services.match_filters import MatchFilters
+from syncra.services.match_memory import KIND_MISSING, MatchMemoryStore
+from syncra.services.missing_tracks import STATUS_MISSING, MissingTracksStore
+from syncra.services.sync_history import SyncHistoryStore, diff_snapshots, snapshot_tracks
+from syncra.services.sync_options import SyncOptions
+from syncra.services.track_identity import display_name, track_fingerprint
+from syncra.ui.dialogs.match_memory_dialog import MatchMemoryDialog
 from syncra.ui.dialogs.metadata_fixer_dialog import MetadataFixerDialog
+from syncra.ui.dialogs.missing_tracks_dialog import MissingTracksDialog
+from syncra.ui.dialogs.sonic_discovery_dialog import (
+    MODE_ADVENTURE,
+    MODE_SIMILAR,
+    SonicDiscoveryDialog,
+)
+from syncra.ui.dialogs.sync_history_dialog import SyncHistoryDialog
+from syncra.ui.widgets.flow_layout import FlowLayout
+from syncra.ui.widgets.playlist_grid import (
+    COVER_ROLE,
+    COVER_SIZE,
+    COVER_STATE_ROLE,
+    COVER_URL_ROLE,
+    SUBTITLE_ROLE,
+    TITLE_ROLE,
+    CoverFetcher,
+    PlaylistCardDelegate,
+    PlaylistGridView,
+    apply_grid_mode,
+    apply_list_mode,
+    badge_pixmap,
+    format_span,
+    identify_service,
+    placeholder_cover,
+    rounded_cover,
+)
 
 CONFIG_FILE = "app_config.json"
+# Keep startup connection attempts short. plexapi defaults to 30s, which makes an
+# unreachable/renamed server look like a frozen app during boot.
+PLEX_CONNECT_TIMEOUT = 10
 _SYNCRA_LIBRARY_MATCH_SESSION_CACHE = {}
 _SYNCRA_LIBRARY_MATCH_SESSION_CACHE_LOCK = threading.Lock()
 _SYNCRA_LIBRARY_MATCH_BUILD_STATES = {}
@@ -76,6 +135,10 @@ _SYNCRA_LIBRARY_MATCH_BUILD_STATES_LOCK = threading.Lock()
 _SYNCRA_SMART_MATCH_RUNTIME_SETTINGS = dict(APP_CONFIG_DEFAULTS.get("smart_match", {}))
 _SYNCRA_SMART_MATCH_CACHE_STORE = None
 _SYNCRA_SMART_MATCH_CACHE_STORE_LOCK = threading.Lock()
+_SYNCRA_MATCH_MEMORY_STORE = None
+_SYNCRA_MISSING_TRACKS_STORE = None
+_SYNCRA_SYNC_HISTORY_STORE = None
+_SYNCRA_LIBRARY_DATA_STORE_LOCK = threading.Lock()
 
 patch_qt_legacy_apis()
 
@@ -1082,27 +1145,17 @@ def _extract_recording_mbid_from_plex_track_for_matching(plex_track):
     return ""
 
 
-def _apply_smart_filter_penalty(score, album_title, parent_widget):
-    if not parent_widget or not hasattr(parent_widget, "enable_filters_checkbox"):
+def _apply_smart_filter_penalty(score, album_title, filter_source):
+    """Apply the smart-filter penalty for an album title.
+
+    `filter_source` may be a MatchFilters, a settings dict, the settings widget, or
+    None. Accepting all four keeps every existing call site working while letting a
+    headless run supply preferences that no longer have to come from a checkbox.
+    """
+    if filter_source is None:
         return score
     try:
-        if not parent_widget.enable_filters_checkbox.isChecked():
-            return score
-        lowered_album = str(album_title or "").lower()
-        penalty = 0
-        if hasattr(parent_widget, "filter_live_checkbox") and parent_widget.filter_live_checkbox.isChecked():
-            if any(keyword in lowered_album for keyword in ["live", "concert", "tour"]):
-                penalty += 15
-        if hasattr(parent_widget, "filter_compilation_checkbox") and parent_widget.filter_compilation_checkbox.isChecked():
-            if any(keyword in lowered_album for keyword in ["best of", "greatest hits", "collection", "anthology"]):
-                penalty += 12
-        if hasattr(parent_widget, "filter_remaster_checkbox") and parent_widget.filter_remaster_checkbox.isChecked():
-            if any(keyword in lowered_album for keyword in ["remaster", "remastered"]):
-                penalty += 8
-        if hasattr(parent_widget, "filter_deluxe_checkbox") and parent_widget.filter_deluxe_checkbox.isChecked():
-            if any(keyword in lowered_album for keyword in ["deluxe", "special", "extended", "expanded", "anniversary"]):
-                penalty += 6
-        return max(0.0, score - penalty)
+        return MatchFilters.coerce(filter_source).apply(score, album_title)
     except Exception as exc:
         logging.warning(f"Could not apply smart filtering penalty: {exc}")
         return score
@@ -1349,12 +1402,101 @@ def _collect_plex_track_candidates(library_section, title, artist="", album=""):
     return candidates
 
 
+def _get_match_memory_store():
+    """Lazy singleton for remembered matching decisions."""
+    global _SYNCRA_MATCH_MEMORY_STORE
+    with _SYNCRA_LIBRARY_DATA_STORE_LOCK:
+        if _SYNCRA_MATCH_MEMORY_STORE is None:
+            try:
+                _SYNCRA_MATCH_MEMORY_STORE = MatchMemoryStore()
+            except Exception as error:
+                logging.error(f"Match memory unavailable: {error}")
+                return None
+        return _SYNCRA_MATCH_MEMORY_STORE
+
+
+def _get_missing_tracks_store():
+    """Lazy singleton for the accumulated missing-track list."""
+    global _SYNCRA_MISSING_TRACKS_STORE
+    with _SYNCRA_LIBRARY_DATA_STORE_LOCK:
+        if _SYNCRA_MISSING_TRACKS_STORE is None:
+            try:
+                _SYNCRA_MISSING_TRACKS_STORE = MissingTracksStore()
+            except Exception as error:
+                logging.error(f"Missing-track store unavailable: {error}")
+                return None
+        return _SYNCRA_MISSING_TRACKS_STORE
+
+
+def _get_sync_history_store():
+    """Lazy singleton for sync run history."""
+    global _SYNCRA_SYNC_HISTORY_STORE
+    with _SYNCRA_LIBRARY_DATA_STORE_LOCK:
+        if _SYNCRA_SYNC_HISTORY_STORE is None:
+            try:
+                _SYNCRA_SYNC_HISTORY_STORE = SyncHistoryStore()
+            except Exception as error:
+                logging.error(f"Sync history unavailable: {error}")
+                return None
+        return _SYNCRA_SYNC_HISTORY_STORE
+
+
+def _build_override_match(library_section, override):
+    """Turn a stored 'always use this track' override into a top-ranked match.
+
+    Returns None when the remembered ratingKey is no longer in the library, so a track
+    deleted since the decision was made falls back to normal scoring instead of
+    silently resolving to nothing.
+    """
+    rating_key = str((override or {}).get("rating_key", "") or "").strip()
+    if not rating_key:
+        return None
+    rows_by_key = _get_library_match_rows_by_key_cached(library_section) or {}
+    row = rows_by_key.get(rating_key)
+    if row is None:
+        # The index may be cold rather than genuinely missing the track; only treat the
+        # override as stale when we actually have an index to check against.
+        if rows_by_key:
+            logging.info(f"Ignoring stale match override for missing ratingKey {rating_key}")
+            return None
+        row = {}
+    return {
+        "score": 100.0,
+        "title_score": 100.0,
+        "artist_score": 100.0,
+        "album_score": 100.0,
+        "duration_score": 100.0,
+        "duration_delta_ms": 0,
+        "rating_key": rating_key,
+        "title": row.get("title", "") or str(override.get("target_title", "") or ""),
+        "artist": row.get("artist", "") or str(override.get("target_artist", "") or ""),
+        "album": row.get("album", "") or str(override.get("target_album", "") or ""),
+        "from_override": True,
+    }
+
+
 def _rank_plex_track_matches(library_section, source_track, parent_widget=None):
     title = str(source_track.get("title", "") or "").strip()
     artist = str(source_track.get("artist", "") or "").strip()
     album = str(source_track.get("album", "") or "").strip()
     if not title:
         return []
+
+    # A decision the user already made beats anything the scorer can infer.
+    library_key = _get_library_match_session_key(library_section)
+    if library_key:
+        store = _get_match_memory_store()
+        if store is not None:
+            override = store.lookup(library_key, source_track)
+            if override:
+                if override.get("kind") == KIND_MISSING:
+                    # Known absent: do not guess, and do not pester the user again.
+                    store.record_hit(library_key, override.get("fingerprint", ""))
+                    return []
+                forced = _build_override_match(library_section, override)
+                if forced is not None:
+                    store.record_hit(library_key, override.get("fingerprint", ""))
+                    return [forced]
 
     ranked = []
     seen = set()
@@ -1906,16 +2048,33 @@ class PlaylistCache:
             del self.cache_data["last_updated"][playlist_id]
         self.save_cache()
 
-def resource_path(relative_path):
-    """ Get the absolute path to a resource, works for dev and for PyInstaller """
-    try:
-        # PyInstaller creates a temp folder and stores the path in _MEIPASS
-        base_path = sys._MEIPASS
-    except AttributeError:
-        # If not running in a PyInstaller bundle, use the directory of the script
-        base_path = os.path.abspath(".")
+APP_NAME = "Syncra"
+APP_ICON_FILE = "Syncra Icon.ico"
 
-    return os.path.join(base_path, relative_path)
+
+def resource_path(relative_path):
+    """Absolute path to a bundled resource, in development and when frozen."""
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        return os.path.join(bundled, relative_path)
+
+    # Derive the project root from this file rather than the working directory:
+    # launching from anywhere else used to make every relative resource miss.
+    project_root = Path(__file__).resolve().parents[2]
+    candidate = project_root / relative_path
+    if candidate.exists():
+        return str(candidate)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+
+def get_app_icon():
+    """The application icon, or an empty QIcon if it could not be found."""
+    for candidate in (APP_ICON_FILE, os.path.join("assets", APP_ICON_FILE)):
+        path = resource_path(candidate)
+        if os.path.exists(path):
+            return QIcon(path)
+    logging.info("Application icon not found; using the platform default.")
+    return QIcon()
 
 def initialize_config():
     def _ensure_file(file_path, defaults, label):
@@ -1954,17 +2113,36 @@ def setup_logging():
         print(f"Unexpected error when trying to remove log file: {e}")
 
     try:
-        # Configure logging
+        # encoding must be explicit: Windows FileHandler otherwise defaults to the ANSI
+        # code page (cp1252), and Syncra logs plenty of emoji. Those records raise
+        # UnicodeEncodeError inside logging and are dropped -- which loses exactly the
+        # lines needed to diagnose a failed startup.
+        # force=True is essential, not tidiness. Importing this module constructs
+        # SecureCredentialManager at module scope, which logs -- and a logging call
+        # with no handlers installed makes Python run basicConfig() implicitly. That
+        # left the root logger with a default stderr handler before this ever ran, so
+        # this call was a silent no-op (basicConfig does nothing when handlers exist):
+        # the log file was never created, and every record printed twice on the
+        # console, once in each format. force=True replaces whatever is there.
         logging.basicConfig(
             filename=LOG_FILE,
+            encoding="utf-8",
             level=logging.DEBUG,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            datefmt='%Y-%m-%d %H:%M:%S',
+            force=True,
         )
 
         # Optionally, add a stream handler for console output
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        # A non-UTF-8 console must not take log records down with it either.
+        stream = getattr(console_handler, "stream", None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
         logging.getLogger().addHandler(console_handler)
 
         logging.info(f"Logging started. Log file: {LOG_FILE}")
@@ -1974,7 +2152,8 @@ def setup_logging():
         logging.basicConfig(
             level=logging.DEBUG,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            datefmt='%Y-%m-%d %H:%M:%S',
+            force=True,
         )
         logging.warning("Logging to console only due to file access issues")
 
@@ -3275,175 +3454,284 @@ class ListenBrainzExportThread(QThread):
             self.error.emit(str(e))
 
 class LibraryDuplicateFinderThread(QThread):
-    progress_update = pyqtSignal(str, int)  # message, percentage
-    duplicates_found = pyqtSignal(list)  # duplicate groups list
+    """Scan the music library for duplicate recordings.
+
+    The previous version made two HTTP round trips per track -- `track.artist()` and
+    `track.album()` -- measured at 25ms and 20ms against a live server, so a 14,753
+    track library spent about eleven minutes just resolving names it already had.
+    `grandparentTitle` and `parentTitle` carry the same values in the search response
+    at no cost.
+
+    Playlist membership was worse: it re-fetched every playlist's contents for every
+    duplicate track (60 playlists x 71ms = 4.2s *per track*). It is now indexed once,
+    up front, and answered from a dict.
+    """
+
+    progress_update = pyqtSignal(str, int)      # message, percentage
+    duplicates_found = pyqtSignal(list, bool)   # groups, was_cancelled
     error = pyqtSignal(str)
 
     def __init__(self, plex_server, parent=None):
         super().__init__(parent)
         self.plex_server = plex_server
-        self.include_playlist_check = True  # Default to checking playlists
+        self.include_playlist_check = True
+        self._stop_requested = False
+
+    def stop(self):
+        """Ask the scan to finish early and report what it has so far."""
+        self._stop_requested = True
+
+    @property
+    def cancelled(self):
+        return self._stop_requested
+
+    # ------------------------------------------------------------------ helpers
 
     def normalize_track_signature(self, track):
-        """Create a normalized signature for duplicate detection"""
+        """Identity used to group duplicates.
+
+        Reuses the shared fingerprint so a track matches the same way here as it does
+        in Match Memory and Missing Tracks -- remaster suffixes, featured-artist
+        credits and punctuation are all normalised away.
+        """
+        title = str(getattr(track, "title", "") or "")
+        artist = str(
+            getattr(track, "grandparentTitle", "")
+            or getattr(track, "originalTitle", "")
+            or ""
+        )
+        return track_fingerprint(title, artist) or f"untitled|||{title.lower()}"
+
+    def _build_playlist_index(self):
+        """Map ratingKey -> [playlist titles], fetching each playlist exactly once."""
+        index = {}
         try:
-            title = track.title.lower().strip() if track.title else ""
-            artist = ""
+            playlists = [
+                playlist for playlist in self.plex_server.playlists()
+                if getattr(playlist, "playlistType", "") == "audio"
+            ]
+        except Exception as error:
+            logging.warning(f"Could not list playlists for duplicate scan: {error}")
+            return index
 
-            if track.artist():
-                artist = track.artist().title.lower().strip()
-            elif hasattr(track, 'originalTitle') and track.originalTitle:
-                artist = track.originalTitle.lower().strip()
+        total = max(len(playlists), 1)
+        for position, playlist in enumerate(playlists):
+            if self._stop_requested:
+                break
+            try:
+                for item in playlist.items():
+                    index.setdefault(str(item.ratingKey), []).append(playlist.title)
+            except Exception as error:
+                logging.debug(f"Could not read playlist '{playlist.title}': {error}")
+            self.progress_update.emit(
+                f"Indexing playlists ({position + 1}/{len(playlists)})...",
+                int(70 + (position + 1) / total * 25),
+            )
+        return index
 
-            # Clean up common variations
-            title = title.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
-            title = title.replace("feat.", "").replace("ft.", "").replace("featuring", "")
-            artist = artist.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+    @staticmethod
+    def _media_details(track):
+        """Path, size, bitrate and codec, without provoking a reload.
 
-            # Remove extra whitespace
-            title = " ".join(title.split())
-            artist = " ".join(artist.split())
-
-            return f"{artist}|||{title}".lower()
-
-        except Exception as e:
-            logging.debug(f"Error normalizing track signature: {e}")
-            return f"unknown|||{track.title or 'unknown'}".lower()
-
-    def get_track_playlists(self, track):
-        """Find which playlists contain this track"""
-        playlists_containing_track = []
+        Bitrate is not a track attribute -- `track.bitrate` is always None. It lives on
+        the Media element, which the search response already includes, so the quality
+        ranking used to compare zeroes against zeroes.
+        """
+        details = {"file_path": "Unknown Path", "file_size": 0, "bitrate": 0, "codec": ""}
         try:
-            # This is expensive but necessary for comprehensive playlist checking
-            for playlist in self.plex_server.playlists():
-                try:
-                    if playlist.playlistType != 'audio':
-                        continue
-                    playlist_items = playlist.items()
-                    for item in playlist_items:
-                        if item.ratingKey == track.ratingKey:
-                            playlists_containing_track.append(playlist.title)
-                            break
-                except:
-                    continue
-        except Exception as e:
-            logging.debug(f"Error checking playlists for track: {e}")
+            media = (getattr(track, "media", None) or [None])[0]
+            if media is None:
+                return details
+            details["bitrate"] = getattr(media, "bitrate", 0) or 0
+            details["codec"] = str(getattr(media, "audioCodec", "") or "")
+            parts = getattr(media, "parts", None) or []
+            if parts:
+                details["file_path"] = getattr(parts[0], "file", "") or "Unknown Path"
+                details["file_size"] = getattr(parts[0], "size", 0) or 0
+        except Exception:
+            pass
+        return details
 
-        return playlists_containing_track
+    def _track_info(self, track):
+        # Every field here comes from the search response; none of them costs a
+        # request, which is the whole point of the rewrite.
+        media = self._media_details(track)
+        return {
+            "track": track,
+            "title": getattr(track, "title", "") or "Unknown Title",
+            "artist": getattr(track, "grandparentTitle", "")
+                      or getattr(track, "originalTitle", "") or "Unknown Artist",
+            "album": getattr(track, "parentTitle", "") or "Unknown Album",
+            "duration": getattr(track, "duration", 0) or 0,
+            "bitrate": media["bitrate"],
+            "codec": media["codec"],
+            "file_path": media["file_path"],
+            "file_size": media["file_size"],
+            "rating_key": track.ratingKey,
+            "playlists": [],
+        }
+
+    # ---------------------------------------------------------------------- run
 
     def run(self):
         try:
-            self.progress_update.emit("Scanning music library for duplicates...", 5)
-
-            # Get music library sections
-            music_sections = []
-            for section in self.plex_server.library.sections():
-                if section.type == 'artist':  # Music library
-                    music_sections.append(section)
-
+            self.progress_update.emit("Finding music libraries...", 2)
+            music_sections = [
+                section for section in self.plex_server.library.sections()
+                if section.type == "artist"
+            ]
             if not music_sections:
                 self.error.emit("No music libraries found on Plex server")
                 return
 
-            self.progress_update.emit("Loading all tracks from music library...", 10)
-
-            # Collect all tracks from all music sections
             all_tracks = []
             for section in music_sections:
+                if self._stop_requested:
+                    break
                 try:
-                    section_tracks = section.searchTracks()
-                    all_tracks.extend(section_tracks)
-                    self.progress_update.emit(f"Loaded {len(all_tracks)} tracks so far...", 15)
-                except Exception as e:
-                    logging.warning(f"Error loading tracks from section {section.title}: {e}")
+                    expected = getattr(section, "totalSize", 0) or 0
+                    self.progress_update.emit(
+                        f"Loading tracks from '{section.title}'"
+                        + (f" ({expected:,} tracks)..." if expected else "..."),
+                        5,
+                    )
+                    all_tracks.extend(section.searchTracks())
+                    self.progress_update.emit(f"Loaded {len(all_tracks):,} tracks...", 30)
+                except Exception as error:
+                    logging.warning(f"Error loading tracks from {section.title}: {error}")
 
             if not all_tracks:
-                self.error.emit("No tracks found in music library")
+                if self._stop_requested:
+                    self.duplicates_found.emit([], True)
+                else:
+                    self.error.emit("No tracks found in music library")
                 return
 
-            self.progress_update.emit(f"Analyzing {len(all_tracks)} tracks for duplicates...", 20)
+            self.progress_update.emit(f"Grouping {len(all_tracks):,} tracks...", 35)
 
-            # Group tracks by signature for duplicate detection
             track_groups = {}
-            processed = 0
-
-            for track in all_tracks:
+            total_tracks = len(all_tracks)
+            for processed, track in enumerate(all_tracks, start=1):
+                if self._stop_requested:
+                    break
                 try:
                     signature = self.normalize_track_signature(track)
-                    if signature not in track_groups:
-                        track_groups[signature] = []
-
-                    # Store detailed track info
-                    track_info = {
-                        'track': track,
-                        'title': track.title or "Unknown Title",
-                        'artist': track.artist().title if track.artist() else "Unknown Artist",
-                        'album': track.album().title if track.album() else "Unknown Album",
-                        'duration': getattr(track, 'duration', 0),
-                        'bitrate': getattr(track, 'bitrate', 0),
-                        'file_path': track.media[0].parts[0].file if track.media and track.media[0].parts else "Unknown Path",
-                        'file_size': track.media[0].parts[0].size if track.media and track.media[0].parts else 0,
-                        'rating_key': track.ratingKey,
-                        'playlists': []  # Will be populated later for duplicates
-                    }
-
-                    track_groups[signature].append(track_info)
-
-                    processed += 1
-                    if processed % 100 == 0:
-                        progress = 20 + (processed / len(all_tracks)) * 50
-                        self.progress_update.emit(f"Processed {processed}/{len(all_tracks)} tracks...", int(progress))
-
-                except Exception as e:
-                    logging.debug(f"Error processing track: {e}")
+                    track_groups.setdefault(signature, []).append(self._track_info(track))
+                except Exception as error:
+                    logging.debug(f"Error processing track: {error}")
                     continue
+                # Cheap loop now, so report less often.
+                if processed % 500 == 0:
+                    self.progress_update.emit(
+                        f"Grouped {processed:,}/{total_tracks:,} tracks...",
+                        int(35 + processed / total_tracks * 30),
+                    )
 
-            self.progress_update.emit("Identifying duplicate groups...", 70)
+            duplicate_groups = [group for group in track_groups.values() if len(group) > 1]
+            # Biggest offenders first: that is what a user wants to act on.
+            duplicate_groups.sort(key=len, reverse=True)
 
-            # Filter to only duplicate groups (groups with more than 1 track)
-            duplicate_groups = []
-            for signature, tracks in track_groups.items():
-                if len(tracks) > 1:
-                    duplicate_groups.append(tracks)
-
-            if not duplicate_groups:
-                self.duplicates_found.emit([])
-                return
-
-            # Conditionally check playlist usage
-            if self.include_playlist_check:
-                self.progress_update.emit("Checking playlist usage for duplicates...", 80)
-
-                # For duplicate tracks, check which playlists they're in
-                total_duplicates = sum(len(group) for group in duplicate_groups)
-                checked = 0
-
+            if duplicate_groups and self.include_playlist_check and not self._stop_requested:
+                index = self._build_playlist_index()
                 for group in duplicate_groups:
-                    for track_info in group:
-                        try:
-                            track_info['playlists'] = self.get_track_playlists(track_info['track'])
-                            checked += 1
-                            if checked % 10 == 0:
-                                progress = 80 + (checked / total_duplicates) * 15
-                                self.progress_update.emit(f"Checked playlists for {checked}/{total_duplicates} duplicate tracks...", int(progress))
-                        except Exception as e:
-                            logging.debug(f"Error checking playlists for duplicate: {e}")
-                            track_info['playlists'] = []
+                    for info in group:
+                        info["playlists"] = index.get(str(info["rating_key"]), [])
 
-                self.progress_update.emit("Duplicate scan completed!", 100)
+            if self._stop_requested:
+                self.progress_update.emit(
+                    f"Stopped early - showing {len(duplicate_groups)} group(s) found so far.",
+                    100,
+                )
             else:
-                # Skip playlist checking for faster scan
-                for group in duplicate_groups:
-                    for track_info in group:
-                        track_info['playlists'] = []  # Empty playlist list
+                self.progress_update.emit(
+                    f"Scan complete - {len(duplicate_groups)} duplicate group(s).", 100
+                )
 
-                self.progress_update.emit("Duplicate scan completed! (Playlists not checked for faster scanning)", 100)
+            self.duplicates_found.emit(duplicate_groups, self._stop_requested)
 
-            self.duplicates_found.emit(duplicate_groups)
+        except Exception as error:
+            logging.error(f"Error in library duplicate finding thread: {error}")
+            self.error.emit(str(error))
 
-        except Exception as e:
-            logging.error(f"Error in library duplicate finding thread: {str(e)}")
-            self.error.emit(str(e))
+
+# Stroke icon set for the playlist editor, in a 24x24 viewBox. Rendered from SVG at
+# runtime so an icon can be tinted per button state without shipping asset variants.
+EDITOR_COVER_SIZE = 280
+
+_EDITOR_ICON_PATHS = {
+    "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+    "sliders": ('<path d="M4 21v-7"/><path d="M4 10V3"/><path d="M12 21v-9"/>'
+                '<path d="M12 8V3"/><path d="M20 21v-5"/><path d="M20 12V3"/>'
+                '<path d="M2 14h4"/><path d="M10 12h4"/><path d="M18 16h4"/>'),
+    "trash": ('<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>'
+              '<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'),
+    "chevrons_up": '<path d="m17 11-5-5-5 5"/><path d="m17 18-5-5-5 5"/>',
+    "chevrons_down": '<path d="m7 6 5 5 5-5"/><path d="m7 13 5 5 5-5"/>',
+    "sort": '<path d="M3 6h18"/><path d="M7 12h10"/><path d="M10 18h4"/>',
+    "copy": ('<rect width="14" height="14" x="8" y="8" rx="2"/>'
+             '<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>'),
+    "check_circle": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+    "x_circle": ('<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/>'
+                 '<path d="m9 9 6 6"/>'),
+    "image": ('<rect width="18" height="18" x="3" y="3" rx="2"/>'
+              '<circle cx="9" cy="9" r="2"/>'
+              '<path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>'),
+    "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+    "more_vertical": ('<circle cx="12" cy="5" r="1.7" fill="{color}" stroke="none"/>'
+                      '<circle cx="12" cy="12" r="1.7" fill="{color}" stroke="none"/>'
+                      '<circle cx="12" cy="19" r="1.7" fill="{color}" stroke="none"/>'),
+    "check_badge": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+}
+
+
+def _make_dots_icon(color="#7f92ad", size=18, dot=3, gap=5):
+    """Draw the overflow glyph directly rather than via SVG.
+
+    Scaling a 24-unit viewBox down to 16px put the three circles on three different
+    subpixel boundaries, so they antialiased to different weights and the glyph looked
+    clipped. Drawing at explicit half-pixel centres makes all three identical.
+    """
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        centre = size / 2.0
+        radius = dot / 2.0
+        for offset in (-gap, 0, gap):
+            painter.drawEllipse(QPointF(centre, centre + offset), radius, radius)
+    finally:
+        painter.end()
+    return QIcon(pixmap)
+
+
+def _make_editor_icon(name, color="#c9d1df", size=18):
+    """Render one of the stroke icons above into a QIcon at the requested tint."""
+    paths = _EDITOR_ICON_PATHS.get(name)
+    if not paths:
+        return QIcon()
+    paths = paths.replace("{color}", color)
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" '
+        'viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" '
+        'stroke-linecap="round" stroke-linejoin="round">{paths}</svg>'
+    ).format(color=color, paths=paths)
+    try:
+        from PyQt6.QtCore import QByteArray
+
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+    except Exception as error:
+        logging.debug(f"Could not build editor icon '{name}': {error}")
+        return QIcon()
+
 
 class PlaylistTrackTable(QTableWidget):
     """Table widget that supports safe drag-and-drop row reordering."""
@@ -3455,10 +3743,43 @@ class PlaylistTrackTable(QTableWidget):
         self._drag_row = -1
         self._drag_track_id = None
         self._drag_row_items = []
+        self._corner_label = None
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
+
+    def enable_corner_label(self, text="#"):
+        """Label the empty box above the row numbers.
+
+        QTableCornerButton has no text API, so the caption is a child QLabel parked
+        over the corner rect and repositioned whenever the headers resize.
+        """
+        if self._corner_label is None:
+            self._corner_label = QLabel(text, self)
+            self._corner_label.setObjectName("editorCornerLabel")
+            self._corner_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.horizontalHeader().geometriesChanged.connect(self._position_corner_label)
+            self.verticalHeader().geometriesChanged.connect(self._position_corner_label)
+        self._corner_label.setText(text)
+        self._position_corner_label()
+
+    def _position_corner_label(self):
+        if self._corner_label is None:
+            return
+        self._corner_label.setGeometry(
+            0, 0, self.verticalHeader().width(), self.horizontalHeader().height()
+        )
+        self._corner_label.setVisible(self.verticalHeader().isVisible())
+        self._corner_label.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_corner_label()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._position_corner_label()
 
     def startDrag(self, supportedActions):
         self._drag_row = self.currentRow()
@@ -4069,8 +4390,8 @@ class PlaylistEditorDialog(QDialog):
         self.setWindowTitle(f"Edit Playlist: {playlist.title}")
         self.setObjectName("playlistEditorDialog")
         self.setModal(True)
-        self.resize(980, 680)
-        self.setMinimumSize(900, 620)
+        self.resize(1500, 940)
+        self.setMinimumSize(1100, 700)
         self.setStyleSheet(self._dialog_stylesheet())
         
         # Setup UI immediately (non-blocking)
@@ -4086,44 +4407,58 @@ class PlaylistEditorDialog(QDialog):
     def _dialog_stylesheet(self):
         return """
             QDialog#playlistEditorDialog {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #121b2b, stop:1 #0f1828);
-                border: 1px solid #344d70;
-                border-radius: 10px;
+                background-color: #0d1420;
             }
             QDialog#playlistEditorDialog QLabel#editorTitleLabel {
-                font-weight: 750;
-                font-size: 15px;
-                color: #eaf2ff;
+                font-weight: 700;
+                font-size: 19px;
+                color: #f2f6fc;
+                letter-spacing: -0.01em;
             }
+            /* Track count reads as a pill beside the title, not a second sentence. */
             QDialog#playlistEditorDialog QLabel#editorTrackCount {
-                color: #9db4d7;
-                font-size: 13px;
+                background-color: #1f2f40;
+                border: 1px solid #2fb8ff;
+                border-radius: 999px;
+                color: #8ad8ff;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 4px 12px;
             }
-            QDialog#playlistEditorDialog QFrame#editorCoverCard {
-                background-color: #152236;
-                border: 1px solid #35527a;
-                border-radius: 10px;
+            QDialog#playlistEditorDialog QFrame#editorCoverCard,
+            QDialog#playlistEditorDialog QFrame#editorTracksCard {
+                background-color: #141d2c;
+                border: 1px solid #253449;
+                border-radius: 14px;
             }
             QDialog#playlistEditorDialog QLabel#editorCoverPreview {
-                background-color: #0f1a2b;
-                border: 1px solid #3a5a86;
-                border-radius: 8px;
-                color: #a8c0e1;
+                background-color: #0d1420;
+                border: 1px solid #253449;
+                border-radius: 12px;
+                color: #7f92ad;
                 font-size: 12px;
             }
             QDialog#playlistEditorDialog QLabel#editorCoverTitle {
-                color: #dce9fb;
-                font-size: 12px;
+                color: #8fa1ba;
+                font-size: 10px;
                 font-weight: 700;
+                letter-spacing: 0.14em;
             }
             QDialog#playlistEditorDialog QLabel#editorCoverStatus {
-                color: #a8c0e1;
-                font-size: 11px;
+                color: #a8b9cf;
+                font-size: 12px;
             }
-            QDialog#playlistEditorDialog QLabel#editorSearchLabel {
-                color: #dbe7fb;
-                font-weight: 650;
-                font-size: 13px;
+            QDialog#playlistEditorDialog QPushButton#editorFilterButton {
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorFilterButton:hover {
+                background-color: #1f2c3f;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorFilterButton:checked {
+                background-color: #1f2f40;
             }
             QDialog#playlistEditorDialog QLabel#editorLoadingLabel {
                 color: #b6c9e6;
@@ -4159,107 +4494,207 @@ class PlaylistEditorDialog(QDialog):
                 background-color: #2ed27a;
                 border-radius: 7px;
             }
+            /* Search is a single pill spanning the panel, magnifier inside it. */
             QDialog#playlistEditorDialog QLineEdit#editorSearchInput {
-                background-color: #18273c;
-                border: 1px solid #3e577b;
-                border-radius: 7px;
-                padding: 8px 10px;
-                color: #f2f7ff;
+                background-color: #141d2c;
+                border: 1px solid #253449;
+                border-radius: 10px;
+                padding: 10px 14px;
+                color: #f2f6fc;
                 font-size: 14px;
             }
             QDialog#playlistEditorDialog QLineEdit#editorSearchInput:focus {
-                border: 1px solid #46a3ff;
+                border: 1px solid #2fb8ff;
+                background-color: #101827;
             }
+            /* Table is flush inside its card: no border, no grid, hairline rows. */
             QDialog#playlistEditorDialog QTableWidget#editorTracksTable {
-                background-color: #16253a;
-                color: #f3f8ff;
-                gridline-color: #2f476a;
-                border: 1px solid #36527a;
-                border-radius: 8px;
-                selection-background-color: #2d4f7a;
-                selection-color: #ffffff;
+                background-color: transparent;
+                color: #e6edf7;
+                gridline-color: transparent;
+                border: none;
+                outline: none;
+                font-size: 13px;
             }
             QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item {
-                padding: 7px 10px;
-                border-bottom: 1px solid #223754;
+                padding: 10px 12px;
+                border-bottom: 1px solid #1c2839;
             }
             QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item:selected {
-                background-color: #2d5a8f;
+                background-color: #24344c;
                 color: #ffffff;
             }
-            QDialog#playlistEditorDialog QHeaderView::section {
-                background: #213651;
-                color: #e8f1ff;
-                border: 1px solid #3a577f;
-                padding: 8px;
-                font-weight: 800;
+            QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item:hover {
+                background-color: #18222f;
+            }
+            QDialog#playlistEditorDialog QHeaderView {
+                background-color: #101827;
+                border: none;
+            }
+            QDialog#playlistEditorDialog QHeaderView::section:horizontal {
+                background-color: #101827;
+                color: #8fa1ba;
+                border: none;
+                border-bottom: 1px solid #253449;
+                padding: 10px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            /* The vertical header is the '#' column from the mockup. Using it instead
+               of a real column keeps every existing column index (0=Title..3=Duration)
+               valid, and it renumbers itself automatically on reorder and delete. */
+            QDialog#playlistEditorDialog QHeaderView::section:vertical {
+                background-color: transparent;
+                color: #6d7c93;
+                border: none;
+                border-bottom: 1px solid #1c2839;
+                padding: 0;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QDialog#playlistEditorDialog QLabel#editorCornerLabel {
+                background-color: #101827;
+                border-bottom: 1px solid #253449;
+                color: #8fa1ba;
+                font-size: 12px;
+                font-weight: 600;
             }
             QDialog#playlistEditorDialog QTableWidget#editorTracksTable QTableCornerButton::section {
-                background: #213651;
-                border: 1px solid #3a577f;
+                background-color: #101827;
+                border: none;
+                border-bottom: 1px solid #253449;
             }
+            /* Toolbar buttons: dark chips with an icon, per the mockup. */
             QDialog#playlistEditorDialog QPushButton#editorBtnNeutral {
-                background-color: #22344f;
-                border: 1px solid #476287;
-                border-radius: 8px;
-                color: #e0edff;
-                font-weight: 700;
-                padding: 8px 14px;
+                background-color: #141d2c;
+                border: 1px solid #253449;
+                border-radius: 10px;
+                color: #dbe4f0;
+                font-weight: 600;
+                padding: 10px 18px;
                 min-height: 22px;
             }
             QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:hover {
-                background-color: #2a4468;
+                background-color: #1b2637;
+                border-color: #33465f;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:pressed {
+                background-color: #101827;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:checked {
+                background-color: #1f2f40;
+                border-color: #2fb8ff;
+                color: #8ad8ff;
             }
             QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:disabled {
-                background-color: #1b2a42;
-                border: 1px solid #334d71;
-                color: #7890b0;
+                background-color: #111823;
+                border-color: #1d2938;
+                color: #55637a;
             }
+            /* Destructive: red text on a dark chip rather than a solid red slab, so it
+               is legible as dangerous without dominating the toolbar. */
+            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive {
+                background-color: #1d1620;
+                border: 1px solid #5e2b32;
+                border-radius: 10px;
+                color: #ff8b86;
+                font-weight: 600;
+                padding: 10px 18px;
+                min-height: 22px;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive:hover {
+                background-color: #2a1a20;
+                border-color: #7a3b44;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive:disabled {
+                background-color: #111823;
+                border-color: #1d2938;
+                color: #55637a;
+            }
+            /* Save is the one committing action, so it is the one filled button. */
             QDialog#playlistEditorDialog QPushButton#editorBtnPrimary {
-                background-color: #2ed27a;
-                border: 1px solid #2bc970;
-                border-radius: 8px;
+                background-color: #16a34a;
+                border: 1px solid #22c55e;
+                border-radius: 10px;
                 color: #ffffff;
-                font-weight: 800;
-                padding: 8px 18px;
+                font-weight: 700;
+                padding: 10px 22px;
                 min-height: 22px;
             }
             QDialog#playlistEditorDialog QPushButton#editorBtnPrimary:hover {
-                background-color: #26bf6a;
+                background-color: #1cb555;
             }
             QDialog#playlistEditorDialog QPushButton#editorBtnPrimary:disabled {
-                background-color: #2b4f3d;
-                border: 1px solid #3a7055;
-                color: #9ec5ae;
+                background-color: #111823;
+                border-color: #1d2938;
+                color: #55637a;
             }
             QDialog#playlistEditorDialog QPushButton#editorBtnDanger {
-                background-color: #ff4b47;
-                border: 1px solid #f44c4a;
-                border-radius: 8px;
-                color: #ffffff;
-                font-weight: 800;
-                padding: 8px 18px;
+                background-color: transparent;
+                border: 1px solid #253449;
+                border-radius: 10px;
+                color: #c9d1df;
+                font-weight: 600;
+                padding: 10px 22px;
                 min-height: 22px;
             }
             QDialog#playlistEditorDialog QPushButton#editorBtnDanger:hover {
-                background-color: #ef3f3c;
+                background-color: #1b2637;
+                color: #f2f6fc;
+            }
+            /* Primary cover action: the accent-filled control on the left panel. */
+            QDialog#playlistEditorDialog QPushButton#editorBtnAccent {
+                background-color: #2fb8ff;
+                border: 1px solid #2fb8ff;
+                border-radius: 10px;
+                color: #06121f;
+                font-weight: 700;
+                padding: 11px 16px;
+                min-height: 22px;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorBtnAccent:hover {
+                background-color: #57c7ff;
+                border-color: #57c7ff;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorBtnAccent:disabled {
+                background-color: #111823;
+                border-color: #1d2938;
+                color: #55637a;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorRowMenuButton {
+                background: transparent;
+                border: none;
+                border-radius: 6px;
+                padding: 0px;
+                margin: 0px;
+                min-width: 0px;
+                min-height: 0px;
+            }
+            QDialog#playlistEditorDialog QPushButton#editorRowMenuButton:hover {
+                background-color: #24344c;
+            }
+            QDialog#playlistEditorDialog QFrame#editorActionBar {
+                background-color: #101827;
+                border: 1px solid #253449;
+                border-radius: 14px;
             }
         """
         
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
 
-        # Playlist info header
+        # Playlist info header: title with a count pill sitting beside it.
         info_layout = QHBoxLayout()
+        info_layout.setSpacing(SPACE_MD)
         self.editor_title_label = QLabel(f"Editing Playlist: {self.playlist.title}")
         self.editor_title_label.setObjectName("editorTitleLabel")
         info_layout.addWidget(self.editor_title_label)
 
-        self.track_count_label = QLabel("Tracks: Loading...")
+        self.track_count_label = QLabel("loading...")
         self.track_count_label.setObjectName("editorTrackCount")
-        info_layout.addWidget(self.track_count_label)
+        info_layout.addWidget(self.track_count_label, 0, Qt.AlignmentFlag.AlignVCenter)
         info_layout.addStretch()
         layout.addLayout(info_layout)
 
@@ -4327,35 +4762,50 @@ class PlaylistEditorDialog(QDialog):
         # Left cover/actions panel
         cover_card = QFrame()
         cover_card.setObjectName("editorCoverCard")
-        cover_card.setFixedWidth(230)
+        cover_card.setFixedWidth(320)
         cover_layout = QVBoxLayout(cover_card)
-        cover_layout.setContentsMargins(10, 10, 10, 10)
-        cover_layout.setSpacing(8)
+        cover_layout.setContentsMargins(20, 18, 20, 18)
+        cover_layout.setSpacing(SPACE_MD)
 
-        cover_title = QLabel("Playlist Cover")
+        cover_title = QLabel("PLAYLIST COVER")
         cover_title.setObjectName("editorCoverTitle")
         cover_layout.addWidget(cover_title)
 
         self.cover_preview_label = QLabel("No cover")
         self.cover_preview_label.setObjectName("editorCoverPreview")
         self.cover_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cover_preview_label.setMinimumSize(200, 200)
-        self.cover_preview_label.setMaximumSize(200, 200)
+        self.cover_preview_label.setFixedSize(EDITOR_COVER_SIZE, EDITOR_COVER_SIZE)
         cover_layout.addWidget(self.cover_preview_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(SPACE_SM)
+        self.cover_status_icon = QLabel()
+        self.cover_status_icon.setPixmap(
+            _make_editor_icon("check_badge", "#2ed27a", 16).pixmap(QSize(16, 16))
+        )
+        self.cover_status_icon.setFixedSize(16, 16)
+        status_row.addWidget(self.cover_status_icon, 0, Qt.AlignmentFlag.AlignTop)
         self.cover_status_label = QLabel("Using current Plex cover.")
         self.cover_status_label.setObjectName("editorCoverStatus")
         self.cover_status_label.setWordWrap(True)
-        cover_layout.addWidget(self.cover_status_label)
+        status_row.addWidget(self.cover_status_label, 1)
+        cover_layout.addLayout(status_row)
 
         self.change_cover_btn = QPushButton("Change Cover...")
-        self.change_cover_btn.setObjectName("editorBtnNeutral")
+        self.change_cover_btn.setObjectName("editorBtnAccent")
+        self.change_cover_btn.setIcon(_make_editor_icon("image", "#06121f"))
+        self.change_cover_btn.setIconSize(QSize(18, 18))
+        self.change_cover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.change_cover_btn.clicked.connect(self.choose_cover_image)
         self.change_cover_btn.setEnabled(False)
         cover_layout.addWidget(self.change_cover_btn)
 
         self.clear_cover_btn = QPushButton("Clear Pending Cover")
         self.clear_cover_btn.setObjectName("editorBtnNeutral")
+        self.clear_cover_btn.setIcon(_make_editor_icon("trash", "#c9d1df"))
+        self.clear_cover_btn.setIconSize(QSize(18, 18))
+        self.clear_cover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_cover_btn.clicked.connect(self.clear_pending_cover)
         self.clear_cover_btn.setEnabled(False)
         cover_layout.addWidget(self.clear_cover_btn)
@@ -4367,101 +4817,199 @@ class PlaylistEditorDialog(QDialog):
         tracks_panel = QWidget()
         tracks_layout = QVBoxLayout(tracks_panel)
         tracks_layout.setContentsMargins(0, 0, 0, 0)
-        tracks_layout.setSpacing(8)
+        tracks_layout.setSpacing(SPACE_MD)
 
         search_layout = QHBoxLayout()
         search_layout.setContentsMargins(0, 0, 0, 0)
-        search_layout.setSpacing(8)
-        search_label = QLabel("Search:")
-        search_label.setObjectName("editorSearchLabel")
-        search_layout.addWidget(search_label)
+        search_layout.setSpacing(SPACE_SM)
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("editorSearchInput")
         self.search_input.setPlaceholderText("Search tracks by title, artist, or album...")
         self.search_input.setClearButtonEnabled(True)
+        # Magnifier lives inside the field, replacing the external "Search:" label.
+        self.search_input.addAction(
+            _make_editor_icon("search", "#7f92ad"),
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
         self.search_input.textChanged.connect(self.filter_tracks)
-        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_input, 1)
+
+        self.highlight_duplicates_button = QPushButton()
+        self.highlight_duplicates_button.setObjectName("editorFilterButton")
+        self.highlight_duplicates_button.setIcon(_make_editor_icon("sliders", "#8fa1ba"))
+        self.highlight_duplicates_button.setIconSize(QSize(20, 20))
+        self.highlight_duplicates_button.setFixedSize(38, 38)
+        self.highlight_duplicates_button.setCheckable(True)
+        self.highlight_duplicates_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.highlight_duplicates_button.setToolTip("Highlight duplicate tracks")
+        self.highlight_duplicates_button.toggled.connect(self.toggle_duplicate_highlighting)
+        self.highlight_duplicates_button.setEnabled(False)
+        search_layout.addWidget(self.highlight_duplicates_button, 0)
+
         tracks_layout.addLayout(search_layout)
+
+        # Table sits flush inside a card so its own chrome can be removed entirely.
+        tracks_card = QFrame()
+        tracks_card.setObjectName("editorTracksCard")
+        tracks_card_layout = QVBoxLayout(tracks_card)
+        tracks_card_layout.setContentsMargins(1, 1, 1, 1)
+        tracks_card_layout.setSpacing(0)
 
         self.tracks_table = PlaylistTrackTable()
         self.tracks_table.setObjectName("editorTracksTable")
-        self.tracks_table.setColumnCount(4)
+        self.tracks_table.setColumnCount(5)
         self.tracks_table.rows_reordered.connect(self.handle_row_reorder)
-        self.tracks_table.setHorizontalHeaderLabels(["Title", "Artist", "Album", "Duration"])
-        self.tracks_table.horizontalHeader().setStretchLastSection(False)
-        self.tracks_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.tracks_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.tracks_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.tracks_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.tracks_table.setHorizontalHeaderLabels(
+            ["Title", "Artist", "Album", "Duration", ""]
+        )
+        header = self.tracks_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setHighlightSections(False)
+        header.setFixedHeight(40)
+        # Headers read left-to-right with their column, not centred over it.
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.tracks_table.setColumnWidth(3, 110)
+        self.tracks_table.setColumnWidth(4, 56)
+
+        duration_header = QTableWidgetItem("Duration")
+        duration_header.setIcon(_make_editor_icon("clock", "#8fa1ba", 14))
+        self.tracks_table.setHorizontalHeaderItem(3, duration_header)
         self.tracks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tracks_table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.tracks_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tracks_table.customContextMenuRequested.connect(self.show_context_menu)
         self.tracks_table.setAlternatingRowColors(False)
-        self.tracks_table.setColumnWidth(0, 280)
-        self.tracks_table.setColumnWidth(1, 220)
-        self.tracks_table.setColumnWidth(2, 220)
-        self.tracks_table.verticalHeader().setDefaultSectionSize(30)
-        tracks_layout.addWidget(self.tracks_table)
+        self.tracks_table.setShowGrid(False)
+        self.tracks_table.setFrameShape(QFrame.NoFrame)
+
+        # The mockup's leading "#" column, provided by the vertical header so that the
+        # existing 0..3 column indices used throughout this class stay correct.
+        row_numbers = self.tracks_table.verticalHeader()
+        row_numbers.setVisible(True)
+        row_numbers.setDefaultSectionSize(38)
+        row_numbers.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        row_numbers.setFixedWidth(52)
+        row_numbers.setHighlightSections(False)
+        # Numbers centre under the '#' caption instead of hugging the left edge.
+        row_numbers.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tracks_table.enable_corner_label("#")
+
+        tracks_card_layout.addWidget(self.tracks_table)
+        tracks_layout.addWidget(tracks_card, 1)
 
         body_layout.addWidget(tracks_panel, 1)
         editor_layout.addLayout(body_layout)
         layout.addWidget(self.editor_section, 1)
 
         # Button section
-        self.action_bar = QWidget()
+        self.action_bar = QFrame()
+        self.action_bar.setObjectName("editorActionBar")
         button_layout = QHBoxLayout(self.action_bar)
-        button_layout.setContentsMargins(0, 4, 0, 0)
-        button_layout.setSpacing(8)
+        button_layout.setContentsMargins(14, 12, 14, 12)
+        button_layout.setSpacing(SPACE_SM)
 
-        self.delete_button = QPushButton("Delete Selected")
-        self.delete_button.setObjectName("editorBtnNeutral")
-        self.delete_button.clicked.connect(self.delete_selected)
-        self.delete_button.setEnabled(False)
-        button_layout.addWidget(self.delete_button)
+        def toolbar_button(text, icon_name, handler, object_name="editorBtnNeutral",
+                           tint="#c9d1df", enabled=False):
+            button = QPushButton(text)
+            button.setObjectName(object_name)
+            button.setIcon(_make_editor_icon(icon_name, tint))
+            button.setIconSize(QSize(18, 18))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(handler)
+            button.setEnabled(enabled)
+            button_layout.addWidget(button)
+            return button
 
-        self.move_up_button = QPushButton("Move Up")
-        self.move_up_button.setObjectName("editorBtnNeutral")
-        self.move_up_button.clicked.connect(self.move_up)
-        self.move_up_button.setEnabled(False)
-        button_layout.addWidget(self.move_up_button)
-
-        self.move_down_button = QPushButton("Move Down")
-        self.move_down_button.setObjectName("editorBtnNeutral")
-        self.move_down_button.clicked.connect(self.move_down)
-        self.move_down_button.setEnabled(False)
-        button_layout.addWidget(self.move_down_button)
-
-        self.sort_button = QPushButton("Sort...")
-        self.sort_button.setObjectName("editorBtnNeutral")
-        self.sort_button.clicked.connect(self.show_sort_menu)
-        self.sort_button.setEnabled(False)
-        button_layout.addWidget(self.sort_button)
-
-        self.highlight_duplicates_button = QPushButton("Highlight Duplicates")
-        self.highlight_duplicates_button.setObjectName("editorBtnNeutral")
-        self.highlight_duplicates_button.setCheckable(True)
-        self.highlight_duplicates_button.toggled.connect(self.toggle_duplicate_highlighting)
-        self.highlight_duplicates_button.setEnabled(False)
-        button_layout.addWidget(self.highlight_duplicates_button)
+        self.delete_button = toolbar_button(
+            "Delete Selected", "trash", self.delete_selected,
+            object_name="editorBtnDestructive", tint="#ff8b86",
+        )
+        self.move_up_button = toolbar_button("Move Up", "chevrons_up", self.move_up)
+        self.move_down_button = toolbar_button("Move Down", "chevrons_down", self.move_down)
+        self.sort_button = toolbar_button("Sort...", "sort", self.show_sort_menu)
+        self.duplicates_button = toolbar_button(
+            "Find Duplicates", "copy",
+            lambda: self.highlight_duplicates_button.toggle(),
+        )
+        self.duplicates_button.setToolTip(
+            "Highlight tracks that appear more than once in this playlist"
+        )
 
         button_layout.addStretch()
 
-        self.save_button = QPushButton("Save Changes")
-        self.save_button.setObjectName("editorBtnPrimary")
-        self.save_button.clicked.connect(self.save_changes)
-        self.save_button.setEnabled(False)
-        button_layout.addWidget(self.save_button)
+        self.save_button = toolbar_button(
+            "Save Changes", "check_circle", self.save_changes,
+            object_name="editorBtnPrimary", tint="#ffffff",
+        )
 
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setObjectName("editorBtnDanger")
-        self.cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(self.cancel_button)
+        self.cancel_button = toolbar_button(
+            "Cancel", "x_circle", self.reject,
+            object_name="editorBtnDanger", enabled=True,
+        )
 
         self.action_bar.setVisible(False)
         layout.addWidget(self.action_bar)
     
+    def _install_row_menu_button(self, row):
+        """Put the per-row overflow button, centred, in the trailing column."""
+        button = QPushButton()
+        button.setObjectName("editorRowMenuButton")
+        button.setIcon(_make_dots_icon("#7f92ad", 18))
+        button.setIconSize(QSize(18, 18))
+        button.setFixedSize(28, 28)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip("Row actions")
+        button.clicked.connect(self._on_row_menu_clicked)
+
+        holder = QWidget()
+        holder.setObjectName("editorRowMenuHolder")
+        holder_layout = QHBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(0)
+        holder_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.tracks_table.setCellWidget(row, 4, holder)
+
+    def _refresh_row_menu_buttons(self):
+        """Ensure every row still has its overflow button.
+
+        PlaylistTrackTable.dropEvent rebuilds a dragged row with removeRow/insertRow,
+        which discards that row's cell widget. Re-installing after structural changes
+        keeps the column complete instead of leaving gaps where rows were moved.
+        """
+        for row in range(self.tracks_table.rowCount()):
+            if self.tracks_table.cellWidget(row, 4) is None:
+                self._install_row_menu_button(row)
+
+    def _on_row_menu_clicked(self):
+        """Open the existing row context menu from the overflow button.
+
+        The row is resolved by locating the sender rather than captured at creation
+        time, so the menu stays correct after a drag reorder or a delete.
+        """
+        button = self.sender()
+        for row in range(self.tracks_table.rowCount()):
+            holder = self.tracks_table.cellWidget(row, 4)
+            if holder is button or (holder is not None and holder.isAncestorOf(button)):
+                if not self.tracks_table.selectionModel().isRowSelected(row):
+                    self.tracks_table.selectRow(row)
+                # Resolve the row from a viewport point inside it, but pop the menu
+                # under the button so it does not appear detached mid-table.
+                row_point = self.tracks_table.visualItemRect(
+                    self.tracks_table.item(row, 0)
+                ).center()
+                self.show_context_menu(
+                    row_point,
+                    global_pos=button.mapToGlobal(button.rect().bottomLeft()),
+                )
+                return
+
     def _register_track(self, track):
         """Store the track reference and return a safe identifier for UI usage."""
         identifier = getattr(track, 'ratingKey', None)
@@ -4479,35 +5027,52 @@ class PlaylistEditorDialog(QDialog):
         self.cover_preview_label.setPixmap(QPixmap())
         self.cover_preview_label.setText(text)
 
+    def _apply_cover_pixmap(self, pixmap):
+        """Fill the cover frame edge to edge with a centre crop and rounded corners.
+
+        The previous version scaled to a hardcoded 200px inside what is now a 280px
+        frame, so every cover sat letterboxed in a dark box. Scaling by expanding and
+        then cropping the centre makes non-square art fill the square cleanly.
+        """
+        side = EDITOR_COVER_SIZE
+        scaled = pixmap.scaled(
+            side,
+            side,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+        canvas = QPixmap(side, side)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        clip = QPainterPath()
+        clip.addRoundedRect(0.0, 0.0, float(side), float(side), 12.0, 12.0)
+        painter.setClipPath(clip)
+        painter.drawPixmap(
+            -max(0, (scaled.width() - side) // 2),
+            -max(0, (scaled.height() - side) // 2),
+            scaled,
+        )
+        painter.end()
+
+        self.cover_preview_label.setPixmap(canvas)
+        self.cover_preview_label.setText("")
+        return True
+
     def _set_cover_from_bytes(self, image_bytes):
         pixmap = QPixmap()
         if not image_bytes or not pixmap.loadFromData(image_bytes):
             self._set_cover_placeholder("Cover unavailable")
             return False
-        pixmap = pixmap.scaled(
-            200,
-            200,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.cover_preview_label.setPixmap(pixmap)
-        self.cover_preview_label.setText("")
-        return True
+        return self._apply_cover_pixmap(pixmap)
 
     def _set_cover_from_file(self, path):
         pixmap = QPixmap(path)
         if pixmap.isNull():
             self._set_cover_placeholder("Invalid image")
             return False
-        pixmap = pixmap.scaled(
-            200,
-            200,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.cover_preview_label.setPixmap(pixmap)
-        self.cover_preview_label.setText("")
-        return True
+        return self._apply_cover_pixmap(pixmap)
 
     def _playlist_cover_url(self):
         self.current_cover_is_custom = False
@@ -4719,7 +5284,10 @@ class PlaylistEditorDialog(QDialog):
 
     def toggle_duplicate_highlighting(self, enabled):
         self.highlight_duplicates_enabled = bool(enabled)
-        self.highlight_duplicates_button.setText("Hide Duplicates" if enabled else "Highlight Duplicates")
+        if hasattr(self, "duplicates_button"):
+            self.duplicates_button.setText(
+                "Clear Highlight" if enabled else "Find Duplicates"
+            )
         self._apply_duplicate_highlighting()
 
     def _select_duplicate_group_for_row(self, row):
@@ -4757,11 +5325,14 @@ class PlaylistEditorDialog(QDialog):
 
             for item in (title_item, artist_item, album_item, duration_item):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            duration_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             self.tracks_table.setItem(row, 0, title_item)
             self.tracks_table.setItem(row, 1, artist_item)
             self.tracks_table.setItem(row, 2, album_item)
             self.tracks_table.setItem(row, 3, duration_item)
+
+            self._install_row_menu_button(row)
 
             track_id = self._register_track(track)
             self.tracks_table.item(row, 0).setData(Qt.UserRole, track_id)
@@ -4811,7 +5382,7 @@ class PlaylistEditorDialog(QDialog):
                 self._register_track(track)
             self.tracks_table.clearContents()
             self.tracks_table.setRowCount(len(self.tracks))
-            self.track_count_label.setText(f"🎵 Tracks: {len(self.tracks)}")
+            self.track_count_label.setText(f"{len(self.tracks)} tracks")
             self._pending_render_tracks = self.track_rows
             self._render_cursor = 0
 
@@ -4859,7 +5430,7 @@ class PlaylistEditorDialog(QDialog):
     def populate_tracks_table(self, tracks):
         """Populate tracks table efficiently with row numbers"""
         self.tracks_table.setRowCount(len(tracks))
-        self.track_count_label.setText(f"🎵 Tracks: {len(tracks)}")
+        self.track_count_label.setText(f"{len(tracks)} tracks")
 
         # Reset lookup so identifiers reflect current dataset
         self.track_lookup.clear()
@@ -4884,6 +5455,7 @@ class PlaylistEditorDialog(QDialog):
         self.move_down_button.setEnabled(True)
         self.sort_button.setEnabled(True)
         self.highlight_duplicates_button.setEnabled(True)
+        self.duplicates_button.setEnabled(True)
         self.save_button.setEnabled(False)
         self.change_cover_btn.setEnabled(True)
         self.clear_cover_btn.setEnabled(bool(self.pending_cover_path))
@@ -4920,8 +5492,12 @@ class PlaylistEditorDialog(QDialog):
             # Show or hide the row
             self.tracks_table.setRowHidden(row, not show_row)
     
-    def show_context_menu(self, position):
-        """Show right-click context menu"""
+    def show_context_menu(self, position, global_pos=None):
+        """Show the row context menu.
+
+        `position` is in viewport coordinates and is only used to resolve the row.
+        `global_pos` lets the overflow button anchor the popup to itself.
+        """
         if not self.tracks_loaded:
             return
         
@@ -4936,17 +5512,24 @@ class PlaylistEditorDialog(QDialog):
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
-                background-color: #142238;
-                color: #e4f0ff;
-                border: 1px solid #38567f;
-                border-radius: 6px;
+                background-color: #141d2c;
+                color: #e6edf7;
+                border: 1px solid #253449;
+                border-radius: 10px;
+                padding: 6px;
             }
             QMenu::item {
-                padding: 8px 20px;
+                padding: 8px 18px;
+                border-radius: 6px;
             }
             QMenu::item:selected {
-                background-color: #2d5a8f;
+                background-color: #24344c;
                 color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #253449;
+                margin: 6px 8px;
             }
         """)
         
@@ -4955,15 +5538,28 @@ class PlaylistEditorDialog(QDialog):
         move_to_top_action = menu.addAction("⬆️ Move to Top")
         move_to_bottom_action = menu.addAction("⬇️ Move to Bottom")
         menu.addSeparator()
+        selected_rows = len({index.row() for index in
+                             self.tracks_table.selectionModel().selectedRows()})
+        similar_action = menu.addAction(
+            "🎧 Find Similar Tracks..." if selected_rows <= 1
+            else f"🎧 Find Similar to {selected_rows} Tracks..."
+        )
+        similar_action.setToolTip(
+            "Build a playlist of tracks that sound like this one, using Plex's analysis"
+        )
+        menu.addSeparator()
         select_duplicates_action = menu.addAction("🧩 Select Duplicate Group")
         copy_track_action = menu.addAction("📋 Copy Title / Artist")
         menu.addSeparator()
         delete_action = menu.addAction("🗑️ Delete Track")
         
         # Show menu and handle selection
-        action = menu.exec(self.tracks_table.mapToGlobal(position))
+        anchor = global_pos or self.tracks_table.viewport().mapToGlobal(position)
+        action = menu.exec(anchor)
         
-        if action == set_position_action:
+        if action == similar_action:
+            self._open_similar_for_row(row)
+        elif action == set_position_action:
             self.set_track_position(row)
         elif action == move_to_top_action:
             self.move_track_to_position(row, 0)
@@ -4979,6 +5575,41 @@ class PlaylistEditorDialog(QDialog):
             QApplication.clipboard().setText(f"{title} - {artist}".strip(" -"))
         elif action == delete_action:
             self.delete_track_at_row(row)
+
+    def _open_similar_for_row(self, row):
+        """Seed Sonic Discovery from the selected tracks in this playlist.
+
+        The table allows multi-select, so every highlighted row becomes a seed and the
+        result is blended across all of them. The right-clicked row is used when
+        nothing else is selected.
+        """
+        rows = sorted({index.row() for index in
+                       self.tracks_table.selectionModel().selectedRows()} or {row})
+        if row not in rows:
+            rows = [row]
+
+        tracks = []
+        for candidate in rows:
+            item = self.tracks_table.item(candidate, 0)
+            resolved = self._resolve_track(item.data(Qt.UserRole)) if item else None
+            if resolved is not None:
+                tracks.append(resolved)
+
+        if not tracks:
+            QMessageBox.information(
+                self, "Track Unavailable",
+                "Could not resolve those tracks on the server.",
+            )
+            return
+
+        owner = self.parent()
+        if owner is None or not hasattr(owner, "open_sonic_discovery"):
+            QMessageBox.information(
+                self, "Unavailable",
+                "Sonic Discovery is only available from the main window.",
+            )
+            return
+        owner.open_sonic_discovery(mode=MODE_SIMILAR, seed_track=tracks)
 
     def _duration_sort_value(self, value):
         text = str(value or "").strip()
@@ -5025,15 +5656,17 @@ class PlaylistEditorDialog(QDialog):
             ]
             for item in items:
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            items[3].setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             items[0].setData(Qt.UserRole, row_data.get("track_id"))
 
             for col, item in enumerate(items):
                 self.tracks_table.setItem(row_index, col, item)
+            self._install_row_menu_button(row_index)
 
             if selected_track_ids and row_data.get("track_id") in selected_track_ids:
                 self.tracks_table.selectRow(row_index)
 
-        self.track_count_label.setText(f"🎵 Tracks: {len(rows)}")
+        self.track_count_label.setText(f"{len(rows)} tracks")
         self._refresh_internal_track_list()
         self.filter_tracks(self.search_input.text())
         self._apply_duplicate_highlighting()
@@ -5112,17 +5745,24 @@ class PlaylistEditorDialog(QDialog):
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
-                background-color: #142238;
-                color: #e4f0ff;
-                border: 1px solid #38567f;
-                border-radius: 6px;
+                background-color: #141d2c;
+                color: #e6edf7;
+                border: 1px solid #253449;
+                border-radius: 10px;
+                padding: 6px;
             }
             QMenu::item {
-                padding: 8px 20px;
+                padding: 8px 18px;
+                border-radius: 6px;
             }
             QMenu::item:selected {
-                background-color: #2d5a8f;
+                background-color: #24344c;
                 color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #253449;
+                margin: 6px 8px;
             }
         """)
 
@@ -5239,6 +5879,7 @@ class PlaylistEditorDialog(QDialog):
 
     def _refresh_internal_track_list(self):
         """Synchronize internal track list with current table order."""
+        self._refresh_row_menu_buttons()
         ordered_tracks = []
         for row in range(self.tracks_table.rowCount()):
             item = self.tracks_table.item(row, 0)
@@ -5264,7 +5905,7 @@ class PlaylistEditorDialog(QDialog):
         
         if reply == QMessageBox.Yes:
             self.tracks_table.removeRow(row)
-            self.track_count_label.setText(f"🎵 Tracks: {self.tracks_table.rowCount()}")
+            self.track_count_label.setText(f"{self.tracks_table.rowCount()} tracks")
             self._refresh_internal_track_list()
             self._apply_duplicate_highlighting()
             self._update_dirty_state()
@@ -5322,7 +5963,7 @@ class PlaylistEditorDialog(QDialog):
                 self.tracks_table.removeRow(row)
                        
             # Update track count
-            self.track_count_label.setText(f"🎵 Tracks: {self.tracks_table.rowCount()}")
+            self.track_count_label.setText(f"{self.tracks_table.rowCount()} tracks")
             self._refresh_internal_track_list()
             self._apply_duplicate_highlighting()
             self._update_dirty_state()
@@ -5640,11 +6281,26 @@ class SmartM3UUploadThread(QThread):
         self.library_section = library_section
         self.matched_rating_keys = []
         self.not_found = []
+        # Structured mirror of not_found, kept so unmatched tracks can be added to the
+        # Missing Tracks list instead of only appearing in a truncated dialog.
+        self.not_found_tracks = []
         self.parent_widget = parent
         self.stop_requested = False
 
     def stop(self):
         self.stop_requested = True
+
+    def _record_not_found(self, track_info, label=None):
+        title = str((track_info or {}).get("title", "") or "").strip()
+        artist = str((track_info or {}).get("artist", "") or "").strip()
+        album = str((track_info or {}).get("album", "") or "").strip()
+        if label is None:
+            label = f"{title} - {artist}" if artist else (title or "Unknown")
+            if album:
+                label = f"{label} ({album})"
+        self.not_found.append(label)
+        if title:
+            self.not_found_tracks.append({"title": title, "artist": artist, "album": album})
 
     def run(self):
         """Run the smart matching process in background thread"""
@@ -5711,19 +6367,21 @@ class SmartM3UUploadThread(QThread):
                                 selected_key = str(getattr(result_holder['track'], 'ratingKey', '') or '')
                                 if selected_key:
                                     self.matched_rating_keys.append(selected_key)
+                                    # The user just resolved this ambiguity by hand; keep
+                                    # the answer so the next run does not ask again.
+                                    self._remember_manual_choice(track_info, result_holder['track'])
                             else:
-                                self.not_found.append(f"{title} - {artist}" if artist else title)
+                                self._record_not_found(track_info)
                         else:
-                            not_found_label = f"{title} - {artist}" if artist else title
-                            if album:
-                                not_found_label = f"{not_found_label} ({album})"
-                            self.not_found.append(not_found_label)
+                            self._record_not_found(track_info)
                     else:
-                        self.not_found.append(f"{title} - {artist}" if artist else title)
+                        self._record_not_found(track_info)
 
                 except Exception as track_error:
                     logging.error(f"Error processing track {track_info}: {track_error}")
-                    self.not_found.append(f"{track_info.get('title', 'Unknown')} - {track_info.get('artist', '')}")
+                    self._record_not_found(track_info)
+
+            self._store_missing_tracks()
 
             # Upload complete
             self.upload_complete.emit(len(self.matched_rating_keys), total_tracks, self.not_found, list(self.matched_rating_keys))
@@ -5732,12 +6390,41 @@ class SmartM3UUploadThread(QThread):
             logging.error(f"Smart M3U upload thread error: {str(e)}")
             self.upload_error.emit(str(e))
 
+    def _remember_manual_choice(self, track_info, plex_track):
+        library_key = _get_library_match_session_key(self.library_section)
+        store = _get_match_memory_store()
+        if not library_key or store is None:
+            return
+        store.remember_match(
+            library_key,
+            track_info,
+            getattr(plex_track, "ratingKey", ""),
+            target_title=str(getattr(plex_track, "title", "") or ""),
+            target_artist=_extract_plex_track_artist_name(plex_track),
+            target_album=_extract_plex_track_album_name(plex_track),
+        )
+
+    def _store_missing_tracks(self):
+        if not self.not_found_tracks:
+            return
+        library_key = _get_library_match_session_key(self.library_section)
+        store = _get_missing_tracks_store()
+        if not library_key or store is None:
+            return
+        source_label = os.path.basename(str(self.m3u_path or "")) or "M3U import"
+        store.record_missing(library_key, self.not_found_tracks, source_label)
+
+
 class SyncThread(QThread):
     progress_update = pyqtSignal(str, int)  # message, percentage
     sync_complete = pyqtSignal(str, int, int)  # playlist_name, added_tracks, total_tracks
     error = pyqtSignal(str)
 
-    def __init__(self, sync_configs, plex_server, parent=None):
+    # Emitted for a dry run instead of writing anything: playlist_name, preview dict
+    preview_ready = pyqtSignal(str, object)
+
+    def __init__(self, sync_configs, plex_server, parent=None, dry_run=False,
+                 options=None):
         super().__init__(parent)
         self.sync_configs = sync_configs
         self.plex_server = plex_server
@@ -5745,6 +6432,11 @@ class SyncThread(QThread):
         self.deezer_client = deezer.Client()
         self.tidal_client = TidalClient()
         self.stop_requested = False
+        # Dry run resolves and diffs everything but never touches the Plex playlist.
+        self.dry_run = bool(dry_run)
+        # Settings the sync needs, resolved once. Previously these were read live off
+        # the parent widget mid-run, which made a sync impossible without a GUI.
+        self.options = options if options is not None else SyncOptions.from_widget(parent)
 
     def _ensure_not_cancelled(self):
         if self.stop_requested:
@@ -5755,7 +6447,8 @@ class SyncThread(QThread):
             for playlist_name, config in self.sync_configs.items():
                 self._ensure_not_cancelled()
 
-                self.progress_update.emit(f"Syncing {playlist_name}...", 0)
+                verb = "Previewing" if self.dry_run else "Syncing"
+                self.progress_update.emit(f"{verb} {playlist_name}...", 0)
                 added_tracks = self.sync_playlist(playlist_name, config)
                 self.sync_complete.emit(playlist_name, added_tracks, len(config.get('tracks', [])))
 
@@ -5806,13 +6499,12 @@ class SyncThread(QThread):
 
             matched_source_tracks = []
             matched_source_keys = []
+            unmatched_tracks = []
             seen_m3u_signatures = set()
             added_count = 0
             library_section = self.plex_server.library.sectionByID(config.get('library_section'))
             total_tracks = max(len(source_tracks), 1)
-            use_smart_matching = False
-            if hasattr(self.parent(), 'm3u_smart_matching_radio'):
-                use_smart_matching = self.parent().m3u_smart_matching_radio.isChecked()
+            use_smart_matching = bool(self.options.use_smart_matching)
             if use_smart_matching and source_tracks:
                 self.progress_update.emit(f"Indexing library for {playlist_name}...", 1)
                 _prime_library_match_caches(library_section)
@@ -5861,6 +6553,14 @@ class SyncThread(QThread):
                     matched_source_keys.append(plex_track.ratingKey)
                     if plex_track.ratingKey not in current_key_set:
                         added_count += 1
+                else:
+                    unmatched_tracks.append(
+                        {
+                            "title": track_title,
+                            "artist": artist_name,
+                            "album": str(source_track.get("album", "") or ""),
+                        }
+                    )
 
                 progress = int((i + 1) / total_tracks * 100)
                 self.progress_update.emit(f"Checking {playlist_name}... ({i+1}/{len(source_tracks)})", progress)
@@ -5876,16 +6576,72 @@ class SyncThread(QThread):
             final_keys = [track.ratingKey for track in final_tracks]
             should_rebuild = clear_before_sync or (final_keys != current_keys)
 
-            if should_rebuild:
-                self._ensure_not_cancelled()
-                if current_items:
-                    try:
-                        plex_playlist.removeItems(current_items)
-                    except Exception as removal_error:
-                        logging.warning(f"Failed to clear playlist '{playlist_name}': {removal_error}")
-                if final_tracks:
+            before_snapshot = snapshot_tracks(current_items)
+            after_snapshot = snapshot_tracks(final_tracks)
+            library_key = _get_library_match_session_key(library_section)
+
+            # Unmatched tracks are recorded on preview runs too: knowing what a sync
+            # would fail to find is exactly the point of previewing it.
+            self._store_unmatched(library_key, unmatched_tracks, playlist_name)
+
+            if self.dry_run:
+                changes = diff_snapshots(before_snapshot, after_snapshot)
+                self.preview_ready.emit(
+                    playlist_name,
+                    {
+                        "playlist_name": playlist_name,
+                        "source": source_url,
+                        "clear_before_sync": clear_before_sync,
+                        "would_rebuild": should_rebuild,
+                        "before": before_snapshot,
+                        "after": after_snapshot,
+                        "changes": changes,
+                        "unmatched": unmatched_tracks,
+                        "source_track_count": len(source_tracks),
+                    },
+                )
+                return added_count
+
+            history = _get_sync_history_store()
+            run_id = ""
+            if history is not None and library_key:
+                run_id = history.start_run(
+                    library_key,
+                    playlist_name,
+                    source=source_url,
+                    mode="sync",
+                    before_snapshot=before_snapshot,
+                )
+
+            try:
+                if should_rebuild:
                     self._ensure_not_cancelled()
-                    plex_playlist.addItems(final_tracks)
+                    if current_items:
+                        try:
+                            plex_playlist.removeItems(current_items)
+                        except Exception as removal_error:
+                            logging.warning(f"Failed to clear playlist '{playlist_name}': {removal_error}")
+                    if final_tracks:
+                        self._ensure_not_cancelled()
+                        plex_playlist.addItems(final_tracks)
+            except Exception:
+                if run_id and history is not None:
+                    history.finish_run(
+                        run_id,
+                        after_snapshot=before_snapshot,
+                        unmatched_count=len(unmatched_tracks),
+                        status="failed",
+                        message="Playlist rebuild failed",
+                    )
+                raise
+
+            if run_id and history is not None:
+                history.finish_run(
+                    run_id,
+                    after_snapshot=after_snapshot if should_rebuild else before_snapshot,
+                    unmatched_count=len(unmatched_tracks),
+                    message="No changes required" if not should_rebuild else "",
+                )
 
             return added_count
 
@@ -5895,6 +6651,14 @@ class SyncThread(QThread):
             logging.error(f"Error syncing playlist {playlist_name}: {str(e)}")
             self.error.emit(f"Error syncing {playlist_name}: {str(e)}")
             return 0
+
+    def _store_unmatched(self, library_key, unmatched_tracks, playlist_name):
+        if not unmatched_tracks or not library_key:
+            return
+        store = _get_missing_tracks_store()
+        if store is None:
+            return
+        store.record_missing(library_key, unmatched_tracks, f"Sync: {playlist_name}")
 
     def get_spotify_tracks(self, url):
         try:
@@ -5963,11 +6727,7 @@ class SyncThread(QThread):
 
     def get_listenbrainz_tracks(self, url):
         try:
-            token = ""
-            parent = self.parent()
-            if parent and hasattr(parent, "listenbrainz_token_input"):
-                token = parent.listenbrainz_token_input.text().strip()
-
+            token = str(self.options.listenbrainz_token or "").strip()
             client = ListenBrainzClient(token=token or None)
             playlist = client.get_playlist(url)
             entries = playlist.get("track") or []
@@ -6050,7 +6810,9 @@ class SyncThread(QThread):
             title, artist, album, recording_mbid = self.parse_track_info(normalized_track)
             if not title:
                 return None
-            scored_tracks = _rank_plex_track_matches(library_section, normalized_track, self.parent())
+            scored_tracks = _rank_plex_track_matches(
+                library_section, normalized_track, self.options.match_filters
+            )
             if not scored_tracks:
                 return None
 
@@ -8783,10 +9545,11 @@ class PlaylistConverterThread(QThread):
             
             plex_tracks = []
             not_found_tracks = []
+            not_found_details = []
             total_tracks = len(tracks)
             for i, track in enumerate(tracks):
                 self._ensure_not_cancelled()
-                title, artist, _, _ = self.parse_track_info(track)
+                title, artist, album, _ = self.parse_track_info(track)
                 track_label = f"{title} - {artist}" if artist else title
                 self.progress_message.emit(f"Matching track {i + 1}/{total_tracks}: {track_label}")
                 plex_track = self.find_best_match(library_section, track)
@@ -8794,8 +9557,14 @@ class PlaylistConverterThread(QThread):
                     plex_tracks.append(plex_track)
                 else:
                     not_found_tracks.append(track_label)
+                    if title:
+                        not_found_details.append(
+                            {"title": title, "artist": artist, "album": album}
+                        )
                 self.progress_update.emit(50 + int((i + 1) / total_tracks * 50))
-            
+
+            self._store_missing_tracks(library_section, not_found_details, final_name)
+
             self._ensure_not_cancelled()
             self.progress_message.emit(f"Creating Plex playlist '{final_name}'...")
 
@@ -8850,6 +9619,31 @@ class PlaylistConverterThread(QThread):
             logging.error(f"Error creating Plex playlist: {str(e)}", exc_info=True)
             raise ValueError(f"Error creating Plex playlist: {e}")
 
+    def _store_missing_tracks(self, library_section, missing_details, playlist_name):
+        """Add unmatched streaming-import tracks to the Missing Tracks list."""
+        if not missing_details:
+            return
+        library_key = _get_library_match_session_key(library_section)
+        store = _get_missing_tracks_store()
+        if not library_key or store is None:
+            return
+        label = str(playlist_name or "").strip() or "Streaming import"
+        store.record_missing(library_key, missing_details, f"Import: {label}")
+
+    def _remember_manual_choice(self, library_section, source_track, plex_track):
+        library_key = _get_library_match_session_key(library_section)
+        store = _get_match_memory_store()
+        if not library_key or store is None or plex_track is None:
+            return
+        store.remember_match(
+            library_key,
+            source_track,
+            getattr(plex_track, "ratingKey", ""),
+            target_title=str(getattr(plex_track, "title", "") or ""),
+            target_artist=_extract_plex_track_artist_name(plex_track),
+            target_album=_extract_plex_track_album_name(plex_track),
+        )
+
     def find_best_match(self, library_section, track):
         """Enhanced find_best_match with user confirmation for low scores"""
         self._ensure_not_cancelled()
@@ -8889,6 +9683,9 @@ class PlaylistConverterThread(QThread):
             
             if user_choice == "use":
                 logging.info(f"User approved match for '{track}' to '{best_match.title}'")
+                # Remember the confirmation so later imports of the same track do not
+                # re-ask, and so the same ambiguity resolves the same way every time.
+                self._remember_manual_choice(library_section, normalized_track, best_match)
                 return best_match
             elif user_choice == "skip":
                 logging.info(f"User skipped match for '{track}'")
@@ -9101,292 +9898,321 @@ class ModernLineEdit(QLineEdit):
         self.setFixedHeight(40)
 
 class LibraryDuplicateManagerDialog(QDialog):
-    """Professional duplicate track management dialog with safe deletion and playlist integration"""
+    """Review duplicate groups and choose which copies to delete.
+
+    Presented as a tree rather than a scrolling stack of custom frames. The previous
+    version built a QFrame with five stacked labels and a badge for every track, so a
+    real result set (1,976 groups / 4,411 tracks here) meant tens of thousands of
+    widgets, each ~230px tall, all constructed up front. A QTreeWidget virtualises its
+    rows, fits one track per line, and inherits the application theme instead of the
+    hardcoded white it was using.
+    """
+
+    COL_NAME, COL_ALBUM, COL_QUALITY, COL_SIZE, COL_TIME, COL_PLAYLISTS, COL_PATH = range(7)
 
     def __init__(self, duplicate_groups, plex_server, parent=None):
         super().__init__(parent)
         self.duplicate_groups = duplicate_groups
         self.plex_server = plex_server
-        self.selected_for_deletion = set()  # Track rating keys of tracks marked for deletion
+        self.selected_for_deletion = set()
+        self._loading = False
         self.setup_ui()
+        self.populate()
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _format_size(num_bytes):
+        size = float(num_bytes or 0)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+    @staticmethod
+    def _format_time(milliseconds):
+        seconds = int(milliseconds or 0) // 1000
+        return f"{seconds // 60}:{seconds % 60:02d}" if seconds else "-"
+
+    @staticmethod
+    def _quality_text(track):
+        bits = []
+        if track.get("bitrate"):
+            bits.append(f"{track['bitrate']} kbps")
+        if track.get("codec"):
+            bits.append(str(track["codec"]).upper())
+        return " · ".join(bits) or "Unknown"
+
+    @staticmethod
+    def _quality_rank(track):
+        """Higher is better. Used for the suggested keep and Auto-Select."""
+        return (track.get("bitrate") or 0, track.get("file_size") or 0)
+
+    def _best_in_group(self, group):
+        return max(group, key=self._quality_rank)
+
+    # ----------------------------------------------------------------------- ui
 
     def setup_ui(self):
-        self.setWindowTitle("🔍 Library Duplicate Manager")
+        self.setWindowTitle("Library Duplicate Manager")
         self.setModal(True)
-        self.resize(1200, 800)
+        self.resize(1280, 820)
+        self.setMinimumSize(980, 560)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
+        layout.setSpacing(SPACE_MD)
 
-        # Header with statistics
-        header_layout = QHBoxLayout()
-
-        total_duplicates = sum(len(group) for group in self.duplicate_groups)
-        total_space_wasted = sum(
-            sum(track['file_size'] for track in group[1:])  # All but the first track in each group
+        total_tracks = sum(len(group) for group in self.duplicate_groups)
+        reclaimable = sum(
+            sum(t.get("file_size") or 0 for t in group)
+            - (self._best_in_group(group).get("file_size") or 0)
             for group in self.duplicate_groups
+        ) if self.duplicate_groups else 0
+        checked_playlists = any(
+            t["playlists"] for group in self.duplicate_groups for t in group
         )
-        space_mb = total_space_wasted / (1024 * 1024) if total_space_wasted else 0
 
-        # Check if playlist info was included
-        playlist_mode = "with playlist info" if any(any(t['playlists'] for t in group) for group in self.duplicate_groups) else "fast mode"
+        header = QLabel(
+            f"{len(self.duplicate_groups):,} duplicate groups · {total_tracks:,} tracks · "
+            f"up to {self._format_size(reclaimable)} reclaimable"
+        )
+        header.setObjectName("sectionHeaderTitle")
+        layout.addWidget(header)
 
-        stats_label = QLabel(f"📊 Found {len(self.duplicate_groups)} duplicate groups "
-                           f"({total_duplicates} total tracks, ~{space_mb:.1f}MB potential savings)\n"
-                           f"💨 Scan mode: {playlist_mode}")
-        stats_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196F3; padding: 10px;")
-        header_layout.addWidget(stats_label)
-        header_layout.addStretch()
+        subtitle = QLabel(
+            "Ticked tracks are the ones that will be deleted. The best copy in each "
+            "group is marked KEEP and cannot be ticked."
+            + ("" if checked_playlists else
+               "  Playlist usage was not checked in this scan.")
+        )
+        subtitle.setObjectName("helperText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
 
-        # Action buttons in header
-        select_suggested_btn = QPushButton("✨ Auto-Select (Keep Best Quality)")
-        select_suggested_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                padding: 8px 16px;
-                border-radius: 6px;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        select_suggested_btn.clicked.connect(self.auto_select_best_quality)
-        header_layout.addWidget(select_suggested_btn)
+        controls = QHBoxLayout()
+        controls.setSpacing(FIELD_SPACING)
 
-        layout.addLayout(header_layout)
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter by title, artist or album...")
+        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.setMinimumHeight(CONTROL_HEIGHT)
+        self.filter_input.setMaximumWidth(FIELD_MAX_WIDTH)
+        self.filter_input.textChanged.connect(self.apply_filter)
+        controls.addWidget(self.filter_input)
 
-        # Main content area with scroll
-        scroll_area = QScrollArea()
-        scroll_widget = QWidget()
-        self.scroll_layout = QVBoxLayout(scroll_widget)
+        for caption, slot in (
+            ("Expand All", lambda: self.tree.expandAll()),
+            ("Collapse All", lambda: self.tree.collapseAll()),
+            ("Auto-Select Lower Quality", self.auto_select_best_quality),
+            ("Clear Selection", self.clear_selection),
+        ):
+            button = QPushButton(caption)
+            button.setMinimumHeight(CONTROL_HEIGHT)
+            button.clicked.connect(slot)
+            controls.addWidget(button)
+        controls.addStretch()
+        layout.addLayout(controls)
 
-        # Create duplicate group widgets
-        for i, group in enumerate(self.duplicate_groups):
-            group_widget = self.create_duplicate_group_widget(group, i)
-            self.scroll_layout.addWidget(group_widget)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(7)
+        self.tree.setHeaderLabels(
+            ["Track", "Album", "Quality", "Size", "Time", "Playlists", "File"]
+        )
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setUniformRowHeights(True)  # required for smooth scrolling at this size
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header_view = self.tree.header()
+        header_view.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(self.COL_ALBUM, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(self.COL_PATH, QHeaderView.ResizeMode.Stretch)
+        for column in (self.COL_QUALITY, self.COL_SIZE, self.COL_TIME, self.COL_PLAYLISTS):
+            header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.itemChanged.connect(self.on_item_changed)
+        layout.addWidget(self.tree, 1)
 
-        scroll_area.setWidget(scroll_widget)
-        scroll_area.setWidgetResizable(True)
-        layout.addWidget(scroll_area)
-
-        # Bottom action bar
         action_layout = QHBoxLayout()
-
-        # Info about selected tracks
+        action_layout.setSpacing(FIELD_SPACING)
         self.selection_info = QLabel("No tracks selected for deletion")
-        self.selection_info.setStyleSheet("color: #666666; font-style: italic;")
+        self.selection_info.setObjectName("helperText")
         action_layout.addWidget(self.selection_info)
-
         action_layout.addStretch()
 
-        # Action buttons
-        cancel_btn = QPushButton("Cancel")
+        cancel_btn = QPushButton("Close")
+        cancel_btn.setMinimumHeight(CONTROL_HEIGHT)
         cancel_btn.clicked.connect(self.reject)
         action_layout.addWidget(cancel_btn)
 
-        self.delete_btn = QPushButton("🗑️ Delete Selected Duplicates")
-        self.delete_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                font-weight: bold;
-                padding: 10px 20px;
-                border-radius: 6px;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
+        self.delete_btn = QPushButton("Delete Selected Duplicates")
+        self.delete_btn.setProperty("variant", "danger")
+        self.delete_btn.setMinimumHeight(CONTROL_HEIGHT)
         self.delete_btn.setEnabled(False)
         self.delete_btn.clicked.connect(self.confirm_deletion)
         action_layout.addWidget(self.delete_btn)
 
         layout.addLayout(action_layout)
 
-    def create_duplicate_group_widget(self, group, group_index):
-        """Create widget for a single duplicate group"""
-        group_box = QGroupBox(f"🎵 Duplicate Group {group_index + 1}: {group[0]['title']} - {group[0]['artist']}")
-        group_box.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                font-size: 14px;
-                border: 2px solid #3498db;
-                border-radius: 8px;
-                margin: 8px 0px;
-                padding-top: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 8px 0 8px;
-                color: #2c3e50;
-                background-color: white;
-            }
-        """)
+    # ------------------------------------------------------------------ content
 
-        layout = QVBoxLayout(group_box)
+    def populate(self):
+        self._loading = True
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
 
-        # Sort tracks by quality (bitrate, then file size)
-        sorted_tracks = sorted(group, key=lambda t: (t['bitrate'] or 0, t['file_size'] or 0), reverse=True)
+        muted = QColor("#8fa1ba")
+        keep_colour = QColor("#7ef0b4")
+        top_level = []
 
-        for i, track in enumerate(sorted_tracks):
-            track_widget = self.create_track_widget(track, i == 0)  # First (highest quality) suggested to keep
-            layout.addWidget(track_widget)
+        for index, group in enumerate(self.duplicate_groups, start=1):
+            best = self._best_in_group(group)
+            group_size = sum(t.get("file_size") or 0 for t in group)
+            reclaimable = group_size - (best.get("file_size") or 0)
 
-        return group_box
+            parent = QTreeWidgetItem()
+            parent.setText(
+                self.COL_NAME,
+                f"{group[0]['artist']} - {group[0]['title']}",
+            )
+            parent.setText(self.COL_ALBUM, f"{len(group)} copies")
+            parent.setText(self.COL_SIZE, self._format_size(reclaimable))
+            parent.setToolTip(self.COL_SIZE, "Reclaimable if only the best copy is kept")
+            parent.setFirstColumnSpanned(False)
+            parent.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            # Cheap searchable haystack, so filtering never re-reads child columns.
+            parent.setData(
+                self.COL_NAME, Qt.ItemDataRole.UserRole + 1,
+                f"{group[0]['artist']} {group[0]['title']} "
+                + " ".join(t["album"] for t in group).lower(),
+            )
 
-    def create_track_widget(self, track, is_suggested_keep):
-        """Create widget for individual track with full details"""
-        track_frame = QFrame()
-        track_frame.setStyleSheet(f"""
-            QFrame {{
-                border: 2px solid {'#4CAF50' if is_suggested_keep else '#ddd'};
-                border-radius: 6px;
-                padding: 8px;
-                margin: 4px;
-                background-color: {'#f8fff8' if is_suggested_keep else '#ffffff'};
-            }}
-        """)
+            children = []
+            for track in group:
+                is_best = track["rating_key"] == best["rating_key"]
+                child = QTreeWidgetItem()
+                child.setText(
+                    self.COL_NAME,
+                    ("KEEP   " if is_best else "") + f"{track['title']}",
+                )
+                child.setText(self.COL_ALBUM, track["album"])
+                child.setText(self.COL_QUALITY, self._quality_text(track))
+                child.setText(self.COL_SIZE, self._format_size(track["file_size"]))
+                child.setText(self.COL_TIME, self._format_time(track["duration"]))
+                if track["playlists"]:
+                    shown = ", ".join(track["playlists"][:2])
+                    if len(track["playlists"]) > 2:
+                        shown += f" +{len(track['playlists']) - 2}"
+                    child.setText(self.COL_PLAYLISTS, shown)
+                    child.setToolTip(
+                        self.COL_PLAYLISTS, "\n".join(track["playlists"])
+                    )
+                child.setText(self.COL_PATH, track["file_path"])
+                child.setToolTip(self.COL_PATH, track["file_path"])
+                child.setData(self.COL_NAME, Qt.ItemDataRole.UserRole, track)
 
-        layout = QHBoxLayout(track_frame)
+                if is_best:
+                    # The best copy is the safety net; it must not be deletable.
+                    child.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    child.setForeground(self.COL_NAME, keep_colour)
+                    child.setToolTip(
+                        self.COL_NAME, "Highest quality copy - kept automatically"
+                    )
+                else:
+                    child.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                        | Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                    child.setCheckState(self.COL_NAME, Qt.CheckState.Unchecked)
+                    child.setForeground(self.COL_PATH, muted)
+                children.append(child)
 
-        # Checkbox for deletion selection (disabled for suggested keep)
-        checkbox = QCheckBox()
-        checkbox.setEnabled(not is_suggested_keep)
-        if is_suggested_keep:
-            checkbox.setToolTip("🌟 Recommended to keep (highest quality)")
+            parent.addChildren(children)
+            top_level.append(parent)
+
+        self.tree.addTopLevelItems(top_level)
+        self.tree.setUpdatesEnabled(True)
+        self._loading = False
+        self.update_selection_info()
+
+    def apply_filter(self, text):
+        needle = str(text or "").strip().lower()
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            haystack = str(
+                item.data(self.COL_NAME, Qt.ItemDataRole.UserRole + 1) or ""
+            ).lower()
+            item.setHidden(bool(needle) and needle not in haystack)
+
+    # --------------------------------------------------------------- selection
+
+    def on_item_changed(self, item, column):
+        if self._loading or column != self.COL_NAME:
+            return
+        track = item.data(self.COL_NAME, Qt.ItemDataRole.UserRole)
+        if not track:
+            return
+        if item.checkState(self.COL_NAME) == Qt.CheckState.Checked:
+            self.selected_for_deletion.add(track["rating_key"])
         else:
-            checkbox.setToolTip("Select to delete this duplicate")
-
-        checkbox.toggled.connect(lambda checked: self.on_track_selection_changed(track['rating_key'], checked))
-        layout.addWidget(checkbox)
-
-        # Track details
-        details_layout = QVBoxLayout()
-
-        # Main info line
-        main_info = QLabel(f"🎵 <b>{track['title']}</b> - {track['artist']} ({track['album']})")
-        main_info.setStyleSheet("font-size: 14px; margin: 2px 0;")
-        details_layout.addWidget(main_info)
-
-        # Technical details
-        duration_str = f"{track['duration'] // 60000}:{(track['duration'] % 60000) // 1000:02d}" if track['duration'] else "Unknown"
-        bitrate_str = f"{track['bitrate']}kbps" if track['bitrate'] else "Unknown bitrate"
-        size_str = f"{track['file_size'] / (1024*1024):.1f}MB" if track['file_size'] else "Unknown size"
-
-        tech_info = QLabel(f"⚡ {duration_str} • {bitrate_str} • {size_str}")
-        tech_info.setStyleSheet("color: #666666; font-size: 12px; margin: 2px 0;")
-        details_layout.addWidget(tech_info)
-
-        # File path
-        path_info = QLabel(f"📁 {track['file_path']}")
-        path_info.setStyleSheet("color: #888888; font-size: 11px; font-family: monospace; margin: 2px 0;")
-        details_layout.addWidget(path_info)
-
-        # Playlists containing this track
-        if track['playlists']:
-            playlists_str = ", ".join(track['playlists'][:3])  # Show first 3 playlists
-            if len(track['playlists']) > 3:
-                playlists_str += f" (+{len(track['playlists']) - 3} more)"
-            playlist_info = QLabel(f"📝 In playlists: {playlists_str}")
-        elif any(any(t['playlists'] for t in group) for group in self.duplicate_groups):
-            # Some tracks have playlist info, so this one truly isn't in playlists
-            playlist_info = QLabel("📝 Not in any playlists")
-        else:
-            # No tracks have playlist info, so it wasn't checked
-            playlist_info = QLabel("📝 Playlist usage not checked (fast scan mode)")
-
-        playlist_info.setStyleSheet("color: #2196F3; font-size: 12px; margin: 2px 0;")
-        details_layout.addWidget(playlist_info)
-
-        layout.addLayout(details_layout)
-
-        # Quality indicator
-        quality_layout = QVBoxLayout()
-        if is_suggested_keep:
-            quality_label = QLabel("🌟 KEEP\n(Best Quality)")
-            quality_label.setStyleSheet("""
-                QLabel {
-                    background-color: #4CAF50;
-                    color: white;
-                    font-weight: bold;
-                    text-align: center;
-                    padding: 8px;
-                    border-radius: 6px;
-                    font-size: 12px;
-                }
-            """)
-        else:
-            quality_label = QLabel("⚠️ DUPLICATE\n(Lower Quality)")
-            quality_label.setStyleSheet("""
-                QLabel {
-                    background-color: #ff9800;
-                    color: white;
-                    font-weight: bold;
-                    text-align: center;
-                    padding: 8px;
-                    border-radius: 6px;
-                    font-size: 12px;
-                }
-            """)
-
-        quality_layout.addWidget(quality_label)
-        layout.addLayout(quality_layout)
-
-        return track_frame
+            self.selected_for_deletion.discard(track["rating_key"])
+        self.update_selection_info()
 
     def auto_select_best_quality(self):
-        """Automatically select lower quality duplicates for deletion"""
-        self.selected_for_deletion.clear()
-
-        for group in self.duplicate_groups:
-            # Sort by quality, keep the best one
-            sorted_tracks = sorted(group, key=lambda t: (t['bitrate'] or 0, t['file_size'] or 0), reverse=True)
-            # Select all but the highest quality for deletion
-            for track in sorted_tracks[1:]:
-                self.selected_for_deletion.add(track['rating_key'])
-
+        """Tick every copy except the best one in each group."""
+        self.selected_for_deletion = {
+            track["rating_key"]
+            for group in self.duplicate_groups
+            for track in group
+            if track["rating_key"] != self._best_in_group(group)["rating_key"]
+        }
         self.update_ui_selections()
-        self.update_selection_info()
 
-    def on_track_selection_changed(self, rating_key, checked):
-        """Handle individual track selection"""
-        if checked:
-            self.selected_for_deletion.add(rating_key)
-        else:
-            self.selected_for_deletion.discard(rating_key)
-
-        self.update_selection_info()
+    def clear_selection(self):
+        self.selected_for_deletion.clear()
+        self.update_ui_selections()
 
     def update_ui_selections(self):
-        """Update UI to reflect current selections"""
-        # This would need to update checkboxes - simplified for now
-        pass
+        """Push the selection set onto the checkboxes.
+
+        This used to be a no-op, so Auto-Select changed the count in the status bar
+        while every checkbox stayed empty.
+        """
+        self._loading = True
+        self.tree.setUpdatesEnabled(False)
+        for index in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(index)
+            for child_index in range(parent.childCount()):
+                child = parent.child(child_index)
+                if not (child.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                    continue
+                track = child.data(self.COL_NAME, Qt.ItemDataRole.UserRole) or {}
+                child.setCheckState(
+                    self.COL_NAME,
+                    Qt.CheckState.Checked
+                    if track.get("rating_key") in self.selected_for_deletion
+                    else Qt.CheckState.Unchecked,
+                )
+        self.tree.setUpdatesEnabled(True)
+        self._loading = False
+        self.update_selection_info()
 
     def update_selection_info(self):
-        """Update selection information label"""
         count = len(self.selected_for_deletion)
-        if count == 0:
+        if not count:
             self.selection_info.setText("No tracks selected for deletion")
             self.delete_btn.setEnabled(False)
-        else:
-            # Calculate space savings
-            total_size = 0
-            for group in self.duplicate_groups:
-                for track in group:
-                    if track['rating_key'] in self.selected_for_deletion:
-                        total_size += track['file_size'] or 0
-
-            size_mb = total_size / (1024 * 1024)
-            self.selection_info.setText(f"🗑️ {count} tracks selected for deletion (~{size_mb:.1f}MB)")
-            self.delete_btn.setEnabled(True)
+            return
+        total_size = sum(
+            track.get("file_size") or 0
+            for group in self.duplicate_groups
+            for track in group
+            if track["rating_key"] in self.selected_for_deletion
+        )
+        self.selection_info.setText(
+            f"{count:,} track(s) selected · frees {self._format_size(total_size)}"
+        )
+        self.delete_btn.setEnabled(True)
 
     def confirm_deletion(self):
         """Confirm and execute deletion with comprehensive safety checks"""
@@ -9463,7 +10289,9 @@ class LibraryDuplicateManagerDialog(QDialog):
                         log_file.write(f"    Title: {track['title']}\n")
                         log_file.write(f"    Artist: {track['artist']}\n")
                         log_file.write(f"    Album: {track['album']}\n")
-                        log_file.write(f"    Duration: {track['duration'] // 60000 if track['duration'] else 0}:{(track['duration'] % 60000) // 1000:02d if track['duration'] else 0}\n")
+                        duration_ms = track['duration'] or 0
+                        minutes, seconds = divmod(duration_ms // 1000, 60)
+                        log_file.write(f"    Duration: {minutes}:{seconds:02d}\n")
                         log_file.write(f"    Bitrate: {track['bitrate'] or 'Unknown'}kbps\n")
                         log_file.write(f"    File Size: {track['file_size'] / (1024*1024):.1f}MB\n" if track['file_size'] else "    File Size: Unknown\n")
                         log_file.write(f"    File Path: {track['file_path']}\n")
@@ -9493,7 +10321,11 @@ class LibraryDuplicateManagerDialog(QDialog):
         log_path = self.create_duplicate_log(tracks_to_delete)
 
         # Create progress dialog
-        progress = QProgressDialog("Deleting duplicate tracks...", "Cancel", 0, len(tracks_to_delete), self)
+        progress = QProgressDialog(
+            "Deleting duplicate tracks...", "Cancel", 0, len(tracks_to_delete), self
+        )
+        progress.setWindowTitle("Deleting Duplicates")
+        progress.setWindowIcon(get_app_icon())
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
@@ -9847,6 +10679,13 @@ class PlexPlaylistManager(QMainWindow):
         self.server_sync_jobs_ui_refreshing = False
         self.source_playlist_load_thread = None
         self.server_playlist_transfer_thread = None
+        self._pending_auto_connect = False
+        self._auto_connect_attempted = False
+        self._sync_is_dry_run = False
+        self._sync_previews = []
+        self.match_filters = MatchFilters()
+        # Gate on save_config(): stays False until load_config() has populated the UI.
+        self._config_loaded = False
 
         # User management
         self.current_user = None  # Currently selected user
@@ -9867,7 +10706,7 @@ class PlexPlaylistManager(QMainWindow):
         self._update_startup_progress("Finalizing window...", 94)
         self.setStyleSheet(self.get_stylesheet())
         self.setWindowTitle('Syncra - Playlist Manager')
-        self.setWindowIcon(QIcon('Syncra Icon.ico'))
+        self.setWindowIcon(get_app_icon())
         self.setMinimumSize(860, 540)
         self.resize(1280, 780)
         self._update_startup_progress("Ready", 100)
@@ -9893,8 +10732,10 @@ class PlexPlaylistManager(QMainWindow):
         sidebar.setFixedWidth(290)
         sidebar.setObjectName("leftSidebar")
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(16, 14, 16, 14)
-        sidebar_layout.setSpacing(8)
+        sidebar_layout.setContentsMargins(SPACE_MD, SPACE_MD, SPACE_MD, SPACE_MD)
+        # Items sit flush; vertical rhythm comes from the section headers' own margins
+        # instead of a uniform 8px gap that made the list feel disconnected.
+        sidebar_layout.setSpacing(2)
 
         # Logo section
         from PyQt6.QtSvgWidgets import QSvgWidget
@@ -9903,8 +10744,10 @@ class PlexPlaylistManager(QMainWindow):
         logo_widget = QSvgWidget()
         svg_data = QByteArray(self.get_logo_svg().encode('utf-8'))
         logo_widget.load(svg_data)
-        logo_widget.setFixedSize(258, 100)
+        logo_widget.setFixedSize(224, 86)
         sidebar_layout.addWidget(logo_widget)
+        sidebar_layout.addSpacing(SPACE_MD)
+        sidebar_layout.addWidget(self._sidebar_divider())
 
         self.home_btn = ModernButton("Home")
         self.connection_btn = ModernButton("Connection")
@@ -9915,8 +10758,9 @@ class PlexPlaylistManager(QMainWindow):
         self.tools_btn = ModernButton("Tools && Utilities")
         self.settings_btn = ModernButton("Settings")
 
-        nav_style = "text-align: left; padding-left: 12px; font-weight: 600;"
-        for btn in [
+        # Nav buttons are styled from the theme via objectName so they can carry a real
+        # active state (cyan left rail) instead of all looking identical.
+        self._nav_buttons = [
             self.home_btn,
             self.connection_btn,
             self.playlists_btn,
@@ -9925,8 +10769,12 @@ class PlexPlaylistManager(QMainWindow):
             self.sync_btn,
             self.tools_btn,
             self.settings_btn,
-        ]:
-            btn.setStyleSheet(nav_style)
+        ]
+        for btn in self._nav_buttons:
+            btn.setObjectName("sidebarNavButton")
+            btn.setProperty("active", False)
+            btn.setCheckable(False)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._set_button_icon(self.home_btn, "home", QStyle.StandardPixmap.SP_DesktopIcon)
         self._set_button_icon(self.connection_btn, "connection", QStyle.StandardPixmap.SP_DriveNetIcon)
@@ -9937,20 +10785,33 @@ class PlexPlaylistManager(QMainWindow):
         self._set_button_icon(self.tools_btn, "tools_utilities", QStyle.StandardPixmap.SP_ComputerIcon)
         self._set_button_icon(self.settings_btn, "settings", QStyle.StandardPixmap.SP_FileDialogDetailedView)
 
-        sidebar_layout.addWidget(self._sidebar_label("Explore"))
-        sidebar_layout.addWidget(self.home_btn)
-        sidebar_layout.addWidget(self.connection_btn)
-        sidebar_layout.addWidget(self.playlists_btn)
+        for section, buttons in (
+            ("Explore", (self.home_btn, self.connection_btn, self.playlists_btn)),
+            ("Import & Sync", (self.streaming_btn, self.local_tracks_btn, self.sync_btn)),
+            ("Utilities", (self.tools_btn, self.settings_btn)),
+        ):
+            sidebar_layout.addWidget(self._sidebar_section(section))
+            for button in buttons:
+                sidebar_layout.addWidget(button)
 
-        sidebar_layout.addWidget(self._sidebar_label("Import & Sync"))
-        sidebar_layout.addWidget(self.streaming_btn)
-        sidebar_layout.addWidget(self.local_tracks_btn)
-        sidebar_layout.addWidget(self.sync_btn)
-
-        sidebar_layout.addWidget(self._sidebar_label("Utilities"))
-        sidebar_layout.addWidget(self.tools_btn)
-        sidebar_layout.addWidget(self.settings_btn)
         sidebar_layout.addStretch()
+
+        # Footer. The bottom third of the sidebar was dead space; a version line
+        # anchored under a divider closes the column and gives the build number a home.
+        sidebar_layout.addWidget(self._sidebar_divider())
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(SPACE_SM, SPACE_SM, SPACE_SM, 0)
+        footer_row.setSpacing(SPACE_SM)
+        version_label = QLabel(f"Syncra v{__version__}")
+        version_label.setObjectName("sidebarFooterText")
+        footer_row.addWidget(version_label)
+        footer_row.addStretch()
+        self.sidebar_status_dot = QLabel("●")
+        self.sidebar_status_dot.setObjectName("sidebarStatusDot")
+        self.sidebar_status_dot.setProperty("state", "offline")
+        self.sidebar_status_dot.setToolTip("Not connected to Plex")
+        footer_row.addWidget(self.sidebar_status_dot)
+        sidebar_layout.addLayout(footer_row)
 
         main_layout.addWidget(sidebar)
 
@@ -10028,9 +10889,44 @@ class PlexPlaylistManager(QMainWindow):
         # Status bar
         self.statusBar().showMessage("Ready")
 
+    def _sidebar_divider(self):
+        """A full-width hairline used to separate the brand and footer blocks."""
+        line = QFrame()
+        line.setObjectName("sidebarDivider")
+        line.setFixedHeight(1)
+        line.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return line
+
+    def _sidebar_section(self, text):
+        """Section header: a tracked caption followed by a rule running to the edge.
+
+        A bare caption floating above a group of buttons reads as another disabled
+        item. Carrying the rule out from the label makes the grouping explicit without
+        adding a heavy separator between every entry.
+        """
+        holder = QWidget()
+        holder.setObjectName("sidebarSection")
+        row = QHBoxLayout(holder)
+        # Generous space above, tight below, so the caption binds to the group it
+        # labels rather than floating between two of them.
+        row.setContentsMargins(SPACE_SM, SPACE_LG, SPACE_SM, SPACE_XS)
+        row.setSpacing(SPACE_SM)
+
+        caption = QLabel(text.upper())
+        caption.setObjectName("sidebarSectionLabel")
+        row.addWidget(caption, 0)
+
+        rule = QFrame()
+        rule.setObjectName("sidebarSectionRule")
+        rule.setFixedHeight(1)
+        rule.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        row.addWidget(rule, 1)
+
+        return holder
+
     def _sidebar_label(self, text):
         label = QLabel(text.upper())
-        label.setStyleSheet("color: #8fa1ba; font-size: 11px; font-weight: 700; padding: 4px 8px;")
+        label.setObjectName("sidebarSectionLabel")
         return label
 
     def _resolve_asset_icon(self, icon_key):
@@ -10061,59 +10957,159 @@ class PlexPlaylistManager(QMainWindow):
         else:
             button.setIcon(self.style().standardIcon(fallback_pixmap))
         button.setIconSize(QSize(16, 16))
+        # Fusion leaves only 4px between icon and label, which reads as a collision.
+        # QSS has no selector for it and a QProxyStyle override of
+        # PM_ButtonIconSpacing recurses into the application style and crashes the
+        # process, so pad the label instead.
+        label = button.text()
+        if label and not label.startswith(" "):
+            button.setText(" " + label)
 
     def _add_page_to_stack(self, page):
+        page.setObjectName("contentPage")
+
+        # One page gutter and one inter-card rhythm for every page, instead of each
+        # page inheriting whatever Qt's defaults happened to be.
+        page_layout = page.layout()
+        if page_layout is not None:
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(PAGE_SPACING)
+
+        # Pages fill the window. Capping the whole page left a dead column down the
+        # right on wide monitors, which reads as a broken layout. The measure is
+        # enforced per-field (FIELD_MAX_WIDTH) and per-button (ACTION_BUTTON_WIDTH)
+        # instead, so lists and tables get the full width they benefit from.
+        host = QWidget()
+        host.setObjectName("pageHost")
+        host_layout = QHBoxLayout(host)
+        host_layout.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
+        host_layout.setSpacing(0)
+        host_layout.addWidget(page, 1)
+
         scroll = QScrollArea()
         scroll.setObjectName("pageScrollArea")
-        page.setObjectName("contentPage")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(page)
+        # Horizontal scrolling was hard-disabled, so any page whose content had a
+        # minimum width wider than the viewport was simply cut off at the right edge
+        # with no way to reach it. Show the bar only when it is actually needed.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(host)
+
         self.content_stack.addWidget(scroll)
 
+    def _make_metric_card(self, caption, value):
+        """A KPI tile: small tracked caption over a large value, left aligned.
+
+        Replaces a single centred QLabel holding "Caption\\nValue", which gave the two
+        lines identical weight and no hierarchy.
+        """
+        card = QFrame()
+        card.setObjectName("dashboardMetricCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(SPACE_LG, SPACE_MD, SPACE_LG, SPACE_MD)
+        card_layout.setSpacing(SPACE_XS)
+
+        caption_label = QLabel(caption)
+        caption_label.setObjectName("metricCaption")
+        value_label = QLabel(str(value))
+        value_label.setObjectName("metricValue")
+
+        card_layout.addWidget(caption_label)
+        card_layout.addWidget(value_label)
+
+        # setText() on the card updates the value, so existing call sites keep working.
+        card.setText = value_label.setText
+        card._value_label = value_label
+        return card
+
+    def _center_block(self, inner):
+        """Wrap a layout or widget in equal stretches so it centres in its card.
+
+        A compact block pinned to the left of a card that spans a 2500px window looks
+        unbalanced; centring keeps the whitespace symmetrical at any width.
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addStretch(1)
+        if isinstance(inner, QLayout):
+            row.addLayout(inner, 0)
+        else:
+            row.addWidget(inner, 0)
+        row.addStretch(1)
+        return row
+
+    def _action_grid(self, buttons, columns=2, centered=False):
+        """Lay actions out on a grid whose columns are sized, not stretched.
+
+        A plain QGridLayout hands every column an equal share of the pane, which is how
+        'Merge Playlists' ended up as a 760px button.
+
+        centered=True gives every button the same fixed width and centres the whole
+        block in its card, which reads better than a left-hugging cluster when the card
+        is much wider than its contents.
+        """
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(SPACE_SM)
+        grid.setVerticalSpacing(SPACE_SM)
+        for position, button in enumerate(buttons):
+            button.setMinimumHeight(CONTROL_HEIGHT)
+            if centered:
+                # Uniform width: a centred block of ragged buttons looks accidental.
+                button.setFixedWidth(ACTION_BUTTON_WIDTH)
+                button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            else:
+                button.setMaximumWidth(ACTION_BUTTON_WIDTH)
+                button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            grid.addWidget(button, position // columns, position % columns)
+
+        if centered:
+            return self._center_block(grid)
+
+        for column in range(columns):
+            grid.setColumnStretch(column, 1)
+        grid.setColumnStretch(columns, 2)
+        return grid
+
     def add_unified_page_header(self, layout, title, subtitle, icon_key):
-        header = QFrame()
-        header.setObjectName("sectionHeaderCard")
-        row = QVBoxLayout(header)
-        row.setContentsMargins(12, 10, 12, 10)
-        row.setSpacing(2)
+        """Intentionally renders nothing.
 
-        title_row = QHBoxLayout()
-        title_row.setContentsMargins(0, 0, 0, 0)
-        title_row.setSpacing(8)
-        title_row.addStretch(1)
-
-        title_icon = QLabel()
-        title_icon.setFixedSize(22, 22)
-        icon = self._resolve_asset_icon(icon_key)
-        if icon and not icon.isNull():
-            title_icon.setPixmap(icon.pixmap(QSize(18, 18)))
-        title_icon.setAlignment(Qt.AlignCenter)
-        title_row.addWidget(title_icon, 0, Qt.AlignCenter)
-
-        section_title = QLabel(title)
-        section_title.setObjectName("sectionHeaderTitle")
-        section_title.setAlignment(Qt.AlignCenter)
-        title_row.addWidget(section_title, 0, Qt.AlignCenter)
-
-        right_balance = QLabel()
-        right_balance.setFixedSize(22, 22)
-        title_row.addWidget(right_balance, 0, Qt.AlignCenter)
-        title_row.addStretch(1)
-
-        section_subtitle = QLabel(subtitle)
-        section_subtitle.setObjectName("sectionHeaderSubtitle")
-        section_subtitle.setAlignment(Qt.AlignCenter)
-
-        row.addLayout(title_row)
-        row.addWidget(section_subtitle, 0, Qt.AlignCenter)
-        layout.addWidget(header)
+        Every page used to draw a centre-aligned card repeating the exact title and
+        subtitle the top bar already shows, so each screen opened with the same heading
+        twice -- once left-aligned, once centred. The top bar is the page header; this
+        stays as a no-op so the eight existing call sites keep working.
+        """
+        return
 
     def navigate_to_page(self, index, title, subtitle):
         self.content_stack.setCurrentIndex(index)
         self.page_title_label.setText(title)
         self.page_subtitle_label.setText(subtitle)
+        self._highlight_active_nav(index)
+
+    def _set_identity_state(self, widget, state):
+        """Swap a themed dynamic state on a widget and repolish it."""
+        if widget is None:
+            return
+        widget.setProperty("state", state)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _highlight_active_nav(self, index):
+        """Mark the sidebar button for `index` active and repolish the rail."""
+        buttons = getattr(self, "_nav_buttons", None)
+        if not buttons:
+            return
+        for position, button in enumerate(buttons):
+            is_active = position == index
+            if button.property("active") == is_active:
+                continue
+            button.setProperty("active", is_active)
+            # Dynamic QSS properties require an explicit repolish to take effect.
+            button.style().unpolish(button)
+            button.style().polish(button)
 
     def create_dashboard_page(self):
         page = QWidget()
@@ -10143,24 +11139,22 @@ class PlexPlaylistManager(QMainWindow):
         hero_layout.addLayout(hero_top_row)
 
         metrics_row = QHBoxLayout()
-        metrics_row.setSpacing(10)
-        self.metric_playlists = QLabel("Playlists\n0")
-        self.metric_playlists.setObjectName("dashboardMetricCard")
-        self.metric_playlists.setAlignment(Qt.AlignCenter)
-        self.metric_sync_jobs = QLabel("Sync Jobs\n0")
-        self.metric_sync_jobs.setObjectName("dashboardMetricCard")
-        self.metric_sync_jobs.setAlignment(Qt.AlignCenter)
-        self.metric_user = QLabel("Active User\nGuest")
-        self.metric_user.setObjectName("dashboardMetricCard")
-        self.metric_user.setAlignment(Qt.AlignCenter)
-        metrics_row.addWidget(self.metric_playlists)
-        metrics_row.addWidget(self.metric_sync_jobs)
-        metrics_row.addWidget(self.metric_user)
+        metrics_row.setSpacing(SPACE_MD)
+        self.metric_playlists = self._make_metric_card("Playlists", "0")
+        self.metric_sync_jobs = self._make_metric_card("Sync Jobs", "0")
+        self.metric_user = self._make_metric_card("Active User", "Guest")
+        self.metric_missing = self._make_metric_card("Missing Tracks", "0")
+        self.metric_missing.setToolTip("Tracks your imports could not find. Open Tools → Missing Tracks.")
+        for card in (self.metric_playlists, self.metric_sync_jobs,
+                     self.metric_user, self.metric_missing):
+            metrics_row.addWidget(card, 1)
         hero_layout.addLayout(metrics_row)
         layout.addWidget(hero)
 
         quick_group = QGroupBox("Quick Actions")
-        quick_layout = QGridLayout(quick_group)
+        quick_box = QVBoxLayout(quick_group)
+        quick_box.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        quick_box.setSpacing(GROUP_SPACING)
 
         connect_quick = ModernButton("Connect to Plex")
         connect_quick.clicked.connect(lambda: self.navigate_to_page(1, "Connection", "Connect and authenticate with Plex"))
@@ -10178,18 +11172,25 @@ class PlexPlaylistManager(QMainWindow):
         tools_quick.clicked.connect(lambda: self.navigate_to_page(6, "Tools & Utilities", "Advanced maintenance and analysis"))
         self._set_button_icon(tools_quick, "tools_utilities", QStyle.StandardPixmap.SP_ComputerIcon)
 
-        quick_layout.addWidget(connect_quick, 0, 0)
-        quick_layout.addWidget(fetch_quick, 0, 1)
-        quick_layout.addWidget(stream_quick, 1, 0)
-        quick_layout.addWidget(sync_quick, 1, 1)
-        quick_layout.addWidget(tools_quick, 2, 0)
+        quick_box.addLayout(self._action_grid([
+            connect_quick,
+            fetch_quick,
+            stream_quick,
+            sync_quick,
+            tools_quick,
+        ], columns=3))
         layout.addWidget(quick_group)
 
         status_group = QGroupBox("Status")
         status_layout = QVBoxLayout(status_group)
+        status_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        status_layout.setSpacing(GROUP_SPACING)
+        # Left-aligned: two short lines centred in a wide card read as an error state.
         self.dashboard_status_label = QLabel("Connection: Not connected\nMetadata Fixer: Disabled")
-        self.dashboard_status_label.setStyleSheet("color: #c9d1df; line-height: 1.4;")
-        self.dashboard_status_label.setAlignment(Qt.AlignCenter)
+        self.dashboard_status_label.setObjectName("helperText")
+        self.dashboard_status_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         status_layout.addWidget(self.dashboard_status_label)
         layout.addWidget(status_group)
         layout.addStretch()
@@ -10201,35 +11202,102 @@ class PlexPlaylistManager(QMainWindow):
         layout = QVBoxLayout(page)
         self.add_unified_page_header(layout, "Sync Manager", "Configure scheduled synchronization between sources and Plex", "sync_manager")
 
-        # Auto-sync controls
-        header_layout = QHBoxLayout()
+        # At-a-glance strip. The page previously opened straight into a checkbox, so
+        # answering "is anything actually syncing?" meant reading four separate cards.
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(SPACE_MD)
+        # _make_metric_card aliases setText() onto the card, so the card itself is the
+        # handle for updating its value.
+        self.sync_metric_configured = self._make_metric_card("Configured", "0")
+        self.sync_metric_auto = self._make_metric_card("Auto-Sync", "Off")
+        self.sync_metric_scheduled = self._make_metric_card("Next scheduled", "Off")
+        self.sync_metric_last = self._make_metric_card("Last sync", "Never")
+        for card in (self.sync_metric_configured, self.sync_metric_auto,
+                     self.sync_metric_scheduled, self.sync_metric_last):
+            metrics_row.addWidget(card, 1)
+        layout.addLayout(metrics_row)
+
+        # Two columns: the configuration list gets the space it needs, and the
+        # settings that are set once and forgotten move out of its way. Stacked
+        # vertically, six cards left the table a few rows tall on a wide monitor.
+        columns = QSplitter(Qt.Orientation.Horizontal)
+        columns.setObjectName("syncColumns")
+        columns.setChildrenCollapsible(False)
+        columns.setHandleWidth(SPACE_MD)
+
+        left_column = QWidget()
+        left_layout = QVBoxLayout(left_column)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(PAGE_SPACING)
+
+        right_column = QWidget()
+        right_layout = QVBoxLayout(right_column)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(PAGE_SPACING)
+
+        # Auto-sync controls. Previously a bare row floating outside any card, which
+        # broke the left edge alignment every other block on the page followed.
+        auto_sync_group = QGroupBox("Automatic Sync")
+        auto_sync_layout = QVBoxLayout(auto_sync_group)
+        auto_sync_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        auto_sync_layout.setSpacing(GROUP_SPACING)
+
+        # Same label/field grid as Scheduled Sync below. As a single horizontal row
+        # this clipped its own checkbox label once it moved into the side column.
+        auto_grid = QGridLayout()
+        auto_grid.setContentsMargins(0, 0, 0, 0)
+        auto_grid.setHorizontalSpacing(SPACE_MD)
+        auto_grid.setVerticalSpacing(SPACE_SM)
+        auto_grid.setColumnMinimumWidth(0, SIDE_LABEL_COLUMN)
+        auto_grid.setColumnStretch(2, 1)
+
         self.auto_sync_checkbox = QCheckBox("Enable Auto-Sync")
         self.auto_sync_checkbox.stateChanged.connect(self.toggle_auto_sync)
-        header_layout.addWidget(self.auto_sync_checkbox)
+        auto_grid.addWidget(self.auto_sync_checkbox, 0, 0, 1, 2,
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        interval_label = QLabel("Interval:")
+        interval_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        auto_grid.addWidget(interval_label, 1, 0)
 
         self.sync_interval_spinbox = QSpinBox()
         self.sync_interval_spinbox.setMinimum(5)
         self.sync_interval_spinbox.setMaximum(1440)  # 24 hours
         self.sync_interval_spinbox.setValue(60)
         self.sync_interval_spinbox.setSuffix(" minutes")
+        self.sync_interval_spinbox.setMinimumHeight(CONTROL_HEIGHT)
+        self.sync_interval_spinbox.setMinimumWidth(SIDE_FIELD_MIN)
+        self.sync_interval_spinbox.setMaximumWidth(FIELD_MAX_WIDTH)
         self.sync_interval_spinbox.valueChanged.connect(lambda: self.save_sync_config())
-        header_layout.addWidget(QLabel("Interval:"))
-        header_layout.addWidget(self.sync_interval_spinbox)
+        auto_grid.addWidget(self.sync_interval_spinbox, 1, 1,
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        layout.addLayout(header_layout)
+        auto_sync_layout.addLayout(auto_grid)
+
+        right_layout.addWidget(auto_sync_group)
 
         # Scheduled Sync Section
         scheduled_group = QGroupBox("Scheduled Sync")
         scheduled_layout = QVBoxLayout(scheduled_group)
+        scheduled_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        scheduled_layout.setSpacing(GROUP_SPACING)
 
-        # First row: Enable checkbox, date/time picker
-        first_row = QHBoxLayout()
+        # Same two-column grid as Sync Configurations below, so the label column and
+        # the field column line up across both cards.
+        scheduled_grid = QGridLayout()
+        scheduled_grid.setContentsMargins(0, 0, 0, 0)
+        scheduled_grid.setHorizontalSpacing(SPACE_MD)
+        scheduled_grid.setVerticalSpacing(SPACE_SM)
+        scheduled_grid.setColumnMinimumWidth(0, SIDE_LABEL_COLUMN)
+        scheduled_grid.setColumnStretch(2, 1)
 
         self.scheduled_sync_checkbox = QCheckBox("Enable Scheduled Sync")
         self.scheduled_sync_checkbox.stateChanged.connect(self.toggle_scheduled_sync)
-        first_row.addWidget(self.scheduled_sync_checkbox)
+        scheduled_grid.addWidget(self.scheduled_sync_checkbox, 0, 0, 1, 2, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        first_row.addWidget(QLabel("Start Date & Time:"))
+        start_label = QLabel("Start Date & Time:")
+        start_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        scheduled_grid.addWidget(start_label, 1, 0)
 
         from PyQt6.QtCore import QDateTime
         self.scheduled_datetime = QDateTimeEdit()
@@ -10238,15 +11306,14 @@ class PlexPlaylistManager(QMainWindow):
         self.scheduled_datetime.setMinimumDateTime(QDateTime.currentDateTime())
         self.scheduled_datetime.setDateTime(QDateTime.currentDateTime().addSecs(3600))  # Default 1 hour from now
         self.scheduled_datetime.dateTimeChanged.connect(self.on_scheduled_datetime_changed)
-        first_row.addWidget(self.scheduled_datetime)
+        self.scheduled_datetime.setMinimumHeight(CONTROL_HEIGHT)
+        self.scheduled_datetime.setMinimumWidth(SIDE_FIELD_MIN)
+        self.scheduled_datetime.setMaximumWidth(FIELD_MAX_WIDTH)
+        scheduled_grid.addWidget(self.scheduled_datetime, 1, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        first_row.addStretch()
-        scheduled_layout.addLayout(first_row)
-
-        # Second row: Repeat options
-        second_row = QHBoxLayout()
-
-        second_row.addWidget(QLabel("Repeat:"))
+        repeat_label = QLabel("Repeat:")
+        repeat_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        scheduled_grid.addWidget(repeat_label, 2, 0)
 
         self.repeat_combo = QComboBox()
         self.repeat_combo.addItem("Once (No Repeat)", "once")
@@ -10256,111 +11323,195 @@ class PlexPlaylistManager(QMainWindow):
         self.repeat_combo.addItem("Bi-Weekly (Every 14 days)", "biweekly")
         self.repeat_combo.addItem("Monthly (Every 30 days)", "monthly")
         self.repeat_combo.currentIndexChanged.connect(self.on_repeat_changed)
-        second_row.addWidget(self.repeat_combo)
+        self.repeat_combo.setMinimumHeight(CONTROL_HEIGHT)
+        self.repeat_combo.setMinimumWidth(SIDE_FIELD_MIN)
+        self.repeat_combo.setMaximumWidth(FIELD_MAX_WIDTH)
+        scheduled_grid.addWidget(self.repeat_combo, 2, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        second_row.addWidget(QLabel("     Status:"))
+        status_label = QLabel("Status:")
+        status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        scheduled_grid.addWidget(status_label, 3, 0)
 
         self.scheduled_status_label = QLabel("No scheduled sync")
-        self.scheduled_status_label.setStyleSheet("color: #888; font-style: italic;")
-        second_row.addWidget(self.scheduled_status_label)
+        self.scheduled_status_label.setObjectName("mutedText")
+        scheduled_grid.addWidget(self.scheduled_status_label, 3, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        second_row.addStretch()
-        scheduled_layout.addLayout(second_row)
+        scheduled_layout.addLayout(scheduled_grid)
 
-        layout.addWidget(scheduled_group)
-        
+        right_layout.addWidget(scheduled_group)
+
         # Sync configurations
         sync_group = QGroupBox("Sync Configurations")
         sync_layout = QVBoxLayout(sync_group)
-        
-        # Add new sync config
-        add_config_layout = QHBoxLayout()
+        sync_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        sync_layout.setSpacing(GROUP_SPACING)
+
+        # Add new sync config. A grid rather than a hbox so the two labels share a
+        # right-aligned column and both fields start on the same x, with the action
+        # button pinned to the far column.
+        add_config_layout = QGridLayout()
         add_config_layout.setContentsMargins(0, 0, 0, 0)
-        add_config_layout.setSpacing(6)
-        
+        add_config_layout.setHorizontalSpacing(SPACE_MD)
+        add_config_layout.setVerticalSpacing(SPACE_SM)
+        add_config_layout.setColumnMinimumWidth(0, SIDE_LABEL_COLUMN)
+        add_config_layout.setColumnStretch(3, 1)
+
+        playlist_label = QLabel("Plex Playlist:")
+        playlist_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        add_config_layout.addWidget(playlist_label, 0, 0)
+
         self.sync_playlist_combo = QComboBox()
         self.sync_playlist_combo.setMinimumWidth(200)
-        self.sync_playlist_combo.setMinimumHeight(34)
-        add_config_layout.addWidget(QLabel("Plex Playlist:"))
-        add_config_layout.addWidget(self.sync_playlist_combo)
-        
+        self.sync_playlist_combo.setMinimumHeight(CONTROL_HEIGHT)
+        self.sync_playlist_combo.setMinimumWidth(SIDE_FIELD_MIN)
+        self.sync_playlist_combo.setMaximumWidth(FIELD_MAX_WIDTH)
+        add_config_layout.addWidget(self.sync_playlist_combo, 0, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        source_label = QLabel("Source:")
+        source_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        add_config_layout.addWidget(source_label, 1, 0)
+
         self.sync_source_input = QLineEdit()
-        self.sync_source_input.setMinimumHeight(34)
+        self.sync_source_input.setMinimumHeight(CONTROL_HEIGHT)
         self.sync_source_input.setPlaceholderText("Enter streaming URL (Spotify/Deezer/Tidal/ListenBrainz) or M3U file path")
-        add_config_layout.addWidget(QLabel("Source:"))
-        add_config_layout.addWidget(self.sync_source_input)
-        
+        self.sync_source_input.setMinimumWidth(SIDE_FIELD_MIN)
+        self.sync_source_input.setMaximumWidth(FIELD_MAX_WIDTH)
+        add_config_layout.addWidget(self.sync_source_input, 1, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
         self.add_sync_config_btn = ModernButton("Add Sync Config")
-        self.add_sync_config_btn.setFixedHeight(34)
+        self.add_sync_config_btn.setProperty("variant", "primary")
+        self.add_sync_config_btn.setMinimumHeight(CONTROL_HEIGHT)
+        self.add_sync_config_btn.setMaximumWidth(ACTION_BUTTON_WIDTH)
         self.add_sync_config_btn.clicked.connect(self.add_sync_config)
-        add_config_layout.addWidget(self.add_sync_config_btn)
-        add_config_layout.setAlignment(self.add_sync_config_btn, Qt.AlignmentFlag.AlignVCenter)
-        
+        add_config_layout.addWidget(self.add_sync_config_btn, 1, 2, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
         sync_layout.addLayout(add_config_layout)
-        
+
         # Sync configurations table
         self.sync_configs_table = QTableWidget()
         self.sync_configs_table.setColumnCount(5)
-        self.sync_configs_table.setHorizontalHeaderLabels(["Playlist", "Source", "Last Sync", "Clear on Sync", "Actions"])
-        self.sync_configs_table.horizontalHeader().setStretchLastSection(True)
+        self.sync_configs_table.setHorizontalHeaderLabels(["Playlist", "Source", "Last Sync", "Clear", "Actions"])
+        # Source is the stretch column. Leaving the last section stretching as well
+        # fought the fixed Actions width and clipped the Delete button.
+        self.sync_configs_table.horizontalHeader().setStretchLastSection(False)
         
         # HIDE THE VERTICAL HEADER (row numbers) - this removes the white bar
         self.sync_configs_table.verticalHeader().setVisible(False)
         
-        # FIXED: Set proper column widths for buttons to be visible
-        self.sync_configs_table.setColumnWidth(0, 200)  # Playlist
-        self.sync_configs_table.setColumnWidth(1, 300)  # Source
-        self.sync_configs_table.setColumnWidth(2, 150)  # Last Sync
-        self.sync_configs_table.setColumnWidth(3, 140)  # Clear before sync
-        self.sync_configs_table.setColumnWidth(4, 180)  # Actions - wider for buttons
+        # Source stretches; the rest size to their content so the table fits the
+        # viewport instead of forcing a horizontal scrollbar at common widths.
+        sync_header = self.sync_configs_table.horizontalHeader()
+        sync_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        sync_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        sync_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        sync_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        sync_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        # A stretch column with no floor collapses to a few pixels once the fixed
+        # columns have taken their share, so Source could end up 47px wide.
+        sync_header.setMinimumSectionSize(80)
+        self.sync_configs_table.setColumnWidth(0, 200)  # Playlist (carries the cover)
+        self.sync_configs_table.setColumnWidth(4, 156)  # Actions - fits both buttons
+        self.sync_configs_table.setAlternatingRowColors(True)
+        self.sync_configs_table.setShowGrid(False)
+        self.sync_configs_table.setMinimumHeight(240)
+        self.sync_configs_table.setIconSize(QSize(self.SYNC_COVER_SIZE, self.SYNC_COVER_SIZE))
+        self.sync_configs_table.verticalHeader().setDefaultSectionSize(self.SYNC_ROW_HEIGHT)
         sync_layout.addWidget(self.sync_configs_table)
-        
-        layout.addWidget(sync_group)
-        
+
+        left_layout.addWidget(sync_group, 1)
+
         # Manual sync controls
         manual_group = QGroupBox("Manual Sync")
         manual_layout = QHBoxLayout(manual_group)
-        
+        manual_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        manual_layout.setSpacing(FIELD_SPACING)
+
+        self.preview_sync_btn = ModernButton("👁 Preview Changes")
+        self.preview_sync_btn.setToolTip(
+            "Resolve every source track and show exactly what would be added and removed, "
+            "without writing anything to Plex"
+        )
+        self.preview_sync_btn.clicked.connect(self.preview_selected_playlists)
+        manual_layout.addWidget(self.preview_sync_btn)
+
         self.sync_selected_btn = ModernButton("Sync Selected")
+        self.sync_selected_btn.setProperty("variant", "primary")
         self.sync_selected_btn.clicked.connect(self.sync_selected_playlists)
         manual_layout.addWidget(self.sync_selected_btn)
-        
+
         self.sync_all_btn = ModernButton("Sync All")
         self.sync_all_btn.clicked.connect(self.sync_all_playlists)
         manual_layout.addWidget(self.sync_all_btn)
-        
+
+        self.sync_history_btn = ModernButton("🕘 Sync History")
+        self.sync_history_btn.setToolTip("Review past sync runs and revert one if it went wrong")
+        self.sync_history_btn.clicked.connect(self.open_sync_history_dialog)
+        manual_layout.addWidget(self.sync_history_btn)
+
         manual_layout.addStretch()
+
+        left_layout.addWidget(manual_group)
         
-        layout.addWidget(manual_group)
-        
-        # Sync progress
+        # Sync progress - the busy state, styled to sit beside the Connected badge
+        # language rather than as a bare progress bar.
         self.sync_progress_group = QGroupBox("Sync Progress")
         self.sync_progress_group.setVisible(False)
         progress_layout = QVBoxLayout(self.sync_progress_group)
-        
+        progress_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        progress_layout.setSpacing(GROUP_SPACING)
+
+        progress_row = QHBoxLayout()
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(FIELD_SPACING)
+
         self.sync_status_label = QLabel("Ready")
-        progress_layout.addWidget(self.sync_status_label)
-        
+        self.sync_status_label.setObjectName("helperText")
+        progress_row.addWidget(self.sync_status_label, 1)
+
+        self.stop_sync_btn = ModernButton("Stop Sync")
+        self.stop_sync_btn.setProperty("variant", "danger")
+        self.stop_sync_btn.setMinimumHeight(CONTROL_HEIGHT)
+        self.stop_sync_btn.clicked.connect(self.stop_sync)
+        progress_row.addWidget(self.stop_sync_btn, 0)
+
+        progress_layout.addLayout(progress_row)
+
         self.sync_progress_bar = QProgressBar()
         progress_layout.addWidget(self.sync_progress_bar)
-        
-        self.stop_sync_btn = ModernButton("Stop Sync")
-        self.stop_sync_btn.clicked.connect(self.stop_sync)
-        progress_layout.addWidget(self.stop_sync_btn)
-        
-        layout.addWidget(self.sync_progress_group)
-        
+
+
         # Sync log
         log_group = QGroupBox("Sync Log")
         log_layout = QVBoxLayout(log_group)
-        
+        log_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        log_layout.setSpacing(GROUP_SPACING)
+
         self.sync_log = QTextEdit()
-        self.sync_log.setMaximumHeight(150)
+        self.sync_log.setMinimumHeight(120)
+        # No maximum: in the side column the log should take the leftover height
+        # instead of leaving a dead gap under it.
         self.sync_log.setReadOnly(True)
         log_layout.addWidget(self.sync_log)
-        
-        layout.addWidget(log_group)
-        
+
+        right_layout.addWidget(log_group, 1)
+
+        columns.addWidget(left_column)
+        columns.addWidget(right_column)
+        columns.setStretchFactor(0, 3)
+        columns.setStretchFactor(1, 2)
+        # Floors, not targets: the stretch factors above give the table most of the
+        # room on a wide window. Kept modest so the page as a whole can still be
+        # narrowed -- below this the table scrolls internally rather than the page
+        # growing a horizontal scrollbar.
+        right_column.setMinimumWidth(300)
+        left_column.setMinimumWidth(560)
+        layout.addWidget(columns, 1)
+
+        # Progress spans the full width beneath both columns; it is the one thing
+        # that matters more than anything else on the page while a sync is running.
+        layout.addWidget(self.sync_progress_group)
+
+        self.refresh_sync_metrics()
         self._add_page_to_stack(page)
         
     def create_tools_page(self):
@@ -10368,44 +11519,75 @@ class PlexPlaylistManager(QMainWindow):
         layout = QVBoxLayout(page)
         self.add_unified_page_header(layout, "Tools & Utilities", "Advanced operations, diagnostics, and library maintenance", "tools_utilities")
         
-        # Playlist operations
+        # Playlist operations. Labels carry no emoji: every one of these buttons also
+        # sets an icon, and rendering both produced a doubled glyph on each row.
         playlist_ops_group = QGroupBox("Playlist Operations")
-        playlist_ops_layout = QGridLayout(playlist_ops_group)
-        
-        # Merge playlists
+        playlist_ops_box = QVBoxLayout(playlist_ops_group)
+        playlist_ops_box.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        playlist_ops_box.setSpacing(GROUP_SPACING)
+
         self.merge_playlists_btn = ModernButton("Merge Playlists")
         self.merge_playlists_btn.clicked.connect(self.show_playlist_merger)
-        playlist_ops_layout.addWidget(self.merge_playlists_btn, 0, 0)
-        
-        # Duplicate detection
-        self.find_duplicates_btn = ModernButton("🔍 Find Library Duplicates")
+
+        self.find_duplicates_btn = ModernButton("Find Library Duplicates")
         self.find_duplicates_btn.clicked.connect(self.find_duplicate_tracks)
         self.find_duplicates_btn.setToolTip("Scan entire music library for duplicate tracks with safe deletion options")
-        playlist_ops_layout.addWidget(self.find_duplicates_btn, 0, 1)
-        
-        # Backup playlists
+
         self.backup_playlists_btn = ModernButton("Backup All Playlists")
         self.backup_playlists_btn.clicked.connect(self.backup_all_playlists)
-        playlist_ops_layout.addWidget(self.backup_playlists_btn, 1, 0)
-        
-        # Restore playlists
+
         self.restore_playlists_btn = ModernButton("Restore Playlists")
         self.restore_playlists_btn.clicked.connect(self.restore_playlists)
-        playlist_ops_layout.addWidget(self.restore_playlists_btn, 1, 1)
 
-        # Portable playlist+audio backup
-        self.portable_backup_btn = ModernButton("Portable Backup")
-        self.portable_backup_btn.clicked.connect(self.open_portable_backup_dialog)
-        self.portable_backup_btn.setToolTip("Back up playlists plus actual audio files into a portable folder")
-        self._set_button_icon(self.portable_backup_btn, "local_tracks", QStyle.StandardPixmap.SP_DriveHDIcon)
-        playlist_ops_layout.addWidget(self.portable_backup_btn, 2, 1)
-
-        # File metadata fixer
         self.metadata_fixer_btn = ModernButton("File Metadata Fixer")
         self.metadata_fixer_btn.clicked.connect(self.open_metadata_fixer)
         self.metadata_fixer_btn.setToolTip("Scan with MusicBrainz and write selected metadata fixes to local audio file tags")
-        self._set_button_icon(self.metadata_fixer_btn, "metadata_fixer", QStyle.StandardPixmap.SP_FileDialogInfoView)
-        playlist_ops_layout.addWidget(self.metadata_fixer_btn, 2, 0)
+
+        self.portable_backup_btn = ModernButton("Portable Backup")
+        self.portable_backup_btn.clicked.connect(self.open_portable_backup_dialog)
+        self.portable_backup_btn.setToolTip("Back up playlists plus actual audio files into a portable folder")
+
+        self.missing_tracks_btn = ModernButton("Missing Tracks")
+        self.missing_tracks_btn.clicked.connect(self.open_missing_tracks_dialog)
+        self.missing_tracks_btn.setToolTip(
+            "Everything your imports and syncs could not find in this library, with re-check and export"
+        )
+
+        self.sonic_similar_btn = ModernButton("Sonic Discovery")
+        self.sonic_similar_btn.clicked.connect(
+            lambda: self.open_sonic_discovery(mode=MODE_SIMILAR)
+        )
+        self.sonic_similar_btn.setToolTip(
+            "Build a playlist from tracks that sound like a seed track, using Plex's "
+            "own analysis of your library"
+        )
+
+        self.sonic_adventure_btn = ModernButton("Sonic Adventure")
+        self.sonic_adventure_btn.clicked.connect(
+            lambda: self.open_sonic_discovery(mode=MODE_ADVENTURE)
+        )
+        self.sonic_adventure_btn.setToolTip(
+            "Pick a start and end track and let Plex plot the gradual path between them"
+        )
+
+        self.match_memory_btn = ModernButton("Match Memory")
+        self.match_memory_btn.clicked.connect(self.open_match_memory_dialog)
+        self.match_memory_btn.setToolTip(
+            "Review the track-matching decisions Syncra has learned from your manual corrections"
+        )
+
+        playlist_ops_box.addLayout(self._action_grid([
+            self.merge_playlists_btn,
+            self.find_duplicates_btn,
+            self.backup_playlists_btn,
+            self.restore_playlists_btn,
+            self.metadata_fixer_btn,
+            self.portable_backup_btn,
+            self.missing_tracks_btn,
+            self.match_memory_btn,
+            self.sonic_similar_btn,
+            self.sonic_adventure_btn,
+        ], columns=2, centered=True))
 
         layout.addWidget(playlist_ops_group)
 
@@ -10489,7 +11671,7 @@ class PlexPlaylistManager(QMainWindow):
             "Save multiple source servers, load a playlist from one server, and transfer it directly into the currently connected Plex server."
         )
         self.server_sync_status.setWordWrap(True)
-        self.server_sync_status.setStyleSheet("color: #b8c9df; font-size: 12px;")
+        self.server_sync_status.setObjectName("helperText")
         server_sync_layout.addWidget(self.server_sync_status)
 
         scheduler_group = QGroupBox("Scheduled Server Sync Jobs")
@@ -10523,7 +11705,7 @@ class PlexPlaylistManager(QMainWindow):
         scheduler_layout.addWidget(self.server_sync_jobs_list)
 
         self.server_sync_jobs_status = QLabel("No scheduled server sync jobs configured.")
-        self.server_sync_jobs_status.setStyleSheet("color: #9cb2d2; font-size: 12px;")
+        self.server_sync_jobs_status.setObjectName("mutedText")
         scheduler_layout.addWidget(self.server_sync_jobs_status)
 
         server_sync_layout.addWidget(scheduler_group)
@@ -10905,13 +12087,7 @@ class PlexPlaylistManager(QMainWindow):
         target_mode = str(job.get("target_mode", "overwrite") or "overwrite").strip().lower()
         sync_policy = str(job.get("sync_policy", "keep_extras") or "keep_extras").strip().lower()
         target_name = str(job.get("target_playlist_name", source_playlist) or source_playlist).strip()
-        filter_settings = {
-            "enabled": bool(self.enable_filters_checkbox.isChecked()) if hasattr(self, "enable_filters_checkbox") else False,
-            "avoid_live": bool(self.filter_live_checkbox.isChecked()) if hasattr(self, "filter_live_checkbox") else False,
-            "avoid_compilation": bool(self.filter_compilation_checkbox.isChecked()) if hasattr(self, "filter_compilation_checkbox") else False,
-            "deprioritize_remaster": bool(self.filter_remaster_checkbox.isChecked()) if hasattr(self, "filter_remaster_checkbox") else False,
-            "deprioritize_deluxe": bool(self.filter_deluxe_checkbox.isChecked()) if hasattr(self, "filter_deluxe_checkbox") else False,
-        }
+        filter_settings = MatchFilters.from_widget(self).to_config()
 
         source_base_url = str(source_profile.get("base_url", "") or "").strip() if isinstance(source_profile, dict) else ""
         source_token = str(source_profile.get("token", "") or "").strip() if isinstance(source_profile, dict) else ""
@@ -11082,13 +12258,7 @@ class PlexPlaylistManager(QMainWindow):
         transfer_mode = "overwrite" if (hasattr(self, "server_sync_overwrite_cb") and self.server_sync_overwrite_cb.isChecked()) else "create_copy"
         sync_policy = self.server_sync_policy_combo.currentData() if hasattr(self, "server_sync_policy_combo") else self.server_sync_policy
         sync_policy = str(sync_policy or "keep_extras").strip().lower()
-        filter_settings = {
-            "enabled": bool(self.enable_filters_checkbox.isChecked()) if hasattr(self, "enable_filters_checkbox") else False,
-            "avoid_live": bool(self.filter_live_checkbox.isChecked()) if hasattr(self, "filter_live_checkbox") else False,
-            "avoid_compilation": bool(self.filter_compilation_checkbox.isChecked()) if hasattr(self, "filter_compilation_checkbox") else False,
-            "deprioritize_remaster": bool(self.filter_remaster_checkbox.isChecked()) if hasattr(self, "filter_remaster_checkbox") else False,
-            "deprioritize_deluxe": bool(self.filter_deluxe_checkbox.isChecked()) if hasattr(self, "filter_deluxe_checkbox") else False,
-        }
+        filter_settings = MatchFilters.from_widget(self).to_config()
         return {
             "profile": profile,
             "source_playlist_title": source_playlist_title,
@@ -11318,6 +12488,155 @@ class PlexPlaylistManager(QMainWindow):
         )
         dialog.exec()
 
+    def _current_library_key(self):
+        """Stable identity for the selected music library, or None when unavailable."""
+        section = self._current_smart_match_library_section()
+        if section is None:
+            return None
+        return _get_library_match_session_key(section)
+
+    def open_missing_tracks_dialog(self):
+        store = _get_missing_tracks_store()
+        if store is None:
+            QMessageBox.critical(
+                self,
+                "Missing Tracks Unavailable",
+                "Syncra could not open its local database. Check the log for details.",
+            )
+            return
+
+        library_section = self._current_smart_match_library_section()
+        library_key = self._current_library_key()
+        if not library_key:
+            QMessageBox.information(
+                self,
+                "No Library Selected",
+                "Connect to Plex and select a music library so Syncra knows which "
+                "library's missing tracks to show.",
+            )
+            return
+
+        dialog = MissingTracksDialog(
+            store,
+            library_key,
+            library_section,
+            lambda section, track: _rank_plex_track_matches(section, track, self),
+            self,
+        )
+        dialog.exec()
+        self.update_dashboard_metrics()
+
+    def open_sonic_discovery(self, mode=MODE_SIMILAR, seed_track=None):
+        """Open the sonic playlist builder, optionally seeded with a track."""
+        if not self.plex_server:
+            QMessageBox.warning(self, "Not Connected", "Connect to Plex first.")
+            return
+
+        library_section = self._current_smart_match_library_section()
+        if library_section is None:
+            QMessageBox.information(
+                self,
+                "No Library Selected",
+                "Select a music library so Syncra knows where to look for similar tracks.",
+            )
+            return
+
+        dialog = SonicDiscoveryDialog(
+            self.plex_server, library_section, seed_track=seed_track, mode=mode, parent=self
+        )
+        if dialog.exec() == QDialog.Accepted:
+            # A new playlist exists on the server; refresh the list so it shows up.
+            self.fetch_playlists()
+
+    def open_match_memory_dialog(self):
+        store = _get_match_memory_store()
+        if store is None:
+            QMessageBox.critical(
+                self,
+                "Match Memory Unavailable",
+                "Syncra could not open its local database. Check the log for details.",
+            )
+            return
+
+        library_key = self._current_library_key()
+        if not library_key:
+            QMessageBox.information(
+                self,
+                "No Library Selected",
+                "Connect to Plex and select a music library to review its learned matches.",
+            )
+            return
+
+        MatchMemoryDialog(store, library_key, self).exec()
+
+    def open_sync_history_dialog(self):
+        store = _get_sync_history_store()
+        if store is None:
+            QMessageBox.critical(
+                self,
+                "Sync History Unavailable",
+                "Syncra could not open its local database. Check the log for details.",
+            )
+            return
+
+        library_key = self._current_library_key()
+        if not library_key:
+            QMessageBox.information(
+                self,
+                "No Library Selected",
+                "Connect to Plex and select a music library to view its sync history.",
+            )
+            return
+
+        dialog = SyncHistoryDialog(store, library_key, self._revert_sync_run, self)
+        dialog.exec()
+
+    def _revert_sync_run(self, run):
+        """Rebuild a playlist from a run's 'before' snapshot. Returns (ok, message)."""
+        if not self.plex_server:
+            return False, "Connect to Plex before reverting a sync run."
+
+        playlist_name = str(run.get("playlist_name", "") or "")
+        snapshot = run.get("before_snapshot", []) or []
+
+        target_playlist = None
+        for playlist in self.plex_server.playlists():
+            if playlist.title == playlist_name:
+                target_playlist = playlist
+                break
+        if target_playlist is None:
+            return False, f"Playlist '{playlist_name}' no longer exists on this server."
+
+        library_section = self._current_smart_match_library_section()
+        if library_section is None:
+            return False, "Select a music library before reverting."
+
+        rating_keys = [row.get("rating_key") for row in snapshot if row.get("rating_key")]
+        restored_tracks = _hydrate_plex_tracks_by_rating_keys(library_section, rating_keys)
+        dropped = len(rating_keys) - len(restored_tracks)
+
+        if rating_keys and not restored_tracks:
+            return False, (
+                "None of the tracks from that snapshot are still in the library, so the "
+                "playlist cannot be restored."
+            )
+
+        try:
+            current_items = list(target_playlist.items())
+            if current_items:
+                target_playlist.removeItems(current_items)
+            if restored_tracks:
+                target_playlist.addItems(restored_tracks)
+        except Exception as error:
+            logging.error(f"Failed to revert playlist '{playlist_name}': {error}", exc_info=True)
+            return False, f"Could not rebuild the playlist: {error}"
+
+        message = f"Restored '{playlist_name}' to {len(restored_tracks)} track(s)."
+        if dropped:
+            message += f"\n\n{dropped} track(s) from the snapshot are no longer in the library."
+        logging.info(message.replace("\n\n", " "))
+        return True, message
+
     def open_portable_backup_dialog(self):
         """Open portable backup dialog for playlist + audio export."""
         if not self.plex_server:
@@ -11343,6 +12662,14 @@ class PlexPlaylistManager(QMainWindow):
                 self.header_connection_chip.setObjectName("headerChipWarn")
             self.header_connection_chip.style().unpolish(self.header_connection_chip)
             self.header_connection_chip.style().polish(self.header_connection_chip)
+        if hasattr(self, "sidebar_status_dot"):
+            connected = bool(self.plex_server)
+            self._set_identity_state(
+                self.sidebar_status_dot, "connected" if connected else "offline"
+            )
+            self.sidebar_status_dot.setToolTip(
+                "Connected to Plex" if connected else "Not connected to Plex"
+            )
         if hasattr(self, "header_metadata_chip"):
             self.header_metadata_chip.setText("Metadata: On" if metadata_enabled else "Metadata: Off")
             self.header_metadata_chip.setObjectName("headerChipAccent" if metadata_enabled else "headerChipNeutral")
@@ -11372,13 +12699,29 @@ class PlexPlaylistManager(QMainWindow):
         self.refresh_smart_match_cache_status()
 
     def update_dashboard_metrics(self):
+        # The caption is baked into each card now; setText only carries the value.
         if hasattr(self, "metric_playlists"):
-            self.metric_playlists.setText(f"Playlists\n{len(self.playlists or [])}")
+            self.metric_playlists.setText(f"{len(self.playlists or [])}")
         if hasattr(self, "metric_sync_jobs"):
             sync_rows = self.sync_configs_table.rowCount() if hasattr(self, "sync_configs_table") else 0
-            self.metric_sync_jobs.setText(f"Sync Jobs\n{sync_rows}")
+            self.metric_sync_jobs.setText(f"{sync_rows}")
         if hasattr(self, "metric_user"):
-            self.metric_user.setText(f"Active User\n{self.current_user_name if self.current_user_name else 'Guest'}")
+            self.metric_user.setText(self.current_user_name if self.current_user_name else "Guest")
+        if hasattr(self, "metric_missing"):
+            self.metric_missing.setText(f"{self._missing_track_count()}")
+
+    def _missing_track_count(self):
+        """Count of still-missing tracks for the selected library, 0 when unavailable."""
+        try:
+            library_key = self._current_library_key()
+            if not library_key:
+                return 0
+            store = _get_missing_tracks_store()
+            if store is None:
+                return 0
+            return store.counts(library_key).get(STATUS_MISSING, 0)
+        except Exception:
+            return 0
 
     def apply_settings_from_controls(self, save=True, show_message=False):
         if self._suspend_settings_apply:
@@ -11477,28 +12820,8 @@ class PlexPlaylistManager(QMainWindow):
         # Enable filters checkbox
         self.enable_filters_checkbox = QCheckBox("Enable smart filtering for better track matching")
         self.enable_filters_checkbox.setChecked(True)
-        self.enable_filters_checkbox.setStyleSheet("""
-            QCheckBox {
-                font-weight: bold;
-                color: #2196F3;
-                padding: 8px;
-                font-size: 14px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-            }
-            QCheckBox::indicator:unchecked {
-                border: 2px solid #2196F3;
-                background-color: transparent;
-                border-radius: 3px;
-            }
-            QCheckBox::indicator:checked {
-                border: 2px solid #2196F3;
-                background-color: #2196F3;
-                border-radius: 3px;
-            }
-        """)
+        # Section-leading toggle: theme accent, not an off-palette material blue.
+        self.enable_filters_checkbox.setObjectName("groupLeadCheckbox")
         filters_layout.addWidget(self.enable_filters_checkbox)
 
         # Filter options with better styling
@@ -11522,31 +12845,10 @@ class PlexPlaylistManager(QMainWindow):
         self.filter_deluxe_checkbox.setToolTip("Reduces priority of albums containing 'deluxe', 'special', 'extended', 'expanded', or 'anniversary'")
 
         # Style the filter checkboxes
-        filter_style = """
-            QCheckBox {
-                color: #ffffff;
-                padding: 6px;
-                font-size: 13px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-            }
-            QCheckBox::indicator:unchecked {
-                border: 2px solid #4CAF50;
-                background-color: transparent;
-                border-radius: 3px;
-            }
-            QCheckBox::indicator:checked {
-                border: 2px solid #4CAF50;
-                background-color: #4CAF50;
-                border-radius: 3px;
-            }
-        """
-
+        # Styled from the theme: uniform indicator size, accent fill when checked.
         for checkbox in [self.filter_live_checkbox, self.filter_compilation_checkbox,
                         self.filter_remaster_checkbox, self.filter_deluxe_checkbox]:
-            checkbox.setStyleSheet(filter_style)
+            checkbox.setStyleSheet("")
 
         filter_options_layout.addWidget(self.filter_live_checkbox)
         filter_options_layout.addWidget(self.filter_compilation_checkbox)
@@ -11558,7 +12860,7 @@ class PlexPlaylistManager(QMainWindow):
         # Info section
         info_label = QLabel("ℹ️ These filters help prioritize the correct versions of tracks when multiple versions exist in your Plex library (e.g., studio vs live, original vs compilation).")
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #dceaff; font-style: italic; padding: 10px; background-color: #1c2a40; border: 1px solid #3f587a; border-radius: 6px; margin: 10px 0;")
+        info_label.setObjectName("infoNote")
         filters_layout.addWidget(info_label)
 
         filters_group.setLayout(filters_layout)
@@ -11576,7 +12878,7 @@ class PlexPlaylistManager(QMainWindow):
             "Example: Replace 'C:\\Music\\' with '/volume1/music/' for Synology NAS"
         )
         path_info.setWordWrap(True)
-        path_info.setStyleSheet("color: #dceaff; padding: 10px; background-color: #1c2a40; border: 1px solid #3f587a; border-radius: 6px; margin: 5px 0;")
+        path_info.setObjectName("infoNote")
         path_mappings_layout.addWidget(path_info)
 
         # Detect Plex paths button
@@ -11735,7 +13037,7 @@ class PlexPlaylistManager(QMainWindow):
         smart_match_cache_layout.addWidget(self.smart_match_cache_status_label)
 
         self.smart_match_cache_detail_label = QLabel("Built: n/a • Indexed tracks: 0")
-        self.smart_match_cache_detail_label.setStyleSheet("color: #9cb2d2; font-size: 12px;")
+        self.smart_match_cache_detail_label.setObjectName("mutedText")
         smart_match_cache_layout.addWidget(self.smart_match_cache_detail_label)
 
         smart_match_cache_buttons = QHBoxLayout()
@@ -12075,13 +13377,16 @@ class PlexPlaylistManager(QMainWindow):
         sort_action = menu.addAction("🔄 Sort by Streaming Service...")
         menu.addSeparator()
         edit_action = menu.addAction("✏️ Edit Playlist")
+        rename_action = menu.addAction("🏷️ Rename Playlist...")
         delete_action = menu.addAction("🗑️ Delete Playlist")
-        
+
         # Show menu and handle selection
         action = menu.exec(self.playlist_listwidget.mapToGlobal(position))
-        
+
         if action == sort_action:
             self.sort_playlist_by_streaming_service(item)
+        elif action == rename_action:
+            self.rename_playlist_item(item)
         elif action == edit_action:
             self.edit_playlist_item(item)
         elif action == delete_action:
@@ -12315,70 +13620,118 @@ class PlexPlaylistManager(QMainWindow):
         layout = QVBoxLayout(page)
         self.add_unified_page_header(layout, "Connection", "Connect to Plex, authenticate, and select your music library", "connection")
 
-        form_layout = QVBoxLayout()
-        form_layout.setSpacing(10)
+        # Persistent, non-modal problem banner. Startup connection failures land here so
+        # they are always readable even when a modal dialog would be inappropriate.
+        self.connection_banner = QLabel("")
+        self.connection_banner.setObjectName("connectionBanner")
+        self.connection_banner.setWordWrap(True)
+        self.connection_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.connection_banner.setStyleSheet(
+            "color: #ffd9d9; background-color: #3a1d22; border: 1px solid #7a3b44;"
+            " border-radius: 8px; padding: 10px; font-size: 12px;"
+        )
+        self.connection_banner.setVisible(False)
+        layout.addWidget(self.connection_banner)
+
+        # Seven identical unlabelled boxes were impossible to tell apart once filled --
+        # placeholders vanish as soon as a value is present. Labelled grid instead, on
+        # the same label-column geometry the Sync Manager uses.
+        account_group = QGroupBox("Plex Account")
+        account_box = QVBoxLayout(account_group)
+        account_box.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        account_box.setSpacing(GROUP_SPACING)
+
+        # The form is a compact block inside a card that spans the whole window, so it
+        # is centred rather than pinned left. The grid sizes to its own content -- no
+        # stretch column -- which is what makes the surrounding stretches symmetrical.
+        account_layout = QGridLayout()
+        account_layout.setContentsMargins(0, 0, 0, 0)
+        account_layout.setHorizontalSpacing(SPACE_MD)
+        account_layout.setVerticalSpacing(SPACE_SM)
+        # No LABEL_COLUMN minimum here: that exists to align label columns across
+        # stacked cards, and padding it would push this centred block off-centre. The
+        # labels size to the widest of their own set instead.
 
         self.plex_username_input = ModernLineEdit()
-        self.plex_username_input.setPlaceholderText("Plex Username")
-        form_layout.addWidget(self.plex_username_input)
+        self.plex_username_input.setPlaceholderText("Plex account username or email")
 
         self.plex_password_input = ModernLineEdit()
-        self.plex_password_input.setPlaceholderText("Plex Password")
+        self.plex_password_input.setPlaceholderText("Plex account password")
         self.plex_password_input.setEchoMode(QLineEdit.Password)
-        form_layout.addWidget(self.plex_password_input)
 
         self.plex_2fa_input = ModernLineEdit()
-        self.plex_2fa_input.setPlaceholderText("Plex 2FA Code (optional)")
+        self.plex_2fa_input.setPlaceholderText("Only if 2FA is enabled")
         self.plex_2fa_input.setMaxLength(8)
         self.plex_2fa_input.setToolTip("Enter your current Plex 2FA code if two-factor authentication is enabled.")
-        form_layout.addWidget(self.plex_2fa_input)
 
         self.server_ip_input = ModernLineEdit()
-        self.server_ip_input.setPlaceholderText("Plex Server IP")
-        form_layout.addWidget(self.server_ip_input)
+        self.server_ip_input.setPlaceholderText("e.g. 192.168.1.20")
 
         self.server_port_input = ModernLineEdit()
-        self.server_port_input.setPlaceholderText("Plex Server Port")
-        form_layout.addWidget(self.server_port_input)
+        self.server_port_input.setPlaceholderText("32400")
 
         self.token_input = ModernLineEdit()
-        self.token_input.setPlaceholderText("Plex Auth Token (optional)")
+        self.token_input.setPlaceholderText("Optional - overrides username/password login")
         self.token_input.setToolTip("Optional: direct token login (useful when account login is blocked by 2FA).")
-        form_layout.addWidget(self.token_input)
 
         self.section_combo = QComboBox()
         self.section_combo.addItem("Library Section")
         self.section_combo.setCurrentIndex(0)
         self.section_combo.currentIndexChanged.connect(self.on_library_section_changed)
-        form_layout.addWidget(self.section_combo)
 
-        layout.addLayout(form_layout)
+        for row, (caption, field) in enumerate((
+            ("Username", self.plex_username_input),
+            ("Password", self.plex_password_input),
+            ("2FA Code", self.plex_2fa_input),
+            ("Server IP", self.server_ip_input),
+            ("Server Port", self.server_port_input),
+            ("Auth Token", self.token_input),
+            ("Music Library", self.section_combo),
+        )):
+            label = QLabel(f"{caption}:")
+            label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            account_layout.addWidget(label, row, 0)
+            field.setMinimumHeight(CONTROL_HEIGHT)
+            # Cap the field, not the page: a 900px-wide port number is unreadable, but
+            # the page itself should still fill the window.
+            field.setFixedWidth(FIELD_MIN_WIDTH)
+            account_layout.addWidget(field, row, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        # Button layout
+        account_box.addLayout(self._center_block(account_layout))
+        layout.addWidget(account_group)
+
+        # Actions centre with the form above them rather than hanging off its left.
         button_layout = QHBoxLayout()
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(FIELD_SPACING)
+        button_layout.addStretch(1)
 
         connect_button = ModernButton('Connect to Plex')
+        connect_button.setProperty("variant", "primary")
+        connect_button.setMinimumHeight(CONTROL_HEIGHT)
         self._set_button_icon(connect_button, "plex_connect", QStyle.StandardPixmap.SP_DialogApplyButton)
-        connect_button.clicked.connect(self.connect_to_plex)
+        # Explicit lambda: clicked() passes a `checked` bool that would otherwise bind to
+        # the from_startup parameter.
+        connect_button.clicked.connect(lambda: self.connect_to_plex(from_startup=False))
         button_layout.addWidget(connect_button)
 
         self.switch_user_button = ModernButton('Switch User')
+        self.switch_user_button.setMinimumHeight(CONTROL_HEIGHT)
         self._set_button_icon(self.switch_user_button, "users", QStyle.StandardPixmap.SP_DirHomeIcon)
         self.switch_user_button.clicked.connect(self.switch_user)
         self.switch_user_button.setToolTip("Switch between Plex users")
         button_layout.addWidget(self.switch_user_button)
 
+        button_layout.addStretch(1)
         layout.addLayout(button_layout)
 
-        # Current user label
+        # Status gets its own centred line. Inside the button row it would drag the
+        # buttons sideways every time the text changed length -- "Not connected" versus
+        # "Connected as: <account name> (Administrator)".
         self.current_user_label = QLabel("Not connected")
-        self.current_user_label.setStyleSheet("""
-            color: #aaaaaa;
-            font-style: italic;
-            padding: 10px;
-            font-size: 12px;
-        """)
-        self.current_user_label.setAlignment(Qt.AlignCenter)
+        self.current_user_label.setObjectName("connectionIdentity")
+        self.current_user_label.setProperty("state", "offline")
+        self.current_user_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.current_user_label)
 
         layout.addStretch()
@@ -12389,8 +13742,9 @@ class PlexPlaylistManager(QMainWindow):
         layout = QVBoxLayout(page)
         self.add_unified_page_header(layout, "Playlists", "Import, export, edit, and maintain Plex playlists", "playlists")
         
-        # Top buttons row
-        buttons_layout = QHBoxLayout()
+        # Top buttons row. A flow layout so the actions wrap onto a second line in a
+        # narrow window instead of pinning a minimum width on the whole page.
+        buttons_layout = FlowLayout(spacing=SPACE_SM)
         self.fetch_playlists_button = ModernButton('Fetch Playlists')
         self.fetch_playlists_button.clicked.connect(self.fetch_playlists)
         buttons_layout.addWidget(self.fetch_playlists_button)
@@ -12417,8 +13771,11 @@ class PlexPlaylistManager(QMainWindow):
         layout.addLayout(buttons_layout)
         
         # Info label with better instructions
-        self.cache_info_label = QLabel("💡 Track counts load instantly when cached. Click any playlist to load tracks on-demand. Double-click to edit.")
-        self.cache_info_label.setStyleSheet("color: #888888; font-style: italic; padding: 5px;")
+        self.cache_info_label = QLabel("💡 Double-click a cover to open the playlist editor. Tick the box on a cover to include it in delete, export and sync actions. Press F2 or right-click to rename.")
+        self.cache_info_label.setObjectName("mutedText")
+        # Without wrapping, this one label gives the whole page a ~1500px minimum
+        # width, so the window could not be narrowed and the cover wall never reflowed.
+        self.cache_info_label.setWordWrap(True)
         layout.addWidget(self.cache_info_label)
         
         # NEW: Import/Export section
@@ -12457,8 +13814,43 @@ class PlexPlaylistManager(QMainWindow):
         
         layout.addWidget(import_export_group)
         
-        # Playlist list
-        self.playlist_listwidget = QListWidget()
+        # Library browser: filter + view switch above the wall of covers.
+        browse_bar = QHBoxLayout()
+        browse_bar.setSpacing(SPACE_SM)
+
+        self.playlist_filter_input = ModernLineEdit()
+        self.playlist_filter_input.setPlaceholderText("Filter playlists by name...")
+        self.playlist_filter_input.setClearButtonEnabled(True)
+        self.playlist_filter_input.setMaximumWidth(340)
+        self.playlist_filter_input.textChanged.connect(self.filter_playlist_items)
+        browse_bar.addWidget(self.playlist_filter_input)
+
+        self.playlist_count_label = QLabel("")
+        self.playlist_count_label.setObjectName("mutedText")
+        browse_bar.addWidget(self.playlist_count_label)
+
+        browse_bar.addStretch()
+
+        self.playlist_grid_view_button = ModernButton("Grid")
+        self.playlist_grid_view_button.setObjectName("viewToggleButton")
+        self.playlist_grid_view_button.setCheckable(True)
+        self.playlist_grid_view_button.setChecked(True)
+        self.playlist_grid_view_button.setToolTip("Show playlists as cover art")
+        self.playlist_grid_view_button.clicked.connect(lambda: self.set_playlist_view_mode("grid"))
+        browse_bar.addWidget(self.playlist_grid_view_button)
+
+        self.playlist_list_view_button = ModernButton("List")
+        self.playlist_list_view_button.setObjectName("viewToggleButton")
+        self.playlist_list_view_button.setCheckable(True)
+        self.playlist_list_view_button.setToolTip("Show playlists as a compact list")
+        self.playlist_list_view_button.clicked.connect(lambda: self.set_playlist_view_mode("list"))
+        browse_bar.addWidget(self.playlist_list_view_button)
+
+        layout.addLayout(browse_bar)
+
+        # Playlist wall
+        self.playlist_listwidget = PlaylistGridView()
+        self.playlist_listwidget.setObjectName("playlistGrid")
         self.playlist_listwidget.setSelectionMode(QListWidget.ExtendedSelection)
         self.playlist_listwidget.itemDoubleClicked.connect(self.edit_playlist_item)
         # NEW: Add single-click handler for responsive track count loading
@@ -12467,13 +13859,309 @@ class PlexPlaylistManager(QMainWindow):
         self.playlist_listwidget.setContextMenuPolicy(Qt.CustomContextMenu)
         self.playlist_listwidget.customContextMenuRequested.connect(self.show_playlist_context_menu)
 
-        layout.addWidget(self.playlist_listwidget)
-        
+        # F2 is the standard rename key; the context menu carries the same action.
+        rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self.playlist_listwidget)
+        rename_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        rename_shortcut.activated.connect(
+            lambda: self.rename_playlist_item(self.playlist_listwidget.currentItem())
+        )
+
+        self.playlist_card_delegate = self.playlist_listwidget.card_delegate
+        # Read defensively: the page is also built in contexts where load_config()
+        # has not populated app_config.
+        stored_mode = (getattr(self, "app_config", None) or {}).get("playlist_view_mode")
+        self.playlist_view_mode = stored_mode if stored_mode in ("grid", "list") else "grid"
+        self._apply_playlist_view_mode()
+
+        layout.addWidget(self.playlist_listwidget, 1)
+
         self.select_all_checkbox = QCheckBox("Select All")
         self.select_all_checkbox.stateChanged.connect(self.select_all_playlists)
         layout.addWidget(self.select_all_checkbox)
-        
+
         self._add_page_to_stack(page)
+
+    # ------------------------------------------------------------------
+    # Playlist wall: view mode, filtering, cover art
+    # ------------------------------------------------------------------
+
+    def _apply_playlist_view_mode(self):
+        """Point the list widget at the card delegate or back at the plain list."""
+        if self.playlist_view_mode == "grid":
+            apply_grid_mode(self.playlist_listwidget, self.playlist_card_delegate)
+        else:
+            apply_list_mode(self.playlist_listwidget)
+
+        # The ::item rules differ per mode, so the property has to be re-evaluated.
+        self.playlist_listwidget.setProperty("viewMode", self.playlist_view_mode)
+        self.playlist_listwidget.style().unpolish(self.playlist_listwidget)
+        self.playlist_listwidget.style().polish(self.playlist_listwidget)
+
+        if hasattr(self, "playlist_grid_view_button"):
+            self.playlist_grid_view_button.setChecked(self.playlist_view_mode == "grid")
+            self.playlist_list_view_button.setChecked(self.playlist_view_mode == "list")
+
+    def set_playlist_view_mode(self, mode):
+        mode = mode if mode in ("grid", "list") else "grid"
+        if mode == getattr(self, "playlist_view_mode", "grid") and self.playlist_listwidget.count():
+            # Still refresh the toggle so a click on the already-active button
+            # cannot leave both buttons looking unchecked.
+            self._apply_playlist_view_mode()
+            return
+        self.playlist_view_mode = mode
+        self._apply_playlist_view_mode()
+
+        # Display text carries the track count in list mode and only the title in
+        # grid mode (the delegate draws the count on its own line), so every visible
+        # item has to be re-rendered when the mode changes.
+        for index in range(self.playlist_listwidget.count()):
+            self._refresh_playlist_item_text(self.playlist_listwidget.item(index))
+
+        if isinstance(getattr(self, "app_config", None), dict):
+            self.app_config["playlist_view_mode"] = mode
+            self.save_config()
+
+    def _refresh_playlist_item_text(self, item, title=None, subtitle=None):
+        """Set an item's roles and rebuild its display string for the current mode."""
+        if item is None:
+            return
+        if title is not None:
+            item.setData(TITLE_ROLE, str(title))
+        if subtitle is not None:
+            item.setData(SUBTITLE_ROLE, str(subtitle))
+
+        resolved_title = str(item.data(TITLE_ROLE) or "")
+        resolved_subtitle = str(item.data(SUBTITLE_ROLE) or "")
+
+        if getattr(self, "playlist_view_mode", "grid") == "grid":
+            item.setText(resolved_title)
+        elif resolved_subtitle:
+            # Matches the historic "Title (128 tracks)" format, which a couple of
+            # call sites still split on ' (' to recover the name.
+            item.setText(f"{resolved_title} ({resolved_subtitle})")
+        else:
+            item.setText(resolved_title)
+
+    def rename_playlist_item(self, item):
+        """Rename a playlist on the Plex server.
+
+        Sync configurations are keyed by playlist *name*, so renaming without also
+        updating the configuration would silently orphan it -- the next sync would
+        look for a playlist that no longer exists. The rename carries the config over.
+        """
+        if item is None:
+            return False
+
+        playlist = item.data(Qt.UserRole)
+        if playlist is None:
+            QMessageBox.warning(self, "Rename Playlist", "That playlist is no longer loaded. Fetch playlists and try again.")
+            return False
+
+        old_name = str(getattr(playlist, "title", "") or "")
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Rename Playlist",
+            "New playlist name:",
+            QLineEdit.EchoMode.Normal,
+            old_name,
+        )
+        if not accepted:
+            return False
+
+        # Plex keeps leading/trailing space, which makes two playlists look identical.
+        new_name = " ".join(str(new_name or "").split())
+        if not new_name or new_name == old_name:
+            return False
+
+        clash = next(
+            (
+                other for other in (self.playlists or [])
+                if str(getattr(other, "title", "")) == new_name
+                and str(getattr(other, "ratingKey", "")) != str(getattr(playlist, "ratingKey", ""))
+            ),
+            None,
+        )
+        if clash is not None:
+            QMessageBox.warning(
+                self,
+                "Name Already Used",
+                f"A playlist called \"{new_name}\" already exists. Pick a different name.",
+            )
+            return False
+
+        try:
+            # editTitle() is the supported call; Playlist.edit() is deprecated in
+            # plexapi 4.17 and warns. Fall back for older versions.
+            if hasattr(playlist, "editTitle"):
+                playlist.editTitle(new_name)
+            else:
+                playlist.edit(title=new_name)
+            playlist.reload()
+        except Exception as error:
+            logging.error(f"Could not rename playlist '{old_name}': {error}")
+            QMessageBox.critical(
+                self,
+                "Rename Failed",
+                f"Plex would not rename \"{old_name}\".\n\n{error}",
+            )
+            return False
+
+        self._refresh_playlist_item_text(item, new_name)
+        item.setToolTip(new_name)
+
+        moved = self._rename_sync_config_playlist(old_name, new_name)
+        self.populate_sync_playlist_combo()
+
+        logging.info(f"Renamed playlist '{old_name}' to '{new_name}'")
+        message = f'Renamed to "{new_name}".'
+        if moved:
+            message += " Its sync configuration was updated to match."
+        self.statusBar().showMessage(message, 5000)
+        return True
+
+    def _rename_sync_config_playlist(self, old_name, new_name):
+        """Point an existing sync configuration at the playlist's new name."""
+        table = getattr(self, "sync_configs_table", None)
+        if table is None:
+            return False
+        for row in range(table.rowCount()):
+            cell = table.item(row, 0)
+            if cell is not None and cell.text() == old_name:
+                cell.setText(new_name)
+                self.save_sync_config()
+                return True
+        return False
+
+    def _playlist_subtitle(self, playlist, track_count=None):
+        """The line under a tile's title.
+
+        `leafCount` and `duration` both arrive with the playlists() response, so a
+        freshly fetched wall can show "138 tracks - 9h 7m" without a single extra
+        request. The old placeholder ("click to load tracks...") was only ever there
+        because the count was assumed to be unknown until clicked.
+        """
+        count = track_count
+        if count is None:
+            count = getattr(playlist, "leafCount", None)
+
+        parts = []
+        try:
+            if count is not None:
+                count = int(count)
+                parts.append("1 track" if count == 1 else f"{count:,} tracks")
+        except (TypeError, ValueError):
+            pass
+
+        duration = getattr(playlist, "duration", None)
+        if duration:
+            parts.append(format_span(duration))
+
+        return " · ".join(parts) or "click to load tracks..."
+
+    def filter_playlist_items(self, text):
+        needle = str(text or "").strip().lower()
+        visible = 0
+        for index in range(self.playlist_listwidget.count()):
+            item = self.playlist_listwidget.item(index)
+            title = str(item.data(TITLE_ROLE) or item.text() or "").lower()
+            hidden = bool(needle) and needle not in title
+            item.setHidden(hidden)
+            if not hidden:
+                visible += 1
+        self._update_playlist_count_label(visible)
+
+    def _update_playlist_count_label(self, visible=None):
+        if not hasattr(self, "playlist_count_label"):
+            return
+        total = self.playlist_listwidget.count()
+        if not total:
+            self.playlist_count_label.setText("")
+        elif visible is None or visible == total:
+            self.playlist_count_label.setText(f"{total} playlists")
+        else:
+            self.playlist_count_label.setText(f"{visible} of {total} playlists")
+
+    def _ensure_cover_fetcher(self):
+        fetcher = getattr(self, "playlist_cover_fetcher", None)
+        if fetcher is None:
+            fetcher = CoverFetcher(self, user_agent=f"Syncra/{__version__}")
+            fetcher.cover_ready.connect(self._on_playlist_cover_ready)
+            self.playlist_cover_fetcher = fetcher
+        return fetcher
+
+    def _playlist_cover_url(self, playlist):
+        """Poster URL for a playlist, transcoded down to tile size.
+
+        Deliberately uses the thumb/composite already on the object rather than
+        querying /posters -- that endpoint is an extra HTTP round trip per playlist,
+        which for a 60-playlist wall would cost more than fetching the art itself.
+        """
+        try:
+            key = getattr(playlist, "thumb", None) or getattr(playlist, "composite", None)
+            key = str(key or "").strip()
+            if not key or not self.plex_server:
+                return ""
+            if key.startswith("http://") or key.startswith("https://"):
+                return key
+            side = COVER_SIZE * 2  # rendered at 2x so the tile stays sharp when scaled
+            encoded = urllib.parse.quote(key, safe="")
+            path = (
+                f"/photo/:/transcode?width={side}&height={side}"
+                f"&minSize=1&upscale=1&url={encoded}"
+            )
+            return self.plex_server.url(path, includeToken=True)
+        except Exception as error:
+            logging.debug(f"Could not build cover URL: {error}")
+            return ""
+
+    def _request_playlist_cover(self, item, playlist):
+        """Attach art to a tile, from cache if possible and from the server if not."""
+        if getattr(self, "playlist_view_mode", "grid") != "grid":
+            return
+        url = self._playlist_cover_url(playlist)
+        if not url:
+            item.setData(COVER_STATE_ROLE, "none")
+            return
+
+        item.setData(COVER_URL_ROLE, url)
+        fetcher = self._ensure_cover_fetcher()
+
+        cached = fetcher.cached_bytes(url)
+        if cached:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(cached):
+                item.setData(COVER_ROLE, rounded_cover(pixmap))
+                item.setData(COVER_STATE_ROLE, "ready")
+                return
+
+        item.setData(COVER_STATE_ROLE, "loading")
+        fetcher.request(url)
+
+    def _on_playlist_cover_ready(self, url, data):
+        """Cover bytes arrived; build the pixmap here, on the GUI thread."""
+        if not data:
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data):
+            return
+        rendered = rounded_cover(pixmap)
+        for index in range(self.playlist_listwidget.count()):
+            item = self.playlist_listwidget.item(index)
+            if item.data(COVER_URL_ROLE) == url:
+                item.setData(COVER_ROLE, rendered)
+                item.setData(COVER_STATE_ROLE, "ready")
+
+        # The same artwork also fronts each Sync Manager row.
+        table = getattr(self, "sync_configs_table", None)
+        if table is None:
+            return
+        thumbnail = None
+        for row in range(table.rowCount()):
+            cell = table.item(row, 0)
+            if cell is not None and cell.data(COVER_URL_ROLE) == url:
+                if thumbnail is None:
+                    thumbnail = QIcon(rounded_cover(pixmap, self.SYNC_COVER_SIZE, 6.0))
+                cell.setIcon(thumbnail)
     
     def on_playlist_clicked(self, item):
         """Handle single click on playlist to load track count responsively"""
@@ -12550,23 +14238,16 @@ class PlexPlaylistManager(QMainWindow):
 
         self.spotify_login_btn = QPushButton("🔑 Login to Spotify")
         self.spotify_login_btn.clicked.connect(self.spotify_login)
-        self.spotify_login_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1DB954;
-                color: white;
-                font-weight: bold;
-                padding: 10px 20px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1ed760;
-            }
-        """)
+        # Primary action on this page; uses the theme accent rather than Spotify green
+        # so one accent colour signals "primary" everywhere in the app.
+        self.spotify_login_btn.setProperty("variant", "primary")
+        self.spotify_login_btn.setMinimumHeight(CONTROL_HEIGHT)
         login_buttons_layout.addWidget(self.spotify_login_btn)
 
         self.spotify_logout_btn = QPushButton("🚪 Logout")
         self.spotify_logout_btn.clicked.connect(self.spotify_logout)
         self.spotify_logout_btn.setEnabled(False)
+        self.spotify_logout_btn.setMinimumHeight(CONTROL_HEIGHT)
         login_buttons_layout.addWidget(self.spotify_logout_btn)
 
         login_buttons_layout.addStretch()
@@ -12575,38 +14256,23 @@ class PlexPlaylistManager(QMainWindow):
 
         streaming_group = QGroupBox("Import from Streaming Services")
         streaming_layout = QVBoxLayout()
+        streaming_layout.setContentsMargins(GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN, GROUP_MARGIN)
+        streaming_layout.setSpacing(GROUP_SPACING)
         streaming_group.setLayout(streaming_layout)
 
         self.playlist_url_input = QLineEdit()
+        self.playlist_url_input.setMinimumHeight(CONTROL_HEIGHT)
         self.playlist_url_input.setPlaceholderText("Enter Spotify, Deezer, or Tidal playlist URL")
+        self.playlist_url_input.setMaximumWidth(FIELD_MAX_WIDTH)
         streaming_layout.addWidget(self.playlist_url_input)
 
         self.add_to_sync_checkbox = QCheckBox("🔄 Add to sync manager after import")
         self.add_to_sync_checkbox.setToolTip("Automatically add this playlist to sync manager to keep it updated")
-        self.add_to_sync_checkbox.setStyleSheet("""
-            QCheckBox {
-                font-weight: bold;
-                color: #4CAF50;
-                padding: 5px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-            }
-            QCheckBox::indicator:unchecked {
-                border: 2px solid #4CAF50;
-                background-color: transparent;
-                border-radius: 3px;
-            }
-            QCheckBox::indicator:checked {
-                border: 2px solid #4CAF50;
-                background-color: #4CAF50;
-                border-radius: 3px;
-            }
-        """)
         streaming_layout.addWidget(self.add_to_sync_checkbox)
 
         self.import_playlist_button = QPushButton("Import Playlist to Plex")
+        self.import_playlist_button.setProperty("variant", "primary")
+        self.import_playlist_button.setMinimumHeight(CONTROL_HEIGHT)
         self.import_playlist_button.clicked.connect(self.import_streaming_playlist)
         streaming_layout.addWidget(self.import_playlist_button)
 
@@ -12629,7 +14295,7 @@ class PlexPlaylistManager(QMainWindow):
 
         self.streaming_status_label = QLabel('')
         self.streaming_status_label.setVisible(False)
-        self.streaming_status_label.setStyleSheet('color: #cccccc; padding: 4px 0;')
+        self.streaming_status_label.setObjectName("helperText")
         streaming_layout.addWidget(self.streaming_status_label)
 
         streaming_tab_layout.addWidget(streaming_group)
@@ -12688,7 +14354,7 @@ class PlexPlaylistManager(QMainWindow):
             "ListenBrainz uses JSPF playlists. Syncra imports from ListenBrainz URLs or your user playlist list and can export Plex playlists as JSPF."
         )
         listenbrainz_hint.setWordWrap(True)
-        listenbrainz_hint.setStyleSheet("color: #b8c9df; font-size: 12px;")
+        listenbrainz_hint.setObjectName("helperText")
         listenbrainz_layout.addWidget(listenbrainz_hint)
 
         listenbrainz_tab_layout.addWidget(listenbrainz_group)
@@ -12772,7 +14438,7 @@ class PlexPlaylistManager(QMainWindow):
 
         self.apple_music_status_label = QLabel("Load an Apple Music XML export to preview playlists.")
         self.apple_music_status_label.setWordWrap(True)
-        self.apple_music_status_label.setStyleSheet("color: #b8c9df; font-size: 12px;")
+        self.apple_music_status_label.setObjectName("helperText")
         apple_music_layout.addWidget(self.apple_music_status_label)
 
         apple_music_tab_layout.addWidget(apple_music_group)
@@ -13742,27 +15408,8 @@ class PlexPlaylistManager(QMainWindow):
                     return
             
             # Add new sync configuration
-            row = self.sync_configs_table.rowCount()
-            self.sync_configs_table.insertRow(row)
-            
-            # Create read-only items
-            playlist_item = QTableWidgetItem(playlist_name)
-            playlist_item.setFlags(playlist_item.flags() & ~Qt.ItemIsEditable)
-            self.sync_configs_table.setItem(row, 0, playlist_item)
-            
-            source_item = QTableWidgetItem(source_url)
-            source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
-            self.sync_configs_table.setItem(row, 1, source_item)
-            
-            sync_item = QTableWidgetItem("Never")
-            sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
-            self.sync_configs_table.setItem(row, 2, sync_item)
-            
-            self._set_clear_on_sync_checkbox(row, False)
+            self.add_sync_config_row(playlist_name, source_url)
 
-            # Create action buttons for the new row
-            self.create_action_buttons_for_row(row)
-            
             # Save the sync configuration
             self.save_sync_config()
             
@@ -13959,7 +15606,6 @@ class PlexPlaylistManager(QMainWindow):
             self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Scheduled sync enabled: {repeat_type}")
         else:
             self.scheduled_status_label.setText("No scheduled sync")
-            self.scheduled_status_label.setStyleSheet("color: #888; font-style: italic;")
             self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Scheduled sync disabled")
 
         # Save settings
@@ -14093,34 +15739,114 @@ class PlexPlaylistManager(QMainWindow):
             QMessageBox.warning(self, "Invalid Source", "Please enter a source URL or file path.")
             return
         
-        # Add to sync configurations table
-        row = self.sync_configs_table.rowCount()
-        self.sync_configs_table.insertRow(row)
-        
-        # Create read-only items
-        playlist_item = QTableWidgetItem(playlist_name)
-        playlist_item.setFlags(playlist_item.flags() & ~Qt.ItemIsEditable)
-        self.sync_configs_table.setItem(row, 0, playlist_item)
-        
-        source_item = QTableWidgetItem(source_url)
-        source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
-        self.sync_configs_table.setItem(row, 1, source_item)
-        
-        sync_item = QTableWidgetItem("Never")
-        sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
-        self.sync_configs_table.setItem(row, 2, sync_item)
-        
-        self._set_clear_on_sync_checkbox(row, False)
+        self.add_sync_config_row(playlist_name, source_url)
 
-        # Create better styled action buttons
-        self.create_action_buttons_for_row(row)
-        
         # Clear inputs
         self.sync_source_input.clear()
-        
+
         self.save_sync_config()
         self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Added sync config for '{playlist_name}'")
     
+    SYNC_ROW_HEIGHT = 52
+    SYNC_COVER_SIZE = 36
+
+    def add_sync_config_row(self, playlist_name, source_url, last_sync="Never",
+                            clear_before=False):
+        """Append one configuration row, with playlist art and a service badge.
+
+        Three places used to build this row inline with slightly different code. The
+        cell *text* is unchanged -- several callers still read the playlist name from
+        column 0 and the source URL from column 1 -- so the artwork is carried as the
+        item's icon and the service name as its tooltip.
+        """
+        table = self.sync_configs_table
+        row = table.rowCount()
+        table.insertRow(row)
+
+        playlist_item = QTableWidgetItem(str(playlist_name))
+        playlist_item.setFlags(playlist_item.flags() & ~Qt.ItemIsEditable)
+        table.setItem(row, 0, playlist_item)
+
+        source_item = QTableWidgetItem(str(source_url))
+        source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+        service, colour = identify_service(source_url)
+        source_item.setIcon(QIcon(badge_pixmap(service, colour)))
+        source_item.setToolTip(f"{service}\n{source_url}")
+        table.setItem(row, 1, source_item)
+
+        sync_item = QTableWidgetItem(str(last_sync or "Never"))
+        sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
+        table.setItem(row, 2, sync_item)
+
+        self._set_clear_on_sync_checkbox(row, clear_before)
+        self.create_action_buttons_for_row(row)
+        table.setRowHeight(row, self.SYNC_ROW_HEIGHT)
+
+        self._apply_sync_row_cover(row, playlist_name)
+        self.refresh_sync_metrics()
+        return row
+
+    def _playlist_by_name(self, name):
+        target = str(name or "")
+        return next(
+            (p for p in (self.playlists or []) if str(getattr(p, "title", "")) == target),
+            None,
+        )
+
+    def _apply_sync_row_cover(self, row, playlist_name):
+        """Show the playlist's poster beside its name, reusing the wall's cover cache."""
+        item = self.sync_configs_table.item(row, 0)
+        if item is None:
+            return
+        playlist = self._playlist_by_name(playlist_name)
+        if playlist is None:
+            item.setIcon(QIcon(placeholder_cover(playlist_name, self.SYNC_COVER_SIZE)))
+            return
+
+        item.setIcon(QIcon(placeholder_cover(playlist_name, self.SYNC_COVER_SIZE)))
+        url = self._playlist_cover_url(playlist)
+        if not url:
+            return
+        item.setData(COVER_URL_ROLE, url)
+
+        fetcher = self._ensure_cover_fetcher()
+        cached = fetcher.cached_bytes(url)
+        if cached:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(cached):
+                item.setIcon(QIcon(rounded_cover(pixmap, self.SYNC_COVER_SIZE, 6.0)))
+                return
+        fetcher.request(url)
+
+    def refresh_sync_metrics(self):
+        """Update the metric strip at the top of the Sync Manager."""
+        if not hasattr(self, "sync_metric_configured"):
+            return
+        table = getattr(self, "sync_configs_table", None)
+        total = table.rowCount() if table is not None else 0
+        self.sync_metric_configured.setText(str(total))
+
+        if getattr(self, "auto_sync_checkbox", None) is not None and self.auto_sync_checkbox.isChecked():
+            self.sync_metric_auto.setText(f"Every {self.sync_interval_spinbox.value()} min")
+        else:
+            self.sync_metric_auto.setText("Off")
+
+        if getattr(self, "scheduled_sync_checkbox", None) is not None and self.scheduled_sync_checkbox.isChecked():
+            self.sync_metric_scheduled.setText(
+                self.scheduled_datetime.dateTime().toString("MMM d, HH:mm")
+            )
+        else:
+            self.sync_metric_scheduled.setText("Off")
+
+        # Most recent real timestamp across every row, ignoring "Never".
+        latest = ""
+        for row in range(total):
+            cell = table.item(row, 2)
+            value = cell.text().strip() if cell is not None else ""
+            if value and value.lower() != "never" and value > latest:
+                latest = value
+        self.sync_metric_last.setText(latest or "Never")
+
     def _set_clear_on_sync_checkbox(self, row, checked=False):
         """Add or update the clear-before-sync checkbox for a table row."""
         checkbox = QCheckBox()
@@ -14146,63 +15872,33 @@ class PlexPlaylistManager(QMainWindow):
         return checkbox.isChecked() if checkbox else False
 
     def create_action_buttons_for_row(self, row):
-        """Create properly sized and visible action buttons for sync config row"""
+        """Per-row actions, styled from the theme.
+
+        These were hardcoded Material green and red on white text, which is the one
+        palette the rest of the app never uses; they now take the shared primary and
+        danger variants like every other button.
+        """
         actions_widget = QWidget()
         actions_layout = QHBoxLayout(actions_widget)
-        actions_layout.setContentsMargins(2, 2, 2, 2)
-        actions_layout.setSpacing(5)
-        
-        # FIXED: Properly sized buttons with clear text labels
-        sync_btn = QPushButton("Sync Now")
+        actions_layout.setContentsMargins(SPACE_XS, SPACE_XS, SPACE_XS, SPACE_XS)
+        actions_layout.setSpacing(SPACE_XS)
+
+        sync_btn = ModernButton("Sync Now")
+        sync_btn.setObjectName("rowActionButton")
+        sync_btn.setProperty("variant", "primary")
         sync_btn.setToolTip("Sync this playlist now")
-        sync_btn.setFixedSize(80, 32)  # Fixed size for visibility
-        sync_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 2px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:pressed {
-                background-color: #3d8b40;
-            }
-        """)
         sync_btn.clicked.connect(lambda: self.sync_single_playlist(row))
         actions_layout.addWidget(sync_btn)
-        
-        # Delete button with proper sizing
-        delete_btn = QPushButton("Delete")
+
+        delete_btn = ModernButton("Delete")
+        delete_btn.setObjectName("rowActionButton")
+        delete_btn.setProperty("variant", "danger")
         delete_btn.setToolTip("Delete this sync configuration")
-        delete_btn.setFixedSize(80, 32)  # Fixed size for visibility
-        delete_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 2px;
-            }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
-            QPushButton:pressed {
-                background-color: #c1170a;
-            }
-        """)
         delete_btn.clicked.connect(lambda: self.delete_sync_config(row))
         actions_layout.addWidget(delete_btn)
-        
-        # FIXED: Set the widget properly and ensure table row height accommodates buttons
+
         self.sync_configs_table.setCellWidget(row, 4, actions_widget)
-        self.sync_configs_table.setRowHeight(row, 40)  # Ensure row is tall enough
+        self.sync_configs_table.setRowHeight(row, self.SYNC_ROW_HEIGHT)
     
     def sync_single_playlist(self, row):
         """Sync a single playlist"""
@@ -14261,27 +15957,14 @@ class PlexPlaylistManager(QMainWindow):
                 logging.info(f"Found {len(playlists)} sync playlist configuration(s)")
 
                 for playlist_name, config in playlists.items():
-                    row = self.sync_configs_table.rowCount()
-                    self.sync_configs_table.insertRow(row)
-                    
-                    # Create read-only items
-                    playlist_item = QTableWidgetItem(playlist_name)
-                    playlist_item.setFlags(playlist_item.flags() & ~Qt.ItemIsEditable)
-                    self.sync_configs_table.setItem(row, 0, playlist_item)
-                    
-                    source_item = QTableWidgetItem(config.get('source_url', ''))
-                    source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
-                    self.sync_configs_table.setItem(row, 1, source_item)
-                    
-                    sync_item = QTableWidgetItem(config.get('last_sync', 'Never'))
-                    sync_item.setFlags(sync_item.flags() & ~Qt.ItemIsEditable)
-                    self.sync_configs_table.setItem(row, 2, sync_item)
+                    self.add_sync_config_row(
+                        playlist_name,
+                        config.get('source_url', ''),
+                        config.get('last_sync', 'Never'),
+                        config.get('clear_before_sync', False),
+                    )
 
-                    self._set_clear_on_sync_checkbox(row, config.get('clear_before_sync', False))
-                    
-                    # Add styled action buttons
-                    self.create_action_buttons_for_row(row)
-                
+
                 # Load auto-sync settings
                 self.auto_sync_checkbox.setChecked(sync_config.get('auto_sync', False))
                 self.sync_interval_spinbox.setValue(sync_config.get('sync_interval', 60))
@@ -14320,68 +16003,165 @@ class PlexPlaylistManager(QMainWindow):
             logging.error(traceback.format_exc())
         self.update_dashboard_metrics()
     
+    def _collect_sync_configs(self, selected_only=True):
+        """Build the sync-config map from the table."""
+        configs = {}
+        for row in range(self.sync_configs_table.rowCount()):
+            name_item = self.sync_configs_table.item(row, 0)
+            if name_item is None:
+                continue
+            if selected_only and not name_item.isSelected():
+                continue
+            source_item = self.sync_configs_table.item(row, 1)
+            configs[name_item.text()] = {
+                'source_url': source_item.text() if source_item else '',
+                'library_section': self.section_combo.currentData(),
+                'clear_before_sync': self._is_clear_before_sync_enabled(row),
+            }
+        return configs
+
     def sync_selected_playlists(self):
         """Sync selected playlists from the table"""
         flow_id = new_flow_id("sync")
         self._active_sync_flow_id = flow_id
         self._active_sync_start = time.perf_counter()
         log_event("sync_selected_requested", flow_id=flow_id, source="ui")
-        selected_configs = {}
-        
-        for row in range(self.sync_configs_table.rowCount()):
-            if self.sync_configs_table.item(row, 0).isSelected():
-                playlist_name = self.sync_configs_table.item(row, 0).text()
-                source_url = self.sync_configs_table.item(row, 1).text()
-                selected_configs[playlist_name] = {
-                    'source_url': source_url,
-                    'library_section': self.section_combo.currentData(),
-                    'clear_before_sync': self._is_clear_before_sync_enabled(row)
-                }
-        
+        selected_configs = self._collect_sync_configs(selected_only=True)
+
         if not selected_configs:
             QMessageBox.warning(self, "No Selection", "Please select sync configurations to sync.")
             return
-        
+
         self.start_sync(selected_configs)
-    
+
+    def preview_selected_playlists(self):
+        """Dry-run the selected sync configs and report the diff without writing."""
+        configs = self._collect_sync_configs(selected_only=True)
+        if not configs:
+            configs = self._collect_sync_configs(selected_only=False)
+            if len(configs) != 1:
+                QMessageBox.warning(
+                    self,
+                    "No Selection",
+                    "Select the sync configuration you want to preview.",
+                )
+                return
+
+        self._sync_previews = []
+        self.start_sync(configs, dry_run=True)
+
     def sync_all_playlists(self):
         """Sync all configured playlists"""
-        all_configs = {}
-        
-        for row in range(self.sync_configs_table.rowCount()):
-            playlist_name = self.sync_configs_table.item(row, 0).text()
-            source_url = self.sync_configs_table.item(row, 1).text()
-            all_configs[playlist_name] = {
-                'source_url': source_url,
-                'library_section': self.section_combo.currentData(),
-                'clear_before_sync': self._is_clear_before_sync_enabled(row)
-            }
-        
+        all_configs = self._collect_sync_configs(selected_only=False)
+
         if not all_configs:
             QMessageBox.warning(self, "No Configurations", "No sync configurations found.")
             return
-        
+
         self.start_sync(all_configs)
-    
-    def start_sync(self, sync_configs):
-        """Start sync process"""
+
+    def start_sync(self, sync_configs, dry_run=False):
+        """Start sync process. dry_run resolves and diffs without writing to Plex."""
         if not self.plex_server:
             QMessageBox.warning(self, "Not Connected", "Please connect to Plex server first.")
             return
         flow_id = getattr(self, "_active_sync_flow_id", new_flow_id("sync"))
-        log_event("sync_started", flow_id=flow_id, playlist_count=len(sync_configs), source="ui")
-        
+        log_event(
+            "sync_started",
+            flow_id=flow_id,
+            playlist_count=len(sync_configs),
+            dry_run=dry_run,
+            source="ui",
+        )
+
+        self._sync_is_dry_run = bool(dry_run)
+        self._sync_previews = []
         self.sync_progress_group.setVisible(True)
-        self.sync_status_label.setText("Initializing sync...")
+        self.sync_status_label.setText(
+            "Previewing changes..." if dry_run else "Initializing sync..."
+        )
         self.sync_progress_bar.setValue(0)
-        
-        self.sync_thread = SyncThread(sync_configs, self.plex_server, self)
+
+        self.sync_thread = SyncThread(sync_configs, self.plex_server, self, dry_run=dry_run)
         self.sync_thread.progress_update.connect(self.update_sync_progress)
         self.sync_thread.sync_complete.connect(self.sync_playlist_complete)
+        self.sync_thread.preview_ready.connect(self.on_sync_preview_ready)
         self.sync_thread.error.connect(self.sync_error)
         self.sync_thread.finished.connect(self.sync_finished)
         self.sync_thread.start()
-    
+
+    def on_sync_preview_ready(self, playlist_name, preview):
+        """Collect one playlist's dry-run result; shown once the run finishes."""
+        if not hasattr(self, "_sync_previews") or self._sync_previews is None:
+            self._sync_previews = []
+        self._sync_previews.append(preview)
+
+    def _show_sync_preview_results(self):
+        previews = getattr(self, "_sync_previews", None) or []
+        if not previews:
+            return
+
+        lines = []
+        total_added = total_removed = total_unmatched = 0
+        for preview in previews:
+            changes = preview.get("changes", {})
+            added = changes.get("added", [])
+            removed = changes.get("removed", [])
+            unmatched = preview.get("unmatched", [])
+            total_added += len(added)
+            total_removed += len(removed)
+            total_unmatched += len(unmatched)
+
+            lines.append(f"▌ {preview.get('playlist_name', '')}")
+            lines.append(
+                f"   {changes.get('before_count', 0)} tracks now → "
+                f"{changes.get('after_count', 0)} tracks after sync"
+            )
+            if preview.get("clear_before_sync"):
+                lines.append("   Clear on Sync is ON: the playlist is rebuilt from the source.")
+            if not added and not removed:
+                lines.append(
+                    "   Reordering only." if changes.get("reordered") else "   No changes."
+                )
+
+            for row in added[:15]:
+                lines.append(f"   + {self._describe_snapshot_row(row)}")
+            if len(added) > 15:
+                lines.append(f"   + ...and {len(added) - 15} more")
+            for row in removed[:15]:
+                lines.append(f"   - {self._describe_snapshot_row(row)}")
+            if len(removed) > 15:
+                lines.append(f"   - ...and {len(removed) - 15} more")
+
+            if unmatched:
+                lines.append(f"   ⚠ {len(unmatched)} source track(s) not found in your library:")
+                for row in unmatched[:10]:
+                    lines.append(f"     · {display_name(row.get('title'), row.get('artist'))}")
+                if len(unmatched) > 10:
+                    lines.append(f"     · ...and {len(unmatched) - 10} more")
+                lines.append("   These were added to Tools → Missing Tracks.")
+            lines.append("")
+
+        summary = (
+            f"Preview only - nothing was written to Plex.\n\n"
+            f"{total_added} track(s) would be added, {total_removed} removed, "
+            f"{total_unmatched} unmatched."
+        )
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Sync Preview")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setText(summary)
+        dialog.setDetailedText("\n".join(lines).strip())
+        dialog.exec()
+
+    @staticmethod
+    def _describe_snapshot_row(row):
+        title = row.get("title", "") or "Unknown"
+        artist = row.get("artist", "")
+        return f"{artist} - {title}" if artist else title
+
+
     def update_sync_progress(self, message, percentage):
         """Update sync progress"""
         self.sync_status_label.setText(message)
@@ -14398,9 +16178,16 @@ class PlexPlaylistManager(QMainWindow):
             total_tracks=total_tracks,
             source="sync_thread",
         )
+        if getattr(self, "_sync_is_dry_run", False):
+            self.sync_log.append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] {playlist_name}: preview resolved "
+                f"({added_tracks} track(s) would be added)"
+            )
+            return
+
         message = f"[{datetime.now().strftime('%H:%M:%S')}] {playlist_name}: Added {added_tracks} new tracks"
         self.sync_log.append(message)
-        
+
         # Update last sync time in table
         for row in range(self.sync_configs_table.rowCount()):
             if self.sync_configs_table.item(row, 0).text() == playlist_name:
@@ -14424,6 +16211,16 @@ class PlexPlaylistManager(QMainWindow):
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             log_event("sync_finished", flow_id=flow_id, elapsed_ms=elapsed_ms, source="sync_thread")
         self.sync_progress_group.setVisible(False)
+
+        if getattr(self, "_sync_is_dry_run", False):
+            self._sync_is_dry_run = False
+            self.sync_log.append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Preview completed (no changes written)"
+            )
+            self.statusBar().showMessage("Sync preview completed")
+            self._show_sync_preview_results()
+            return
+
         self.sync_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Sync completed")
         self.statusBar().showMessage("Sync completed")
     
@@ -14468,7 +16265,11 @@ class PlexPlaylistManager(QMainWindow):
 
             with open(SYNC_CONFIG_FILE, 'w') as f:
                 json.dump(sync_config, f, indent=4)
-                
+
+            # Every mutation on this page routes through here, so it is the one place
+            # the summary strip needs to be refreshed from.
+            self.refresh_sync_metrics()
+
         except Exception as e:
             logging.error(f"Error saving sync config: {str(e)}")
 
@@ -14566,8 +16367,15 @@ class PlexPlaylistManager(QMainWindow):
         # Get scan options
         include_playlist_check = check_playlists_cb.isChecked()
 
-        # Show loading dialog
-        self.show_loading("Scanning music library for duplicates...", "Initializing library scan...")
+        # Loading dialog with a Stop button: a large library still takes a while, and
+        # stopping keeps whatever has been found rather than throwing it away.
+        self.show_loading(
+            "Scanning music library for duplicates...",
+            "Initializing library scan...",
+            can_cancel=True,
+            cancel_callback=self.cancel_duplicate_scan,
+            cancel_text="Stop and Show Results",
+        )
 
         # Disable the button to prevent multiple clicks
         self.find_duplicates_btn.setEnabled(False)
@@ -14684,17 +16492,46 @@ class PlexPlaylistManager(QMainWindow):
         QMessageBox.critical(self, "Scan Error", f"Error scanning for duplicates: {error_message}")
         self.statusBar().showMessage("Duplicate scan failed")
     
-    def on_library_duplicates_found(self, duplicate_groups):
-        """Handle library duplicate scan results with professional management UI"""
+    def cancel_duplicate_scan(self):
+        """Stop the scan but keep what it has already found."""
+        thread = getattr(self, "duplicates_thread", None)
+        if thread is None or not thread.isRunning():
+            self.hide_loading()
+            return
+        thread.stop()
+        if self.loading_dialog:
+            self.loading_dialog.detail_label.setText(
+                "Stopping... collecting the results found so far."
+            )
+            self.loading_dialog.cancel_button.setEnabled(False)
+
+    def on_library_duplicates_found(self, duplicate_groups, was_cancelled=False):
+        """Show the scan results, whether the scan finished or was stopped early."""
         self.hide_loading()
 
         if not duplicate_groups:
-            QMessageBox.information(self, "No Duplicates Found",
-                                  "🎉 Great news! No duplicate tracks were found in your music library.\n\n"
-                                  "Your library is clean and well-organized!")
+            if was_cancelled:
+                QMessageBox.information(
+                    self, "Scan Stopped",
+                    "The scan was stopped before it found any duplicates.",
+                )
+            else:
+                QMessageBox.information(
+                    self, "No Duplicates Found",
+                    "🎉 Great news! No duplicate tracks were found in your music library.\n\n"
+                    "Your library is clean and well-organized!",
+                )
             return
 
-        # Create professional duplicate management dialog
+        if was_cancelled:
+            total = sum(len(group) for group in duplicate_groups)
+            QMessageBox.information(
+                self, "Scan Stopped",
+                f"Stopped early. Showing the {len(duplicate_groups)} duplicate group(s) "
+                f"({total} tracks) found before you stopped.\n\n"
+                "Run the scan again to search the whole library.",
+            )
+
         dialog = LibraryDuplicateManagerDialog(duplicate_groups, self.plex_server, self)
         dialog.exec()
 
@@ -15038,34 +16875,41 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         self.fetch_playlists_button.setText("Fetch Playlists")
 
     def update_playlist_listwidget(self):
-        """Update playlist list widget with on-demand track count loading"""
+        """Rebuild the playlist wall, with on-demand track counts and async cover art."""
         self.playlist_listwidget.clear()
-        
+
         for playlist, track_count in self.playlist_data:
             try:
-                # Display playlist with track count (or "..." if not cached)
-                if track_count is not None:
-                    item_text = f"{playlist.title} ({track_count} tracks)"
-                else:
-                    item_text = f"{playlist.title} (click to load tracks...)"
-                
-                item = QListWidgetItem(item_text)
+                subtitle = self._playlist_subtitle(playlist, track_count)
+
+                item = QListWidgetItem()
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
-                
+
                 # Store playlist object for easy access
                 item.setData(Qt.UserRole, playlist)
-                
+                item.setToolTip(playlist.title)
+                self._refresh_playlist_item_text(item, playlist.title, subtitle)
+
                 self.playlist_listwidget.addItem(item)
-                
+                self._request_playlist_cover(item, playlist)
+
             except Exception as e:
                 logging.warning(f"Error adding playlist {playlist.title} to list: {str(e)}")
                 # Fallback: add without track count
-                item = QListWidgetItem(playlist.title)
+                item = QListWidgetItem()
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
                 item.setData(Qt.UserRole, playlist)
+                self._refresh_playlist_item_text(item, playlist.title, "")
                 self.playlist_listwidget.addItem(item)
+
+        if hasattr(self, "playlist_filter_input"):
+            # Keep an active filter applied across a refresh instead of silently
+            # showing everything again.
+            self.filter_playlist_items(self.playlist_filter_input.text())
+        else:
+            self._update_playlist_count_label()
 
     def load_track_count_on_demand(self, playlist):
         """Load track count for a specific playlist on-demand"""
@@ -15113,7 +16957,9 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             item = self.playlist_listwidget.item(i)
             playlist = item.data(Qt.UserRole)
             if playlist and str(playlist.ratingKey) == playlist_id:  # Convert to string for comparison
-                item.setText(f"{playlist.title} ({track_count} tracks)")
+                self._refresh_playlist_item_text(
+                    item, playlist.title, self._playlist_subtitle(playlist, track_count)
+                )
                 break
 
     def update_playlist_item_loading(self, playlist_id):
@@ -15122,7 +16968,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             item = self.playlist_listwidget.item(i)
             playlist = item.data(Qt.UserRole)
             if playlist and str(playlist.ratingKey) == playlist_id:  # Convert to string for comparison
-                item.setText(f"{playlist.title} (loading...)")
+                self._refresh_playlist_item_text(item, playlist.title, "loading...")
                 break
 
     def update_playlist_item_error(self, playlist_id):
@@ -15131,7 +16977,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             item = self.playlist_listwidget.item(i)
             playlist = item.data(Qt.UserRole)
             if playlist and str(playlist.ratingKey) == playlist_id:  # Convert to string for comparison
-                item.setText(f"{playlist.title} (error loading tracks)")
+                self._refresh_playlist_item_text(item, playlist.title, "error loading tracks")
                 break
 
     def refresh_all_track_counts(self):
@@ -15192,27 +17038,40 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     def clear_playlist_cache(self):
         """Clear the playlist cache"""
-        reply = QMessageBox.question(self, "Clear Cache", 
-                                   "This will clear all cached playlist data. Track counts will need to be reloaded. Continue?",
+        reply = QMessageBox.question(self, "Clear Cache",
+                                   "This will clear cached playlist track counts and downloaded cover art. Both will be reloaded on demand. Continue?",
                                    QMessageBox.Yes | QMessageBox.No)
-        
+
         if reply == QMessageBox.Yes:
             self.playlist_cache.clear_cache()
-            QMessageBox.information(self, "Cache Cleared", "Playlist cache has been cleared.")
-            
+
+            # Cover art is cached separately, on disk. Leaving it behind would make
+            # "Clear Cache" look like it had not worked for anyone whose art changed.
+            covers_removed = 0
+            try:
+                covers_removed = self._ensure_cover_fetcher().cache.clear()
+            except Exception as error:
+                logging.warning(f"Could not clear cover cache: {error}")
+
+            QMessageBox.information(
+                self,
+                "Cache Cleared",
+                f"Playlist cache has been cleared ({covers_removed} cover(s) removed).",
+            )
+
             # Refresh the display
             if self.playlists:
                 # Reset playlist_data to remove cached counts
                 self.playlist_data = [(playlist, None) for playlist, _ in self.playlist_data]
                 self.update_playlist_listwidget()
-                self.cache_info_label.setText("💡 Cache cleared. Track counts will load on-demand.")
+                self.cache_info_label.setText("💡 Cache cleared. Track counts and cover art will load on-demand.")
 
     def _create_plex_account(self, username, password):
         """Create a Plex account, using 2FA code when provided."""
         if not username or not password:
             raise ValueError("Plex username and password are required.")
 
-        auth_kwargs = {}
+        auth_kwargs = {"timeout": PLEX_CONNECT_TIMEOUT}
         two_factor_code = self.plex_2fa_input.text().strip() if hasattr(self, "plex_2fa_input") else ""
         if two_factor_code:
             auth_kwargs["code"] = two_factor_code
@@ -15235,7 +17094,103 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 ) from auth_error
             raise
 
-    def connect_to_plex(self):
+    def start_pending_auto_connect(self):
+        """Run the queued startup auto-connect once the UI is actually usable.
+
+        Called by main() after the window is shown and the splash is closed, so a failed
+        or slow connection degrades into a visible error instead of a frozen splash.
+        """
+        if self._auto_connect_attempted or not self._pending_auto_connect:
+            return
+        self._auto_connect_attempted = True
+        self._pending_auto_connect = False
+        self.statusBar().showMessage("Connecting to Plex...")
+        self.connect_to_plex(from_startup=True)
+
+    def _set_connection_banner(self, message, level="error"):
+        """Show or clear the non-modal banner on the Connection page."""
+        banner = getattr(self, "connection_banner", None)
+        if banner is None:
+            return
+        if not message:
+            banner.clear()
+            banner.setVisible(False)
+            return
+        palette = {
+            "error": ("#ffd9d9", "#3a1d22", "#7a3b44"),
+            "warn": ("#ffeccc", "#3a2f1d", "#7a663b"),
+            "info": ("#dceaff", "#1c2a40", "#3f587a"),
+        }
+        fg, bg, border = palette.get(level, palette["error"])
+        banner.setStyleSheet(
+            f"color: {fg}; background-color: {bg}; border: 1px solid {border};"
+            " border-radius: 8px; padding: 10px; font-size: 12px;"
+        )
+        banner.setText(message)
+        banner.setVisible(True)
+
+    def _describe_plex_connection_error(self, error):
+        """Map a connection exception to (title, actionable message, token_is_stale)."""
+        if isinstance(error, Unauthorized):
+            return (
+                "Plex Login Rejected",
+                "Plex rejected the saved credentials (401 Unauthorized).\n\n"
+                "This normally means your Plex password was changed or the account was "
+                "signed out everywhere, which invalidates saved tokens.\n\n"
+                "Fix: clear the Plex Auth Token field, enter your username and password "
+                "on the Connection page, then press 'Connect to Plex'.",
+                True,
+            )
+        if isinstance(error, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.Timeout)):
+            return (
+                "Plex Server Timed Out",
+                f"No response from the Plex server within {PLEX_CONNECT_TIMEOUT} seconds.\n\n"
+                "Check that the server IP and port on the Connection page are still correct, "
+                "that the server is powered on, and that any VPN or network share it needs "
+                "is available.",
+                False,
+            )
+        if isinstance(error, requests.exceptions.ConnectionError):
+            return (
+                "Cannot Reach Plex Server",
+                "Could not open a connection to the Plex server.\n\n"
+                "The server address may have changed (a new DHCP address is the usual cause), "
+                "the server may be offline, or a firewall may be blocking the port.",
+                False,
+            )
+        if isinstance(error, NotFound):
+            return (
+                "Plex Endpoint Not Found",
+                "The server answered but the expected Plex endpoint was missing.\n\n"
+                "Confirm the IP and port point at a Plex Media Server and not another service.",
+                False,
+            )
+        message = str(error).strip() or error.__class__.__name__
+        if "401" in message or "unauthorized" in message.lower():
+            return (
+                "Plex Login Rejected",
+                "Plex rejected the saved credentials.\n\n"
+                "Your password was most likely changed, which invalidates saved tokens. "
+                "Clear the token field and sign in again with your username and password.\n\n"
+                f"Details: {message}",
+                True,
+            )
+        return ("Connection Error", f"Error connecting to Plex: {message}", False)
+
+    def _report_connection_problem(self, title, message, modal_allowed=True):
+        """Surface a connection failure without ever blocking startup.
+
+        A modal dialog is only safe once the main window is visible and the splash is
+        gone. During startup the message goes to the banner and status bar instead.
+        """
+        logging.error(f"{title}: {message}")
+        self._set_connection_banner(f"⚠️ {title}\n\n{message}", level="error")
+        self.statusBar().showMessage(f"{title} - see the Connection page for details.")
+        splash_active = bool(getattr(self, "_startup_splash_active", False))
+        if modal_allowed and self.isVisible() and not splash_active:
+            QMessageBox.critical(self, title, message)
+
+    def connect_to_plex(self, from_startup=False):
 
         self.section_combo.clear()
         self.section_combo.addItem("Library Section")
@@ -15250,15 +17205,19 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
             base_url = f"http://{server_ip}:{server_port}"
 
+            self._set_connection_banner("")
+
             if token:
                 # Use token-only auth first to avoid unnecessary 2FA prompts on startup.
                 # Account-level login remains available when switching users.
                 self.plex_account = None
-                self.plex_server = PlexServer(base_url, token)
+                self.plex_server = PlexServer(base_url, token, timeout=PLEX_CONNECT_TIMEOUT)
                 # Best-effort: build account context from token so Switch User can work
-                # without forcing username/password+2FA each launch.
+                # without forcing username/password+2FA each launch. plex.tv is a separate
+                # host from the local server, so it gets its own bounded timeout and must
+                # never be allowed to stall or fail the connection we already have.
                 try:
-                    self.plex_account = MyPlexAccount(token=token)
+                    self.plex_account = MyPlexAccount(token=token, timeout=PLEX_CONNECT_TIMEOUT)
                 except Exception as token_account_error:
                     logging.info(f"Token-based account context unavailable: {token_account_error}")
             else:
@@ -15267,7 +17226,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 self.plex_account = account
                 token = account.authenticationToken
                 self.token_input.setText(token)
-                self.plex_server = PlexServer(base_url, token)
+                self.plex_server = PlexServer(base_url, token, timeout=PLEX_CONNECT_TIMEOUT)
 
             # Auto-select saved user during auto-connect
             auto_select_user = getattr(self, '_auto_select_user', None)
@@ -15390,6 +17349,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self.populate_library_sections()
             self.populate_sync_playlist_combo()
             self.statusBar().showMessage(f"Successfully connected to Plex as {self.current_user_name}")
+            self._set_connection_banner("")
             self.save_config()
             self.refresh_feature_dependent_ui()
             if self._startup_auto_fetch_pending:
@@ -15397,8 +17357,40 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 QTimer.singleShot(0, self.fetch_playlists)
         except Exception as e:
             logging.error(f"Error connecting to Plex: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Connection Error", f"Error connecting to Plex: {str(e)}")
+            self.plex_server = None
+            title, message, token_is_stale = self._describe_plex_connection_error(e)
+
+            if token_is_stale and self.token_input.text().strip():
+                # A rejected token is never going to start working again. Drop it so the
+                # next launch asks for credentials instead of silently failing forever.
+                self.token_input.clear()
+                self._clear_stale_token_from_config()
+                message += "\n\nThe stored token has been cleared automatically."
+
+            if from_startup:
+                message = (
+                    "Syncra started, but could not reconnect to your Plex server.\n\n" + message
+                )
+            self._report_connection_problem(title, message, modal_allowed=not from_startup)
+            if from_startup:
+                self.navigate_to_page(1, "Connection", "Connect and authenticate with Plex")
             self.refresh_feature_dependent_ui()
+
+    def _clear_stale_token_from_config(self):
+        """Remove a rejected auth token from app_config.json."""
+        try:
+            if not os.path.exists(CONFIG_FILE):
+                return
+            with open(CONFIG_FILE, 'r') as config_file:
+                config = json.load(config_file)
+            if not config.get('token'):
+                return
+            config['token'] = ''
+            with open(CONFIG_FILE, 'w') as config_file:
+                json.dump(config, config_file, indent=4)
+            logging.info("Cleared rejected Plex token from configuration.")
+        except Exception as clear_error:
+            logging.warning(f"Could not clear stale token from config: {clear_error}")
 
     def update_window_title(self):
         """Update window title and user label to show current user"""
@@ -15414,22 +17406,12 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # Update label if it exists
             if hasattr(self, 'current_user_label'):
                 self.current_user_label.setText(user_status)
-                self.current_user_label.setStyleSheet("""
-                    color: #4CAF50;
-                    font-weight: bold;
-                    padding: 10px;
-                    font-size: 12px;
-                """)
+                self._set_identity_state(self.current_user_label, "connected")
         else:
             self.setWindowTitle(base_title)
             if hasattr(self, 'current_user_label'):
                 self.current_user_label.setText("Not connected")
-                self.current_user_label.setStyleSheet("""
-                    color: #aaaaaa;
-                    font-style: italic;
-                    padding: 10px;
-                    font-size: 12px;
-                """)
+                self._set_identity_state(self.current_user_label, "offline")
 
     def switch_user(self):
         """Show user selection dialog to switch active user"""
@@ -17609,9 +19591,21 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     def load_config(self):
         '''Load saved configuration values and optionally auto-connect to Plex.'''
+        # Populating widgets fires their change signals, and several of those handlers
+        # call save_config(). During a load that is both pointless (it would write back
+        # what was just read) and noisy, because the not-yet-loaded guard in
+        # save_config() logs a warning every time. Suspend saving until the load ends.
+        self._loading_config = True
+        try:
+            self._load_config_inner()
+        finally:
+            self._loading_config = False
+
+    def _load_config_inner(self):
         try:
             if not os.path.exists(CONFIG_FILE):
                 logging.info('Config file not found; using defaults.')
+                self._config_loaded = True
                 self.load_spotify_config()
                 self.refresh_feature_dependent_ui()
                 return
@@ -17721,6 +19715,18 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         self._saved_user_name = config.get('selected_user_name', None)
         self._saved_is_admin = config.get('is_admin', True)
 
+        self.match_filters = MatchFilters.from_config(config)
+        for attr, value in (
+            ("enable_filters_checkbox", self.match_filters.enabled),
+            ("filter_live_checkbox", self.match_filters.avoid_live),
+            ("filter_compilation_checkbox", self.match_filters.avoid_compilation),
+            ("filter_remaster_checkbox", self.match_filters.deprioritize_remaster),
+            ("filter_deluxe_checkbox", self.match_filters.deprioritize_deluxe),
+        ):
+            checkbox = getattr(self, attr, None)
+            if checkbox is not None:
+                checkbox.setChecked(bool(value))
+
         self.last_section_id = config.get('last_section') or None
 
         # Load path mappings
@@ -17743,18 +19749,47 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         self._startup_auto_fetch_pending = bool(self.feature_flags.get("auto_fetch_playlists_on_startup", False))
 
-        # Auto-connect if we have a saved token
+        # Auto-connect if we have a saved token.
+        #
+        # This must NOT be scheduled with QTimer.singleShot() here. load_config() runs
+        # inside __init__, and the very next startup-progress update calls
+        # QApplication.processEvents(), which dispatches pending zero-timers. That made
+        # connect_to_plex() run *during* __init__ with the main window still hidden and
+        # the always-on-top splash still up, so any error dialog it raised opened a nested
+        # modal loop behind the splash that the user could neither see nor dismiss --
+        # __init__ never returned, and the splash never closed.
+        #
+        # Instead just record the intent; main() triggers it once the window is visible
+        # and the real event loop owns the app.
         if token_value and self.server_ip_input.text() and self.server_port_input.text():
-            logging.info(f'Auto-connecting to Plex as saved user: {self._saved_user_name}')
+            logging.info(f'Queued auto-connect to Plex as saved user: {self._saved_user_name}')
             # Set flag to auto-select saved user during auto-connect
             self._auto_select_user = self._saved_user_name
-            QTimer.singleShot(0, self.connect_to_plex)
+            self._pending_auto_connect = True
 
+        self._config_loaded = True
         self.refresh_feature_dependent_ui()
         self.refresh_smart_match_cache_status()
 
     def save_config(self):
         """Save configuration while preserving existing settings"""
+        # A load is in progress and is about to set every widget; the change signals
+        # that fire on the way are not user edits and must not be written back.
+        if getattr(self, "_loading_config", False):
+            return
+
+        # Never write a window whose settings were never read in.
+        #
+        # save_config() serialises the live widget values, and closeEvent() calls it on
+        # every exit. If load_config() never populated those widgets, closing the window
+        # persists the empty defaults over the real file -- wiping credentials, server
+        # profiles, ListenBrainz tokens, feature flags and metadata settings in one go.
+        if not getattr(self, "_config_loaded", False):
+            logging.warning(
+                "Skipping save_config(): configuration was never loaded into this window, "
+                "so saving would overwrite the stored settings with empty defaults."
+            )
+            return
         try:
             # Load existing config first to preserve Spotify settings
             existing_config = {}
@@ -17794,11 +19829,38 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 credential_manager.save_password(username, password)
                 logging.info("Password saved to secure credential storage")
 
+            server_ip = self.server_ip_input.text()
+            server_port = self.server_port_input.text()
+
+            # Refuse to blank out a saved account.
+            #
+            # closeEvent() calls save_config(), which reads straight from the connection
+            # fields. If those fields were never populated -- load_config() failed, was
+            # skipped, or the window was built headlessly -- every credential gets
+            # written back as an empty string and the user has to sign in again on the
+            # next launch. Clearing one field is a legitimate edit; all four going empty
+            # at once while the stored config has values never is.
+            credential_fields = (username, server_ip, server_port, active_token)
+            stored_credentials = (
+                existing_config.get("plex_username", ""),
+                existing_config.get("server_ip", ""),
+                existing_config.get("server_port", ""),
+                existing_config.get("token", ""),
+            )
+            if not any(str(value or "").strip() for value in credential_fields) and \
+                    any(str(value or "").strip() for value in stored_credentials):
+                logging.warning(
+                    "Refusing to overwrite saved Plex credentials with empty values "
+                    "(connection fields were never populated). Keeping stored account."
+                )
+                username, server_ip, server_port, active_token = stored_credentials
+
             config.update({
+                "match_filters": MatchFilters.from_widget(self).to_config(),
                 "plex_username": username,
                 # Password NOT stored in config file - stored in secure OS keyring/encrypted file
-                "server_ip": self.server_ip_input.text(),
-                "server_port": self.server_port_input.text(),
+                "server_ip": server_ip,
+                "server_port": server_port,
                 "token": active_token,  # Save currently active token for true token-first auto-reconnect
                 "plex_server_profiles": self.plex_server_profiles if isinstance(self.plex_server_profiles, list) else [],
                 "server_sync_policy": self.server_sync_policy,
@@ -17860,10 +19922,20 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             if self.batch_track_count_thread and self.batch_track_count_thread.isRunning():
                 self.batch_track_count_thread.stop()
                 self.batch_track_count_thread.wait(3000)
-                
+
+            # Cover fetches are QRunnables on a pool, not QThreads; drop the queue and
+            # let anything already in flight finish so no task outlives the window.
+            if getattr(self, "playlist_cover_fetcher", None) is not None:
+                self.playlist_cover_fetcher.shutdown()
+
+
             if hasattr(self, 'duplicates_thread') and self.duplicates_thread.isRunning():
-                self.duplicates_thread.terminate()
-                self.duplicates_thread.wait(3000)
+                # Ask first: terminate() on a thread mid-request can leave the
+                # connection in a bad state.
+                self.duplicates_thread.stop()
+                if not self.duplicates_thread.wait(3000):
+                    self.duplicates_thread.terminate()
+                    self.duplicates_thread.wait(2000)
 
             if self.source_playlist_load_thread and self.source_playlist_load_thread.isRunning():
                 self.source_playlist_load_thread.terminate()
@@ -18114,14 +20186,42 @@ def main():
     setup_logging()
     initialize_config()
     app = QApplication(sys.argv)
+    # Identity first: an untitled window inherits applicationName(), which otherwise
+    # defaults to the executable basename ("python" from source, the exe name when
+    # frozen). Setting the icon here gives every dialog the icon too.
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setOrganizationName(APP_NAME)
+    app.setWindowIcon(get_app_icon())
     app.setStyle("Fusion")  # This can help with some styling issues
     splash = StartupSplashScreen()
     splash.show()
     splash.update_progress("Starting Syncra...", 5)
-    ex = PlexPlaylistManager(startup_splash=splash)
+
+    try:
+        ex = PlexPlaylistManager(startup_splash=splash)
+    except Exception as startup_error:
+        # Never leave the always-on-top splash stranded on screen with no explanation.
+        logging.critical("Fatal error during startup", exc_info=True)
+        splash.close()
+        QMessageBox.critical(
+            None,
+            "Syncra Failed to Start",
+            "Syncra could not finish starting up.\n\n"
+            f"{startup_error}\n\n"
+            "Details were written to the Syncra log file.",
+        )
+        sys.exit(1)
+
     ex.show()
     splash.finish_for(ex)
     ex._startup_splash_active = False
+
+    # Auto-connect only after the window is visible and the splash is gone, so a bad
+    # token, a changed password, or an unreachable server produces a readable error
+    # instead of a nested modal loop hidden behind the splash.
+    QTimer.singleShot(0, ex.start_pending_auto_connect)
+
     sys.exit(app.exec())
 
 if __name__ == '__main__':
