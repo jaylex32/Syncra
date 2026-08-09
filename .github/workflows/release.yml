@@ -113,8 +113,15 @@ jobs:
       run: |
         # Extract changelog for this version
         VERSION="${{ steps.get_version.outputs.VERSION }}"
-        # Read CHANGELOG.md and extract the section for this version
-        awk "/^## ${VERSION}/,/^## /" CHANGELOG.md | sed '$d' > release_notes.md
+        # Extract this version's section: print from its heading up to the next one.
+        #
+        # This used to be an awk range, `/^## $VERSION/,/^## /`. A range whose end
+        # pattern also matches its start line spans that single line, so the range
+        # yielded only the heading and the trailing `sed '$d'` then deleted it --
+        # release_notes.md was always empty and every release fell back to the
+        # "See CHANGELOG.md" stub below.
+        awk "/^## ${VERSION}( |\$)/{flag=1; print; next} /^## /{flag=0} flag" \
+          CHANGELOG.md > release_notes.md
 
         # If no specific version found, use a default message
         if [ ! -s release_notes.md ]; then
