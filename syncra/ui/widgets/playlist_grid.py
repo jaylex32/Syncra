@@ -50,14 +50,11 @@ from PyQt6.QtWidgets import QListView, QListWidget, QStyle, QStyledItemDelegate
 
 from ...services.cover_cache import CoverCache, cache_key
 from ...theme.styles import (
-    BORDER_SOFT,
     RADIUS_CARD,
     SPACE_SM,
     SPACE_XS,
-    SURFACE_CARD,
     TOKENS,
-    TXT_MUTED,
-    TXT_TITLE,
+    tile_palette,
 )
 
 # ---------------------------------------------------------------------------
@@ -70,6 +67,7 @@ TITLE_ROLE = Qt.ItemDataRole.UserRole + 5         # canonical title, free of any
 COVER_ROLE = Qt.ItemDataRole.UserRole + 2         # rendered QPixmap, ready to blit
 COVER_URL_ROLE = Qt.ItemDataRole.UserRole + 3     # str, poster URL for the fetcher
 COVER_STATE_ROLE = Qt.ItemDataRole.UserRole + 4   # "idle" | "loading" | "ready" | "none"
+POSTER_KEY_ROLE = Qt.ItemDataRole.UserRole + 6    # playlist ratingKey, for poster lookups
 
 # ---------------------------------------------------------------------------
 # Card geometry. Multiples of 4 per the design system's grid.
@@ -193,8 +191,9 @@ def placeholder_cover(title: str, side: int = COVER_SIZE,
     the same colours -- the grid stays visually stable between launches.
     """
     name = str(title or "")
-    index = sum(ord(c) for c in name) % len(PLACEHOLDER_GRADIENTS)
-    top, bottom = PLACEHOLDER_GRADIENTS[index]
+    gradients = tile_palette() or PLACEHOLDER_GRADIENTS
+    index = sum(ord(c) for c in name) % len(gradients)
+    top, bottom = gradients[index]
 
     canvas = QPixmap(side, side)
     canvas.fill(Qt.GlobalColor.transparent)
@@ -214,11 +213,18 @@ def placeholder_cover(title: str, side: int = COVER_SIZE,
     font.setPointSizeF(max(14.0, side * 0.24))
     font.setWeight(QFont.Weight.DemiBold)
     painter.setFont(font)
-    painter.setPen(QColor(255, 255, 255, 46))
+    initial_colour = QColor(TOKENS['txt_0'])
+    initial_colour.setAlpha(56)
+    painter.setPen(initial_colour)
     painter.drawText(QRect(0, 0, side, side), Qt.AlignmentFlag.AlignCenter, _initials(name))
     painter.end()
     return canvas
 
+
+# Service badges keep their brand colours in every theme -- Spotify green is
+# Spotify green -- so the letter on them is a fixed dark ink chosen for contrast
+# against those saturated fills, not a palette colour.
+BADGE_TEXT = "#0d1622"
 
 SERVICE_COLOURS = {
     "spotify": ("Spotify", "#1db954"),
@@ -227,21 +233,25 @@ SERVICE_COLOURS = {
     "listenbrainz": ("ListenBrainz", "#e97a2c"),
     "apple": ("Apple Music", "#fa2d48"),
     "youtube": ("YouTube", "#ff0033"),
-    "m3u": ("Local file", "#7f92ad"),
 }
+
+# Not a brand: a local file or an unrecognised host gets a neutral chip, so this one
+# follows the palette rather than being pinned to a colour.
+NEUTRAL_SERVICE = "Local file"
 
 
 def identify_service(source: str):
     """Map a sync source to (label, colour). Falls back to a neutral local-file badge."""
     text = str(source or "").strip().lower()
+    neutral = TOKENS["txt_muted"]
     if not text:
-        return SERVICE_COLOURS["m3u"]
+        return (NEUTRAL_SERVICE, neutral)
     for key, value in SERVICE_COLOURS.items():
         if key in text:
             return value
     if text.startswith("http://") or text.startswith("https://"):
-        return ("Web", "#7f92ad")
-    return SERVICE_COLOURS["m3u"]
+        return ("Web", neutral)
+    return (NEUTRAL_SERVICE, neutral)
 
 
 def badge_pixmap(label: str, colour: str, size: int = 22) -> QPixmap:
@@ -259,7 +269,7 @@ def badge_pixmap(label: str, colour: str, size: int = 22) -> QPixmap:
     font.setPointSizeF(max(7.0, size * 0.48))
     font.setWeight(QFont.Weight.Bold)
     painter.setFont(font)
-    painter.setPen(QColor("#0d1622"))
+    painter.setPen(QColor(BADGE_TEXT))
     initial = (str(label or "?").strip() or "?")[0].upper()
     painter.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, initial)
     painter.end()
@@ -273,6 +283,34 @@ def badge_pixmap(label: str, colour: str, size: int = 22) -> QPixmap:
 
 class _FetchSignals(QObject):
     finished = pyqtSignal(str, bytes)   # url, image bytes (empty on failure)
+    resolved = pyqtSignal(str, str)     # request key, resolved image url
+
+
+class _ResolveTask(QRunnable):
+    """Work out an item's real image URL off the GUI thread.
+
+    A playlist's listing entry carries the auto-generated composite even when the user
+    has uploaded their own poster; finding the selected one costs a request per
+    playlist, which must not happen on the GUI thread.
+    """
+
+    def __init__(self, key: str, resolver, signals: _FetchSignals):
+        super().__init__()
+        self.key = key
+        self.resolver = resolver
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    def run(self):
+        url = ""
+        try:
+            url = str(self.resolver() or "")
+        except Exception as error:
+            logging.debug(f"Cover resolve failed for {self.key}: {error}")
+        try:
+            self.signals.resolved.emit(self.key, url)
+        except RuntimeError:
+            pass
 
 
 class _CoverTask(QRunnable):
@@ -321,6 +359,7 @@ class CoverFetcher(QObject):
     """
 
     cover_ready = pyqtSignal(str, bytes)
+    cover_url_resolved = pyqtSignal(str, str)
 
     def __init__(self, parent=None, max_threads: int = 4, user_agent: str = "Syncra"):
         super().__init__(parent)
@@ -328,6 +367,7 @@ class CoverFetcher(QObject):
         self.user_agent = user_agent
         self.signals = _FetchSignals()
         self.signals.finished.connect(self._on_finished)
+        self.signals.resolved.connect(self.cover_url_resolved)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(max(1, max_threads))
         self._in_flight: set[str] = set()
@@ -345,6 +385,14 @@ class CoverFetcher(QObject):
             return False
         self._in_flight.add(url)
         self.pool.start(_CoverTask(url, self.cache, self.signals, self.user_agent))
+        return True
+
+    def resolve(self, key: str, resolver) -> bool:
+        """Queue a lookup for an item's real image URL, answered on cover_url_resolved."""
+        key = str(key or "").strip()
+        if not key or resolver is None:
+            return False
+        self.pool.start(_ResolveTask(key, resolver, self.signals))
         return True
 
     def _on_finished(self, url: str, data: bytes):
@@ -445,12 +493,12 @@ class PlaylistCardDelegate(QStyledItemDelegate):
         elif hovered:
             painter.fillPath(path, QColor(TOKENS["bg_2"]))
         else:
-            painter.fillPath(path, QColor(SURFACE_CARD))
+            painter.fillPath(path, QColor(TOKENS['card']))
 
         if selected or checked:
             pen = QPen(QColor(TOKENS["accent"]), 2)
         elif hovered:
-            pen = QPen(QColor(BORDER_SOFT), 1)
+            pen = QPen(QColor(TOKENS['border_soft']), 1)
         else:
             pen = QPen(QColor(TOKENS["border"]), 1)
         painter.setPen(pen)
@@ -468,7 +516,9 @@ class PlaylistCardDelegate(QStyledItemDelegate):
         if hovered:
             wash = QPainterPath()
             wash.addRoundedRect(QRectF(rect), RADIUS_CARD, RADIUS_CARD)
-            painter.fillPath(wash, QColor(255, 255, 255, 16))
+            wash_colour = QColor(TOKENS['txt_0'])
+            wash_colour.setAlpha(16)
+            painter.fillPath(wash, wash_colour)
 
     def _paint_check(self, painter, card, checked, hovered):
         # Unchecked boxes stay faint until the tile is hovered, so a full grid is art
@@ -488,13 +538,17 @@ class PlaylistCardDelegate(QStyledItemDelegate):
             tick.moveTo(rect.left() + 5.5, rect.top() + 11.0)
             tick.lineTo(rect.left() + 9.0, rect.top() + 14.5)
             tick.lineTo(rect.left() + 16.0, rect.top() + 7.0)
-            painter.setPen(QPen(QColor("#0d1622"), 2.2,
+            painter.setPen(QPen(QColor(TOKENS["on_accent"]), 2.2,
                                 Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                                 Qt.PenJoinStyle.RoundJoin))
             painter.drawPath(tick)
         else:
-            painter.fillPath(path, QColor(13, 22, 34, 165))
-            painter.setPen(QPen(QColor(255, 255, 255, 130), 1))
+            scrim = QColor(TOKENS['bg_0'])
+            scrim.setAlpha(165)
+            painter.fillPath(path, scrim)
+            outline = QColor(TOKENS['txt_0'])
+            outline.setAlpha(130)
+            painter.setPen(QPen(outline, 1))
             painter.drawPath(path)
 
     def _paint_text(self, painter, card, index, selected):
@@ -505,7 +559,7 @@ class PlaylistCardDelegate(QStyledItemDelegate):
         title = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         painter.setFont(self._title_font)
         metrics = QFontMetrics(self._title_font)
-        painter.setPen(QColor(TXT_TITLE if selected else TOKENS["txt_0"]))
+        painter.setPen(QColor(TOKENS["txt_title"] if selected else TOKENS["txt_0"]))
         painter.drawText(
             QRect(left, top, width, TITLE_HEIGHT),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
@@ -517,7 +571,7 @@ class PlaylistCardDelegate(QStyledItemDelegate):
             return
         painter.setFont(self._subtitle_font)
         sub_metrics = QFontMetrics(self._subtitle_font)
-        painter.setPen(QColor(TXT_MUTED))
+        painter.setPen(QColor(TOKENS["txt_muted"]))
         painter.drawText(
             QRect(left, top + TITLE_HEIGHT + 2, width, SUBTITLE_HEIGHT),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),

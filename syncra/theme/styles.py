@@ -1,78 +1,113 @@
 """Centralized design system and QSS theme for Syncra.
 
-Palette is unchanged from the original theme -- every colour value here already existed
-in the app, either in the TOKENS dict or hardcoded inline in the QSS. What changed is
-that they are now all named, and everything else (spacing, radii, type scale, states)
-is derived from a small set of constants instead of being chosen per widget.
+Colours come from a palette in `palettes.py` rather than being fixed here, so the whole
+interface can be re-themed. `TOKENS` holds the *active* palette and is updated in place
+by `set_theme()` -- in place matters, because modules that painted with these values
+imported the dict once at start-up and would otherwise keep the old colours forever.
 
-Layout code should import SPACE_*, RADIUS_* and FONT_* rather than hardcoding numbers,
-so Python-side margins stay in sync with the QSS.
+Everything else (spacing, radii, type scale, states) is derived from a small set of
+constants instead of being chosen per widget. Layout code should import SPACE_*,
+RADIUS_* and FONT_* rather than hardcoding numbers, so Python-side margins stay in
+sync with the QSS.
 """
 
-# ---------------------------------------------------------------------------
-# Colour tokens - deep navy surfaces, neon cyan accent. Values preserved exactly.
-# ---------------------------------------------------------------------------
+from .palettes import DEFAULT_THEME, THEMES, get_palette, theme_names, tile_gradients
 
-TOKENS = {
-    # Surfaces, darkest to lightest
-    "bg_0": "#111a28",   # window canvas
-    "bg_1": "#1a2537",   # inputs, lists, tables
-    "bg_2": "#25344b",   # buttons, combos, header sections
-    "bg_3": "#314664",   # hover / selected
+# The live palette. Mutated in place by set_theme(); never rebound.
+TOKENS = get_palette(DEFAULT_THEME)
 
-    # Text
-    "txt_0": "#f5f7fb",  # primary
-    "txt_1": "#c9d1df",  # secondary
+_active_theme = DEFAULT_THEME
 
-    # Brand
-    "accent": "#2fb8ff",     # neon cyan - active elements and primary actions only
-    "accent_ok": "#2ed27a",  # success green - matches the Connected badge
 
-    "border": "#3f516f",
-}
+def current_theme() -> str:
+    """Key of the palette currently applied."""
+    return _active_theme
 
-# Named versions of colours that were previously inline in the QSS string.
-SURFACE_SIDEBAR = "#121722"
-SURFACE_GRADIENT_END = "#0f1b30"
-SURFACE_HEADER_A = "#1f2a3b"
-SURFACE_HEADER_B = "#1a2232"
-SURFACE_HERO_A = "#1d2f47"
-SURFACE_HERO_B = "#1b2335"
-SURFACE_SECTION_A = "#1e2b3f"
-SURFACE_SECTION_B = "#1a2231"
-SURFACE_CARD = "#202d43"
 
-BORDER_SOFT = "#44516c"
-BORDER_SECTION = "#42506a"
-BORDER_SCROLL = "#2f4360"
-BORDER_SCROLL_HANDLE = "#49648b"
+def is_dark() -> bool:
+    return bool(TOKENS.get("dark", True))
 
-SCROLL_HANDLE = "#2a3f5e"
-SCROLL_HANDLE_HOVER = "#35527a"
-SCROLL_HANDLE_ACTIVE = "#3f6291"
 
-TXT_TITLE = "#f8fbff"
-TXT_MUTED = "#a8b9cf"
-TXT_SUBTLE = "#b9c8dc"
-TXT_METRIC = "#d9e7ff"
-TXT_HERO = "#c7d4e8"
-TXT_SIDEBAR_GROUP = "#8fa1ba"
+def available_themes() -> list:
+    """[(key, display name, description), ...] for the settings picker."""
+    return [
+        (key, palette.get("name", key.title()), palette.get("description", ""))
+        for key, palette in THEMES.items()
+    ]
 
-# Sidebar rules. The section rule is quieter than the block divider so the two read
-# as different weights of separation rather than the same line repeated.
-SIDEBAR_RULE = "#232f42"
-SIDEBAR_DIVIDER = "#2b3a52"
 
-# Status families. Each is (background, border, foreground).
-STATUS_OK = ("#1f3a2a", "#2ed27a", "#90f3c1")
-STATUS_WARN = ("#3a2b1f", "#f9a93b", "#ffd399")
-STATUS_DANGER = ("#3a1d22", "#7a3b44", "#ffd9d9")
-STATUS_NEUTRAL = ("#243047", "#486089", "#cfe0ff")
-STATUS_ACCENT = ("#1f2f40", TOKENS["accent"], "#8ad8ff")
+def set_theme(name) -> str:
+    """Switch the active palette and return the stylesheet for it.
 
-DISABLED_BG = "#1b2434"
-DISABLED_FG = "#6d7c93"
-DISABLED_BORDER = "#2c3a52"
+    TOKENS is updated in place so painting code that captured the dict at import time
+    sees the new colours without being reloaded.
+    """
+    global _active_theme
+    palette = get_palette(name)
+    TOKENS.clear()
+    TOKENS.update(palette)
+    _active_theme = str(name or DEFAULT_THEME).strip().lower()
+    if _active_theme not in THEMES:
+        _active_theme = DEFAULT_THEME
+    return build_stylesheet(TOKENS)
+
+
+def build_qpalette(p=None):
+    """A QPalette matching the active theme.
+
+    The stylesheet covers everything Syncra styles by name, but any widget that falls
+    back to Qt's own painting -- scroll-area viewports, native dialogs, message boxes,
+    item-view backgrounds -- uses the palette instead. Leaving it on the dark default
+    is why a light theme showed black panels behind styled content.
+    """
+    from PyQt6.QtGui import QColor, QPalette
+
+    p = p or TOKENS
+    palette = QPalette()
+    R = QPalette.ColorRole
+    G = QPalette.ColorGroup
+
+    pairs = {
+        R.Window: p["bg_0"],
+        R.WindowText: p["txt_0"],
+        R.Base: p["bg_1"],
+        R.AlternateBase: p["bg_2"],
+        R.Text: p["txt_0"],
+        R.Button: p["bg_2"],
+        R.ButtonText: p["txt_0"],
+        R.BrightText: p["txt_title"],
+        R.Highlight: p["accent"],
+        R.HighlightedText: p["on_accent"],
+        R.ToolTipBase: p["header_a"],
+        R.ToolTipText: p["txt_0"],
+        R.PlaceholderText: p["txt_muted"],
+        R.Link: p["accent"],
+        R.LinkVisited: p["accent_pressed"],
+        R.Light: p["bg_3"],
+        R.Midlight: p["bg_2"],
+        R.Mid: p["border"],
+        R.Dark: p["bg_0"],
+        R.Shadow: p["gradient_end"],
+    }
+    for role, value in pairs.items():
+        palette.setColor(role, QColor(value))
+
+    for role, value in (
+        (R.WindowText, p["disabled_fg"]),
+        (R.Text, p["disabled_fg"]),
+        (R.ButtonText, p["disabled_fg"]),
+        (R.Base, p["disabled_bg"]),
+        (R.Button, p["disabled_bg"]),
+    ):
+        palette.setColor(G.Disabled, role, QColor(value))
+
+    return palette
+
+
+def tile_palette() -> tuple:
+    """Gradient pairs for generated playlist tiles under the active palette."""
+    return tile_gradients(TOKENS)
+
 
 # ---------------------------------------------------------------------------
 # Spacing - strict 4px grid. Import these in layout code.
@@ -138,9 +173,8 @@ W_BOLD = 700
 W_HEAVY = 800
 
 
-def _chip(name, family):
+def _chip(name, bg, border, fg):
     """Build the QSS block for a status chip / badge."""
-    bg, border, fg = family
     return f"""
 #{name} {{
     background-color: {bg};
@@ -149,14 +183,17 @@ def _chip(name, family):
 }}"""
 
 
-MAIN_STYLESHEET = f"""
+def build_stylesheet(p=None):
+    """Render the full QSS for a palette (the active one by default)."""
+    p = p or TOKENS
+    return f"""
 /* ---------------------------------------------------------------- base ---- */
 QMainWindow, QMessageBox, QMenu, QDialog {{
-    background-color: {TOKENS['bg_0']};
-    color: {TOKENS['txt_0']};
+    background-color: {p['bg_0']};
+    color: {p['txt_0']};
 }}
 QWidget {{
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     font-family: {FONT_STACK};
     font-size: {FS_BODY}px;
 }}
@@ -164,22 +201,55 @@ QLabel {{
     background: transparent;
 }}
 QToolTip {{
-    background-color: {SURFACE_HEADER_A};
-    color: {TOKENS['txt_0']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['header_a']};
+    color: {p['txt_0']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CONTROL}px;
     padding: {SPACE_XS}px {SPACE_SM}px;
     font-size: {FS_SECONDARY}px;
 }}
 
+/* --------------------------------------------------- semantic label states --
+   Set with the dynamic property `status`, so a label's colour follows the theme
+   instead of being frozen by an inline stylesheet at construction time. */
+QLabel[status="muted"] {{
+    color: {p['txt_muted']};
+}}
+QLabel[status="info"] {{
+    color: {p['accent']};
+}}
+QLabel[status="ok"] {{
+    color: {p['ok_border']};
+    font-weight: {W_SEMIBOLD};
+}}
+QLabel[status="warn"] {{
+    color: {p['warn_border']};
+    font-weight: {W_SEMIBOLD};
+}}
+QLabel[status="danger"] {{
+    color: {p['danger_border']};
+    font-weight: {W_SEMIBOLD};
+}}
+QWidget[surface="sunken"] {{
+    background-color: {p['bg_1']};
+    border-radius: {RADIUS_CONTROL}px;
+}}
+QLabel[status="notice"] {{
+    color: {p['txt_subtle']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
+    border-radius: {RADIUS_CONTROL}px;
+    padding: {SPACE_SM}px {SPACE_MD}px;
+}}
+
 /* ------------------------------------------------------------- shell ------ */
 #leftSidebar {{
-    background-color: {SURFACE_SIDEBAR};
-    border-right: 1px solid {TOKENS['border']};
+    background-color: {p['sidebar']};
+    border-right: 1px solid {p['border']};
 }}
 #mainContentSurface {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 {SURFACE_SIDEBAR}, stop:1 {SURFACE_GRADIENT_END});
+        stop:0 {p['sidebar']}, stop:1 {p['gradient_end']});
 }}
 #mainContentStack {{
     background: transparent;
@@ -193,7 +263,7 @@ QToolTip {{
     background: transparent;
 }}
 #sidebarGroupLabel {{
-    color: {TXT_SIDEBAR_GROUP};
+    color: {p['txt_sidebar_group']};
     font-size: {FS_MICRO}px;
     font-weight: {W_BOLD};
     letter-spacing: 0.08em;
@@ -206,33 +276,33 @@ QToolTip {{
     background: transparent;
 }}
 #sidebarSectionLabel {{
-    color: {TXT_SIDEBAR_GROUP};
+    color: {p['txt_sidebar_group']};
     font-size: 10px;
     font-weight: {W_BOLD};
     letter-spacing: 0.14em;
     background: transparent;
 }}
 #sidebarSectionRule {{
-    background-color: {SIDEBAR_RULE};
+    background-color: {p['sidebar_rule']};
     border: none;
 }}
 #sidebarDivider {{
-    background-color: {SIDEBAR_DIVIDER};
+    background-color: {p['sidebar_divider']};
     border: none;
 }}
 #sidebarFooterText {{
-    color: {TXT_SIDEBAR_GROUP};
+    color: {p['txt_sidebar_group']};
     font-size: {FS_MICRO}px;
     font-weight: {W_MEDIUM};
     background: transparent;
 }}
 #sidebarStatusDot {{
-    color: {DISABLED_FG};
+    color: {p['disabled_fg']};
     font-size: {FS_BODY}px;
     background: transparent;
 }}
 #sidebarStatusDot[state="connected"] {{
-    color: {TOKENS['accent_ok']};
+    color: {p['accent_ok']};
 }}
 
 /* Sidebar navigation: flat by default, cyan left rail when active. */
@@ -247,62 +317,62 @@ QToolTip {{
     text-align: left;
     font-size: {FS_BODY}px;
     font-weight: {W_MEDIUM};
-    color: {TOKENS['txt_1']};
+    color: {p['txt_1']};
     /* ~40px rows. The previous 34px min-height plus 8px padding produced 54px items,
        which spread nine entries over the full column height. */
     min-height: 32px;
 }}
 #sidebarNavButton:hover {{
-    background-color: {TOKENS['bg_1']};
-    color: {TOKENS['txt_0']};
-    border-left-color: {TOKENS['border']};
+    background-color: {p['bg_1']};
+    color: {p['txt_0']};
+    border-left-color: {p['border']};
 }}
 #sidebarNavButton:pressed {{
-    background-color: {TOKENS['bg_2']};
+    background-color: {p['bg_2']};
 }}
 #sidebarNavButton[active="true"] {{
-    background-color: {STATUS_ACCENT[0]};
-    color: {STATUS_ACCENT[2]};
-    border-left: 3px solid {TOKENS['accent']};
+    background-color: {p['chip_accent_bg']};
+    color: {p['chip_accent_fg']};
+    border-left: 3px solid {p['accent']};
     font-weight: {W_SEMIBOLD};
 }}
 #sidebarNavButton:focus {{
-    border-color: {TOKENS['accent']};
+    border-color: {p['accent']};
 }}
 
 /* -------------------------------------------------------- page header ----- */
 #topHeaderCard {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 {SURFACE_HEADER_A}, stop:1 {SURFACE_HEADER_B});
-    border: 1px solid {TOKENS['border']};
+        stop:0 {p['header_a']}, stop:1 {p['header_b']});
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_PANEL}px;
 }}
 #pageTitle {{
     font-size: {FS_TITLE}px;
     font-weight: {W_BOLD};
-    color: {TXT_TITLE};
+    color: {p['txt_title']};
     letter-spacing: -0.01em;
 }}
 #pageSubtitle {{
     font-size: {FS_SECONDARY}px;
     font-weight: {W_REGULAR};
-    color: {TXT_MUTED};
+    color: {p['txt_muted']};
 }}
 #sectionHeaderCard {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 {SURFACE_SECTION_A}, stop:1 {SURFACE_SECTION_B});
-    border: 1px solid {BORDER_SECTION};
+        stop:0 {p['section_a']}, stop:1 {p['section_b']});
+    border: 1px solid {p['border_section']};
     border-radius: {RADIUS_PANEL}px;
 }}
 #sectionHeaderTitle {{
     font-size: {FS_SECTION}px;
     font-weight: {W_BOLD};
-    color: {TXT_TITLE};
+    color: {p['txt_title']};
     letter-spacing: -0.01em;
 }}
 #sectionHeaderSubtitle {{
     font-size: {FS_SECONDARY}px;
-    color: {TXT_SUBTLE};
+    color: {p['txt_subtle']};
 }}
 
 /* ------------------------------------------------------------- chips ------ */
@@ -315,77 +385,77 @@ QToolTip {{
     letter-spacing: 0.04em;
     min-height: 18px;
 }}
-{_chip("headerChipOk", STATUS_OK)}
-{_chip("headerChipWarn", STATUS_WARN)}
-{_chip("headerChipNeutral", STATUS_NEUTRAL)}
-{_chip("headerChipAccent", STATUS_ACCENT)}
-{_chip("headerChipDanger", STATUS_DANGER)}
+{_chip('headerChipOk', p['ok_bg'], p['ok_border'], p['ok_fg'])}
+{_chip('headerChipWarn', p['warn_bg'], p['warn_border'], p['warn_fg'])}
+{_chip('headerChipNeutral', p['neutral_bg'], p['neutral_border'], p['neutral_fg'])}
+{_chip('headerChipAccent', p['chip_accent_bg'], p['chip_accent_border'], p['chip_accent_fg'])}
+{_chip('headerChipDanger', p['danger_bg'], p['danger_border'], p['danger_fg'])}
 
 /* Inline status banners share the chip palette at card scale. */
 #connectionBanner, #statusBannerDanger {{
-    background-color: {STATUS_DANGER[0]};
-    border: 1px solid {STATUS_DANGER[1]};
-    color: {STATUS_DANGER[2]};
+    background-color: {p['danger_bg']};
+    border: 1px solid {p['danger_border']};
+    color: {p['danger_fg']};
     border-radius: {RADIUS_CARD}px;
     padding: {SPACE_MD}px;
     font-size: {FS_SECONDARY}px;
 }}
 #statusBannerOk {{
-    background-color: {STATUS_OK[0]};
-    border: 1px solid {STATUS_OK[1]};
-    color: {STATUS_OK[2]};
+    background-color: {p['ok_bg']};
+    border: 1px solid {p['ok_border']};
+    color: {p['ok_fg']};
     border-radius: {RADIUS_CARD}px;
     padding: {SPACE_MD}px;
     font-size: {FS_SECONDARY}px;
 }}
 #statusBannerInfo, #infoNote {{
-    background-color: {STATUS_ACCENT[0]};
-    border: 1px solid {TOKENS['border']};
-    color: {STATUS_ACCENT[2]};
+    background-color: {p['chip_accent_bg']};
+    border: 1px solid {p['border']};
+    color: {p['chip_accent_fg']};
     border-radius: {RADIUS_CARD}px;
     padding: {SPACE_MD}px;
     font-size: {FS_SECONDARY}px;
 }}
 #helperText {{
-    color: {TXT_SUBTLE};
+    color: {p['txt_subtle']};
     font-size: {FS_SECONDARY}px;
 }}
 #mutedText {{
-    color: {TXT_MUTED};
+    color: {p['txt_muted']};
     font-size: {FS_SECONDARY}px;
 }}
 
 /* --------------------------------------------------------- dashboard ------ */
 #dashboardHeroCard {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 {SURFACE_HERO_A}, stop:1 {SURFACE_HERO_B});
-    border: 1px solid {BORDER_SOFT};
+        stop:0 {p['hero_a']}, stop:1 {p['hero_b']});
+    border: 1px solid {p['border_soft']};
     border-radius: {RADIUS_PANEL}px;
 }}
 #dashboardHeroTitle {{
     font-size: {FS_DISPLAY}px;
     font-weight: {W_HEAVY};
-    color: {TXT_TITLE};
+    color: {p['txt_title']};
     letter-spacing: -0.02em;
 }}
 #dashboardHeroSubtitle {{
     font-size: {FS_BODY}px;
-    color: {TXT_HERO};
+    color: {p['txt_hero']};
 }}
 #dashboardMetricCard {{
     background-color: rgba(17, 26, 40, 0.55);
-    border: 1px solid {BORDER_SOFT};
+    border: 1px solid {p['border_soft']};
     border-radius: {RADIUS_CARD}px;
 }}
 #metricCaption {{
-    color: {TXT_MUTED};
+    color: {p['txt_muted']};
     font-size: {FS_MICRO}px;
     font-weight: {W_SEMIBOLD};
     letter-spacing: 0.08em;
     text-transform: uppercase;
 }}
 #metricValue {{
-    color: {TXT_TITLE};
+    color: {p['txt_title']};
     font-size: {FS_TITLE}px;
     font-weight: {W_BOLD};
     letter-spacing: -0.01em;
@@ -394,116 +464,116 @@ QToolTip {{
 /* ----------------------------------------------------------- buttons ------ */
 /* No margin here: spacing belongs to the layout, not the widget. */
 QPushButton {{
-    background-color: {TOKENS['bg_2']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_2']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CONTROL}px;
     padding: {SPACE_SM}px {SPACE_LG}px;
     min-height: {CONTROL_HEIGHT - 18}px;
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     font-size: {FS_BODY}px;
     font-weight: {W_MEDIUM};
 }}
 QPushButton:hover {{
-    background-color: {TOKENS['bg_3']};
-    border-color: {BORDER_SCROLL_HANDLE};
+    background-color: {p['bg_3']};
+    border-color: {p['border_scroll_handle']};
 }}
 QPushButton:pressed {{
-    background-color: {TOKENS['bg_1']};
-    border-color: {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border-color: {p['border']};
 }}
 QPushButton:focus {{
-    border: 1px solid {TOKENS['accent']};
+    border: 1px solid {p['accent']};
 }}
 QPushButton:disabled {{
-    background-color: {DISABLED_BG};
-    border-color: {DISABLED_BORDER};
-    color: {DISABLED_FG};
+    background-color: {p['disabled_bg']};
+    border-color: {p['disabled_border']};
+    color: {p['disabled_fg']};
 }}
 QPushButton:checked {{
-    background-color: {STATUS_ACCENT[0]};
-    border-color: {TOKENS['accent']};
-    color: {STATUS_ACCENT[2]};
+    background-color: {p['chip_accent_bg']};
+    border-color: {p['accent']};
+    color: {p['chip_accent_fg']};
 }}
 /* Primary action: the only filled cyan control on a page. */
 QPushButton[variant="primary"] {{
-    background-color: {TOKENS['accent']};
-    border: 1px solid {TOKENS['accent']};
-    color: {TOKENS['bg_0']};
+    background-color: {p['accent']};
+    border: 1px solid {p['accent']};
+    color: {p['on_accent']};
     font-weight: {W_SEMIBOLD};
 }}
 QPushButton[variant="primary"]:hover {{
-    background-color: #57c7ff;
-    border-color: #57c7ff;
+    background-color: {p['accent_hover']};
+    border-color: {p['accent_hover']};
 }}
 QPushButton[variant="primary"]:pressed {{
-    background-color: #1a9fe0;
-    border-color: #1a9fe0;
+    background-color: {p['accent_pressed']};
+    border-color: {p['accent_pressed']};
 }}
 QPushButton[variant="primary"]:disabled {{
-    background-color: {DISABLED_BG};
-    border-color: {DISABLED_BORDER};
-    color: {DISABLED_FG};
+    background-color: {p['disabled_bg']};
+    border-color: {p['disabled_border']};
+    color: {p['disabled_fg']};
 }}
 QPushButton[variant="danger"] {{
-    background-color: {STATUS_DANGER[0]};
-    border: 1px solid {STATUS_DANGER[1]};
-    color: {STATUS_DANGER[2]};
+    background-color: {p['danger_bg']};
+    border: 1px solid {p['danger_border']};
+    color: {p['danger_fg']};
 }}
 QPushButton[variant="danger"]:hover {{
-    background-color: #4a262c;
+    background-color: {p['danger_hover']};
 }}
 QPushButton[variant="success"] {{
-    background-color: {STATUS_OK[0]};
-    border: 1px solid {STATUS_OK[1]};
-    color: {STATUS_OK[2]};
+    background-color: {p['ok_bg']};
+    border: 1px solid {p['ok_border']};
+    color: {p['ok_fg']};
 }}
 QPushButton[variant="success"]:hover {{
-    background-color: #26482f;
+    background-color: {p['success_hover']};
 }}
 QPushButton[variant="ghost"] {{
     background: transparent;
     border: 1px solid transparent;
-    color: {TOKENS['txt_1']};
+    color: {p['txt_1']};
 }}
 QPushButton[variant="ghost"]:hover {{
-    background-color: {TOKENS['bg_1']};
-    color: {TOKENS['txt_0']};
+    background-color: {p['bg_1']};
+    color: {p['txt_0']};
 }}
 
 /* ------------------------------------------------------------ inputs ------ */
 QLineEdit, QTextEdit, QPlainTextEdit, QDateTimeEdit,
 QSpinBox, QDoubleSpinBox, QComboBox {{
-    background-color: {TOKENS['bg_1']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CONTROL}px;
     padding: {SPACE_SM}px {SPACE_MD}px;
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     font-size: {FS_BODY}px;
-    selection-background-color: {TOKENS['bg_3']};
-    selection-color: {TOKENS['txt_0']};
+    selection-background-color: {p['bg_3']};
+    selection-color: {p['txt_0']};
 }}
 QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QDateTimeEdit:hover,
 QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
-    border-color: {BORDER_SCROLL_HANDLE};
+    border-color: {p['border_scroll_handle']};
 }}
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QDateTimeEdit:focus,
 QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
-    border: 1px solid {TOKENS['accent']};
-    background-color: {TOKENS['bg_0']};
+    border: 1px solid {p['accent']};
+    background-color: {p['bg_0']};
 }}
 QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled,
 QDateTimeEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
 QComboBox:disabled {{
-    background-color: {DISABLED_BG};
-    border-color: {DISABLED_BORDER};
-    color: {DISABLED_FG};
+    background-color: {p['disabled_bg']};
+    border-color: {p['disabled_border']};
+    color: {p['disabled_fg']};
 }}
 QLineEdit:read-only {{
-    background-color: {TOKENS['bg_0']};
-    color: {TOKENS['txt_1']};
+    background-color: {p['bg_0']};
+    color: {p['txt_1']};
 }}
 QLineEdit[hasError="true"] {{
-    border: 1px solid {STATUS_DANGER[1]};
+    border: 1px solid {p['danger_border']};
 }}
 QTextEdit, QPlainTextEdit {{
     padding: {SPACE_SM}px;
@@ -517,13 +587,13 @@ QComboBox::drop-down {{
     background: transparent;
 }}
 QComboBox QAbstractItemView {{
-    background-color: {TOKENS['bg_1']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CONTROL}px;
     padding: {SPACE_XS}px;
     outline: none;
-    selection-background-color: {TOKENS['bg_3']};
-    selection-color: {TOKENS['txt_0']};
+    selection-background-color: {p['bg_3']};
+    selection-color: {p['txt_0']};
 }}
 QComboBox QAbstractItemView::item {{
     padding: {SPACE_SM}px {SPACE_MD}px;
@@ -542,7 +612,7 @@ QDateTimeEdit::up-button, QDateTimeEdit::down-button {{
 /* --------------------------------------------- checkboxes / radios -------- */
 QCheckBox, QRadioButton {{
     spacing: {SPACE_SM}px;
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     font-size: {FS_BODY}px;
     padding: {SPACE_XS}px 0;
     background: transparent;
@@ -550,8 +620,8 @@ QCheckBox, QRadioButton {{
 QCheckBox::indicator, QRadioButton::indicator {{
     width: 16px;
     height: 16px;
-    background-color: {TOKENS['bg_1']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
 }}
 QCheckBox::indicator {{
     border-radius: {RADIUS_CONTROL - 2}px;
@@ -560,35 +630,35 @@ QRadioButton::indicator {{
     border-radius: 9px;
 }}
 QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
-    border-color: {TOKENS['accent']};
+    border-color: {p['accent']};
 }}
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
-    background-color: {TOKENS['accent']};
-    border-color: {TOKENS['accent']};
+    background-color: {p['accent']};
+    border-color: {p['accent']};
 }}
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
-    background-color: {DISABLED_BG};
-    border-color: {DISABLED_BORDER};
+    background-color: {p['disabled_bg']};
+    border-color: {p['disabled_border']};
 }}
 QCheckBox:disabled, QRadioButton:disabled {{
-    color: {DISABLED_FG};
+    color: {p['disabled_fg']};
 }}
 /* A checkbox that leads a settings section reads as a heading. */
 #groupLeadCheckbox {{
     font-size: {FS_BODY}px;
     font-weight: {W_SEMIBOLD};
-    color: {STATUS_ACCENT[2]};
+    color: {p['chip_accent_fg']};
     padding: {SPACE_XS}px 0 {SPACE_SM}px 0;
 }}
 
 /* Connection identity line: neutral when offline, green when connected. */
 #connectionIdentity {{
-    color: {TOKENS['txt_1']};
+    color: {p['txt_1']};
     font-size: {FS_SECONDARY}px;
     padding: {SPACE_SM}px;
 }}
 #connectionIdentity[state="connected"] {{
-    color: {STATUS_OK[2]};
+    color: {p['ok_fg']};
     font-weight: {W_SEMIBOLD};
 }}
 
@@ -597,8 +667,8 @@ QCheckBox:disabled, QRadioButton:disabled {{
    rather than in a notch cut out of the top border, which is the single thing that
    made the whole app read as a 2005 settings dialog. */
 QGroupBox {{
-    background-color: {SURFACE_CARD};
-    border: 1px solid {BORDER_SOFT};
+    background-color: {p['card']};
+    border: 1px solid {p['border_soft']};
     border-radius: {RADIUS_CARD}px;
     margin-top: 0px;
     padding: {SPACE_XL + SPACE_SM}px {GROUP_MARGIN}px {GROUP_MARGIN}px {GROUP_MARGIN}px;
@@ -612,27 +682,27 @@ QGroupBox::title {{
     padding: 0;
     background: transparent;
     border: none;
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     font-size: {FS_SECTION - 1}px;
     font-weight: {W_SEMIBOLD};
     letter-spacing: -0.01em;
 }}
 
 QFrame[frameShape="4"], QFrame[frameShape="5"] {{
-    background-color: {TOKENS['border']};
+    background-color: {p['border']};
     border: none;
     max-height: 1px;
 }}
 
 /* ----------------------------------------------- lists, trees, tables ----- */
 QListWidget, QTreeWidget, QTableWidget, QTableView {{
-    background-color: {TOKENS['bg_1']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CARD}px;
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     outline: none;
-    gridline-color: {TOKENS['bg_2']};
-    alternate-background-color: {TOKENS['bg_0']};
+    gridline-color: {p['bg_2']};
+    alternate-background-color: {p['bg_0']};
     font-size: {FS_BODY}px;
 }}
 QListWidget::item, QTreeWidget::item {{
@@ -644,12 +714,12 @@ QTableWidget::item, QTableView::item {{
     padding: {SPACE_XS}px {SPACE_SM}px;
 }}
 QListWidget::item:hover, QTreeWidget::item:hover {{
-    background-color: {TOKENS['bg_2']};
+    background-color: {p['bg_2']};
 }}
 QListWidget::item:selected, QTreeWidget::item:selected,
 QTableWidget::item:selected, QTableView::item:selected {{
-    background-color: {TOKENS['bg_3']};
-    color: {TOKENS['txt_0']};
+    background-color: {p['bg_3']};
+    color: {p['txt_0']};
 }}
 
 /* Item-view check indicators. Styling QCheckBox::indicator above makes Qt hand all
@@ -660,22 +730,22 @@ QListWidget::indicator, QTreeWidget::indicator, QTableWidget::indicator {{
     width: 16px;
     height: 16px;
     border-radius: {RADIUS_CONTROL - 2}px;
-    background-color: {TOKENS['bg_1']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
 }}
 QListWidget::indicator:hover, QTreeWidget::indicator:hover,
 QTableWidget::indicator:hover {{
-    border-color: {TOKENS['accent']};
+    border-color: {p['accent']};
 }}
 QListWidget::indicator:checked, QTreeWidget::indicator:checked,
 QTableWidget::indicator:checked {{
-    background-color: {TOKENS['accent']};
-    border-color: {TOKENS['accent']};
+    background-color: {p['accent']};
+    border-color: {p['accent']};
 }}
 QListWidget::indicator:disabled, QTreeWidget::indicator:disabled,
 QTableWidget::indicator:disabled {{
-    background-color: {DISABLED_BG};
-    border-color: {DISABLED_BORDER};
+    background-color: {p['disabled_bg']};
+    border-color: {p['disabled_border']};
 }}
 
 /* -------------------------------------------------- playlist cover wall ----- */
@@ -684,8 +754,8 @@ QTableWidget::indicator:disabled {{
    whole card, so the generic ::item background and padding above have to be
    neutralised or Qt would draw a second highlight behind every cover. */
 QListWidget#playlistGrid {{
-    background-color: {TOKENS['bg_0']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_0']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_PANEL}px;
 }}
 QListWidget#playlistGrid[viewMode="grid"] {{
@@ -702,7 +772,7 @@ QListWidget#playlistGrid[viewMode="grid"]::item:selected {{
     background: transparent;
 }}
 QListWidget#playlistGrid[viewMode="list"] {{
-    background-color: {TOKENS['bg_1']};
+    background-color: {p['bg_1']};
     padding: {SPACE_XS}px;
 }}
 
@@ -730,63 +800,63 @@ QListWidget#playlistGrid[viewMode="list"] {{
     background: transparent;
 }}
 #syncColumns::handle:hover {{
-    background-color: {TOKENS['bg_2']};
+    background-color: {p['bg_2']};
     border-radius: {RADIUS_CONTROL - 2}px;
 }}
 QHeaderView {{
-    background-color: {TOKENS['bg_2']};
+    background-color: {p['bg_2']};
     border: none;
 }}
 QHeaderView::section {{
-    background-color: {TOKENS['bg_2']};
-    color: {TOKENS['txt_1']};
+    background-color: {p['bg_2']};
+    color: {p['txt_1']};
     font-size: {FS_MICRO}px;
     font-weight: {W_BOLD};
     letter-spacing: 0.06em;
     padding: {SPACE_SM}px {SPACE_MD}px;
     min-height: 22px;
     border: none;
-    border-right: 1px solid {TOKENS['border']};
-    border-bottom: 1px solid {TOKENS['border']};
+    border-right: 1px solid {p['border']};
+    border-bottom: 1px solid {p['border']};
 }}
 QHeaderView::section:hover {{
-    background-color: {TOKENS['bg_3']};
-    color: {TOKENS['txt_0']};
+    background-color: {p['bg_3']};
+    color: {p['txt_0']};
 }}
 QTableCornerButton::section {{
-    background-color: {TOKENS['bg_2']};
+    background-color: {p['bg_2']};
     border: none;
-    border-bottom: 1px solid {TOKENS['border']};
+    border-bottom: 1px solid {p['border']};
 }}
 
 /* --------------------------------------------------------- progress ------- */
 QProgressBar {{
-    background-color: {TOKENS['bg_1']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CONTROL}px;
     text-align: center;
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     font-size: {FS_MICRO}px;
     font-weight: {W_SEMIBOLD};
     min-height: 18px;
 }}
 QProgressBar::chunk {{
-    background-color: {TOKENS['accent']};
+    background-color: {p['accent']};
     border-radius: {RADIUS_CONTROL - 1}px;
     margin: 1px;
 }}
 
 /* ------------------------------------------------------------- tabs ------- */
 QTabWidget::pane {{
-    border: 1px solid {TOKENS['border']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CARD}px;
-    background-color: {TOKENS['bg_1']};
+    background-color: {p['bg_1']};
     top: -1px;
     padding: {SPACE_XS}px;
 }}
 QTabBar::tab {{
     background-color: transparent;
-    color: {TOKENS['txt_1']};
+    color: {p['txt_1']};
     padding: {SPACE_SM}px {SPACE_LG}px;
     margin-right: {SPACE_XS}px;
     border: 1px solid transparent;
@@ -798,47 +868,47 @@ QTabBar::tab {{
     min-width: 80px;
 }}
 QTabBar::tab:hover:!selected {{
-    background-color: {TOKENS['bg_1']};
-    color: {TOKENS['txt_0']};
+    background-color: {p['bg_1']};
+    color: {p['txt_0']};
 }}
 QTabBar::tab:selected {{
-    background-color: {TOKENS['bg_1']};
-    color: {TOKENS['txt_0']};
-    border-color: {TOKENS['border']};
-    border-bottom: 2px solid {TOKENS['accent']};
+    background-color: {p['bg_1']};
+    color: {p['txt_0']};
+    border-color: {p['border']};
+    border-bottom: 2px solid {p['accent']};
     font-weight: {W_SEMIBOLD};
 }}
 
 /* ------------------------------------------------------------- menus ------ */
 QMenu {{
-    background-color: {TOKENS['bg_1']};
-    border: 1px solid {TOKENS['border']};
+    background-color: {p['bg_1']};
+    border: 1px solid {p['border']};
     border-radius: {RADIUS_CARD}px;
     padding: {SPACE_XS}px;
 }}
 QMenu::item {{
     padding: {SPACE_SM}px {SPACE_LG}px;
     border-radius: {RADIUS_CONTROL - 2}px;
-    color: {TOKENS['txt_0']};
+    color: {p['txt_0']};
     min-height: 22px;
 }}
 QMenu::item:selected {{
-    background-color: {TOKENS['bg_3']};
+    background-color: {p['bg_3']};
 }}
 QMenu::item:disabled {{
-    color: {DISABLED_FG};
+    color: {p['disabled_fg']};
 }}
 QMenu::separator {{
     height: 1px;
-    background: {TOKENS['border']};
+    background: {p['border']};
     margin: {SPACE_XS}px {SPACE_SM}px;
 }}
 
 /* --------------------------------------------------------- statusbar ------ */
 QStatusBar {{
-    background-color: {TOKENS['bg_0']};
-    border-top: 1px solid {TOKENS['border']};
-    color: {TOKENS['txt_1']};
+    background-color: {p['bg_0']};
+    border-top: 1px solid {p['border']};
+    color: {p['txt_1']};
     font-size: {FS_SECONDARY}px;
     padding: 0 {SPACE_MD}px;
     min-height: 26px;
@@ -849,7 +919,7 @@ QStatusBar::item {{
 
 /* ------------------------------------------------------------ splitter ---- */
 QSplitter::handle {{
-    background-color: {TOKENS['border']};
+    background-color: {p['border']};
 }}
 QSplitter::handle:horizontal {{
     width: 1px;
@@ -860,23 +930,23 @@ QSplitter::handle:vertical {{
 
 /* ------------------------------------------------------------ scrollbars -- */
 QScrollBar:vertical {{
-    background: {SURFACE_GRADIENT_END};
+    background: {p['gradient_end']};
     width: 12px;
     margin: 2px;
-    border: 1px solid {BORDER_SCROLL};
+    border: 1px solid {p['border_scroll']};
     border-radius: {RADIUS_CONTROL}px;
 }}
 QScrollBar::handle:vertical {{
-    background: {SCROLL_HANDLE};
+    background: {p['scroll_handle']};
     min-height: 28px;
-    border: 1px solid {BORDER_SCROLL_HANDLE};
+    border: 1px solid {p['border_scroll_handle']};
     border-radius: {RADIUS_CONTROL}px;
 }}
 QScrollBar::handle:vertical:hover {{
-    background: {SCROLL_HANDLE_HOVER};
+    background: {p['scroll_handle_hover']};
 }}
 QScrollBar::handle:vertical:pressed {{
-    background: {SCROLL_HANDLE_ACTIVE};
+    background: {p['scroll_handle_active']};
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
@@ -887,23 +957,23 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
     background: transparent;
 }}
 QScrollBar:horizontal {{
-    background: {SURFACE_GRADIENT_END};
+    background: {p['gradient_end']};
     height: 12px;
     margin: 2px;
-    border: 1px solid {BORDER_SCROLL};
+    border: 1px solid {p['border_scroll']};
     border-radius: {RADIUS_CONTROL}px;
 }}
 QScrollBar::handle:horizontal {{
-    background: {SCROLL_HANDLE};
+    background: {p['scroll_handle']};
     min-width: 28px;
-    border: 1px solid {BORDER_SCROLL_HANDLE};
+    border: 1px solid {p['border_scroll_handle']};
     border-radius: {RADIUS_CONTROL}px;
 }}
 QScrollBar::handle:horizontal:hover {{
-    background: {SCROLL_HANDLE_HOVER};
+    background: {p['scroll_handle_hover']};
 }}
 QScrollBar::handle:horizontal:pressed {{
-    background: {SCROLL_HANDLE_ACTIVE};
+    background: {p['scroll_handle_active']};
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     width: 0px;
@@ -914,3 +984,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
     background: transparent;
 }}
 """
+
+
+MAIN_STYLESHEET = build_stylesheet()

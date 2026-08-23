@@ -18,6 +18,7 @@ APP_CONFIG_DEFAULTS = {
     "apple_music_import_ratings": True,
     "last_section": None,
     "playlist_view_mode": "grid",
+    "theme": "midnight",
     "auto_backup": True,
     "backup_interval": 24,
     "features": {

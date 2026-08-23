@@ -619,10 +619,18 @@ class PlaylistsPageTests(unittest.TestCase):
         self.window.set_playlist_view_mode("carousel")
         self.assertEqual(self.window.playlist_view_mode, "grid")
 
-    def test_the_mode_is_remembered_in_config(self):
-        self.window.app_config = {}
-        self.window.set_playlist_view_mode("list")
-        self.assertEqual(self.window.app_config.get("playlist_view_mode"), "list")
+    def test_switching_the_mode_persists_it(self):
+        """Round-tripping through the config file is covered in test_themes.py.
+
+        This asserts the trigger: changing the mode must reach save_config(). It used
+        to write to a `self.app_config` dict that never existed, so nothing was saved.
+        """
+        from unittest import mock
+
+        with mock.patch.object(self.window, "save_config") as saved:
+            self.window.set_playlist_view_mode("list")
+        self.assertTrue(saved.called, "changing the view must persist it")
+        self.assertEqual(self.window.playlist_view_mode, "list")
 
     # -- filtering ----------------------------------------------------------
 
