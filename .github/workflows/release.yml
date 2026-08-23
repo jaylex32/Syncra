@@ -53,17 +53,17 @@ jobs:
     - name: Build executable (Windows)
       if: matrix.os == 'windows-latest'
       run: |
-        pyinstaller --onefile --windowed --name="Syncra" --icon="Syncra Icon.ico" --add-data "assets;assets" --add-data "Syncra Icon.ico;." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        pyinstaller --onefile --windowed --name="Syncra" --icon="Syncra Icon.ico" --add-data "assets;assets" --add-data "Syncra Icon.ico;." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=ytmusicapi --collect-data ytmusicapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (Linux)
       if: matrix.os == 'ubuntu-latest'
       run: |
-        xvfb-run -a pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --add-data "Syncra Icon.ico:." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        xvfb-run -a pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --add-data "Syncra Icon.ico:." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=ytmusicapi --collect-data ytmusicapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Build executable (macOS)
       if: contains(matrix.os, 'macos')
       run: |
-        pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --add-data "Syncra Icon.ico:." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
+        pyinstaller --onefile --windowed --name="Syncra" --add-data "assets:assets" --add-data "Syncra Icon.ico:." --hidden-import=pyotp --hidden-import=spotipy --hidden-import=deezer --hidden-import=fuzzywuzzy --hidden-import=plexapi --hidden-import=ytmusicapi --collect-data ytmusicapi --hidden-import=PyQt6.QtSvg --hidden-import=PyQt6.QtSvgWidgets main.py
 
     - name: Create archive (Windows)
       if: matrix.os == 'windows-latest'

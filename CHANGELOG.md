@@ -1,5 +1,71 @@
 # Changelog
 
+## v2.22.0 - 2026-08-23
+
+Five colour themes including a light one, YouTube playlist import, sharing playlists
+with the other accounts on your server, exporting a playlist as real audio files, and
+a fix for an import that renamed users' own files.
+
+### 🎨 Colour Themes
+- **Added five colour themes**, chosen in Settings and applied instantly without a restart: **Midnight** (the original navy and cyan), **Carbon** (near-black, for OLED screens and dark rooms), **Slate** (neutral grey with a teal accent), **Aurora** (deep indigo with magenta), and **Daylight** (a proper light theme). The choice is remembered between launches.
+- Every colour now comes from a named palette describing the *role* it plays -- "the surface inputs sit on", not "dark navy" -- which is what lets the light theme invert cleanly.
+- **Roughly 330 hardcoded colours were removed**, including 199 CSS declarations buried in inline `setStyleSheet` calls in the main module. Each was a spot that would have kept its old colour forever; labels that used to carry an inline colour now use a semantic `status` property instead, so their colour follows the theme and updates live.
+- **Fixed: a light theme showed black panels behind styled content.** The stylesheet only covers what Syncra styles by name; anything Qt paints itself -- scroll-area viewports, message boxes, native dialogs -- reads the QPalette, which was still the dark default. The palette is now built from the theme too.
+- Generated playlist tiles, the cover grid's cards, checkboxes and hover washes are all painted from the live palette rather than fixed values.
+- Midnight renders byte-identical to the previous stylesheet, so the default look is unchanged.
+- Streaming-service badges deliberately keep their brand colours in every theme; a local file or unknown source gets a neutral chip that follows the palette.
+- A regression guard in the test suite fails if a raw hex colour reappears in UI code, since that is exactly how a theme develops holes.
+
+### 🎵 Exported MP3s Now Carry Their Metadata
+- **Fixed: exporting to MP3 produced files with no tags and no artwork.** Plex's transcoder returns a bare stream — the only frame it set was `TSSE`, naming the encoder — so every converted track arrived with no title, artist, album, track number or cover. Exports to *original* format were unaffected, since those are a byte copy of the source file.
+- Exported MP3s are now tagged with title, artist, album, album artist, track and disc number, genre, release year, and embedded front cover art.
+- Tags are written as **ID3v2.3**, which is what older car head units and cheap players read; v2.4 is frequently ignored by them.
+- Album art and release year are fetched **once per album** and reused across its tracks, so a 12-track album costs one artwork download rather than twelve.
+
+### 🖼️ Custom Playlist Covers
+- **Fixed: the playlist wall showed the auto-generated composite even when a playlist had a custom cover.** The `playlists()` listing reports the 4-panel composite as the playlist's thumb regardless of what poster is actually selected, so a custom cover you uploaded never appeared. 25 of 60 playlists on the test server were affected.
+- The selected poster is now resolved per playlist in the background, on the same worker pool as the artwork. The composite still paints immediately, and a custom cover replaces it a moment later, so nothing feels slower.
+- The lookup is queued *before* the cached-composite fast path returns; queued after it, an already-cached composite meant the custom cover was never looked up at all.
+
+### 📁 More Export Folder Layouts
+- Export with audio files now offers seven layouts instead of two: one flat folder, Artist, Album, Artist/Album, Playlist, Playlist/Artist, and Playlist/Artist/Album.
+- The dialog shows the resulting path for the selected layout, so the choice is concrete before you start.
+- Track numbering follows the layout: inside an album folder the track's own number is used, otherwise its position in the playlist.
+- Playlist-prefixed layouts keep the `.m3u` at the destination root, so several playlists can be exported side by side onto one drive without colliding.
+
+### ▶️ YouTube Playlist Import
+- **Added importing public YouTube and YouTube Music playlists.** Paste a playlist link anywhere a Spotify/Deezer/Tidal link already works — Streaming Import, and as a Sync Manager source so it keeps syncing. No sign-in is needed for public playlists. Only metadata is read; nothing is downloaded from YouTube.
+- **Titles are cleaned before matching, carefully.** On a real 185-track playlist, 40% of titles carried upload furniture — "(Official Music Video)", "(Official 4K Video)", "[HD Remaster]", a trailing bare "HD". Feeding those to the matcher loses tracks the library actually has.
+  - Blanket bracket-stripping would be worse: the same playlist contains "(dub mix)", "(Rah Mix)", "(Naive Melody)", "(No Can Do)" and "(Are Made Of This)", which are part of the real song. A bracketed group is removed only when everything meaningful inside it is production noise.
+- **The uploader is not the artist.** On regular YouTube playlists the artist field is the channel that posted the video: "Prince - Purple Rain" came through credited to *"The Codfather"*, and "George Benson - Give Me The Night" to *"RHINO"*. Where the title itself carries an "Artist - Title" prefix, that prefix now wins, so those tracks are attributable. Dashes inside brackets are not treated as a split point, so "Danger Zone (Official Video - Top Gun)" stays intact.
+- Measured against a real library, 87% of a 40-track sample resolved on the first pass; the remainder are remix and "feat." variants that Smart Matching and Match Memory already exist to handle.
+- Album-style and private links fail with a readable explanation instead of an internal parse error.
+- Adds a dependency on `ytmusicapi`, bundled into the packaged builds.
+
+### 👥 Share Playlists With Your Household
+- **Added sharing a playlist with the other accounts on your server.** Plex playlists belong to the account that created them, and Plex itself offers no way to hand one to another user — so on a server with a family, every playlist the admin builds is invisible to everyone else. Right-click a playlist and pick who should get their own copy.
+- Choose what happens if they already have a playlist by that name: leave theirs alone, add only the tracks they are missing, or replace it (confirmed separately, since that deletes something belonging to someone else).
+- Each account is handled independently and reported on its own row, so one person failing never hides what happened to the others.
+- One request per user rather than one per track: playlist creation only needs rating keys, so sharing a 138-track playlist with seven people is seven writes, not a thousand lookups.
+
+### 💾 Export Playlists With Their Audio
+- **Added exporting a playlist as actual audio files**, not just an `.m3u`. The existing export writes server-side paths like `\\Desktop-u78huhb\f\Music Masters\...`, which mean nothing on a USB stick — nothing plays. This copies the audio into a folder alongside a playlist with relative paths, so it works in a car, on a phone, or in any player pointed at the folder.
+- **Your Plex server does the converting**, so nothing needs installing locally. A 24-track FLAC playlist is 771 MB; at MP3 192 kbps it is about 146 MB. Originals, 320, 192 and 128 kbps are all offered, with the saving shown before you start.
+- Flat numbered folder or Artist/Album subfolders, plus a size limit for the target device (1 GB up to 32 GB).
+- Filenames are sanitised for FAT32/exFAT, which is what USB sticks and SD cards actually use — `AC/DC` and `What?` are ordinary music metadata and illegal filenames. Trailing dots and spaces are stripped too, since Windows drops them silently and would otherwise collapse two tracks into one file.
+- Name collisions are resolved while planning rather than at write time, so two tracks with the same name cannot quietly overwrite each other.
+- Cancelling keeps what was already written and still writes a playlist for it.
+
+### 🖼️ Branding
+- New application icon.
+
+### 🐛 Fixes
+- **Fixed: importing a `.m3u8` renamed the user's own file.** Before uploading, the importer ran `os.rename()` on the source playlist to change its extension to `.m3u` — permanently altering a file the app had only been asked to read. Importing a folder did it to every `.m3u8` in it. Originals are now left untouched; the upload works from a temporary copy instead.
+  - The rename was never needed. The direct upload posts the playlist under a filename it builds itself (`<playlist name>.m3u`), so the name on disk never reached Plex. The extension only mattered to the local-server path fallback, which is now handed the temp copy.
+  - Only affected imports with **Path Matching** selected; the Smart Matching path returned before the rename.
+  - Applies to every import route — single file, whole folder, backup restore, and playlists built from selected local tracks — since all of them go through the same upload function.
+- Temp upload copies are now always written with a `.m3u` extension, and the temp-folder cleanup prunes stale `.m3u8` copies left by earlier versions instead of ignoring them.
+
 ## v2.21.0 - 2026-08-09
 
 A cover-art overhaul of the Playlists and Sync Manager pages, playlist renaming, Sonic

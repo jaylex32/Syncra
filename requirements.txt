@@ -8,3 +8,4 @@ pyotp>=2.8.0
 deezer-python>=5.8.0
 Pillow>=9.0.0
 mutagen>=1.47.0
+ytmusicapi>=1.10.0

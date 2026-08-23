@@ -1,4 +1,7 @@
-# Syncra - Plex Playlist Manager
+<h1>
+  <img src="assets/logo.png" alt="Syncra" width="40" align="top">
+  Syncra - Plex Playlist Manager
+</h1>
 
 🎵 **Advanced playlist management for Plex Media Server with streaming service integration**
 
@@ -18,10 +21,11 @@
 
 ## ✨ Features
 
+- 🎨 **Five colour themes** — Midnight, Carbon (OLED), Slate, Aurora and a light Daylight theme, switchable in Settings without a restart
 - 🖼️ **Cover-art playlist wall** — browse your playlists as posters with track counts and playing time, with a filter box and a compact list view when you want one. Rename any playlist with F2 or the right-click menu
 - 🔄 **Sync Manager** with cover art, per-service badges, and an at-a-glance summary of what is configured and when it last ran
 - 🎛️ **Advanced Playlist Editor** with search, filtering, and drag-and-drop reordering
-- 🔄 **Auto-Sync** from Spotify, Deezer, Tidal, and ListenBrainz playlists
+- 🔄 **Auto-Sync** from Spotify, Deezer, Tidal, YouTube, and ListenBrainz playlists
 - 🎧 **Sonic Discovery** — build playlists from Plex's own audio analysis: "More Like This" from any track, or a **Sonic Adventure** that plots the gradual path between two tracks. Entirely local, no external service
 - 🎯 **Missing Tracks workspace** - a running, deduplicated list of everything your imports couldn't find, with re-check and CSV export
 - 🧠 **Match Memory** - Syncra learns from your manual match corrections and stops asking twice
@@ -55,7 +59,7 @@ Get the latest version for your platform from the [Releases](https://github.com/
 1. **Connect to Plex**: Enter your server details in the Connection tab
 2. **Fetch Playlists**: Click "Fetch Playlists" to load your collection as a wall of cover art
 3. **Edit Playlists**: Double-click any cover to open the advanced editor; tick the box on a cover to include it in delete, export and sync actions
-4. **Sync from Streaming**: Paste Spotify/Deezer/Tidal/ListenBrainz URLs to auto-sync
+4. **Sync from Streaming**: Paste Spotify/Deezer/Tidal/YouTube/ListenBrainz URLs to auto-sync
 5. **Explore Tools**: Check out the Tools & Utilities for advanced features
 
 ## ⌨️ Headless Sync (CLI)
@@ -94,7 +98,7 @@ Arguments: --sync-all --log-file "%LOCALAPPDATA%\Syncra\sync.log"
 
 1. Go to **Sync Manager** tab
 2. Select a Plex playlist
-3. Enter a **Spotify/Deezer/Tidal URL**
+3. Enter a **Spotify/Deezer/Tidal/YouTube URL**
 4. Set **sync interval** (hourly, daily, etc.)
 5. **Enable auto-sync** and let Syncra keep your playlists updated!
 
@@ -116,6 +120,7 @@ Arguments: --sync-all --log-file "%LOCALAPPDATA%\Syncra\sync.log"
 - 🎵 **Spotify** (playlists, albums, tracks)
 - 🎶 **Deezer** (playlists, albums, tracks)  
 - 🎧 **Tidal** (playlists, albums, tracks)
+- ▶️ **YouTube / YouTube Music** (public playlists, no sign-in)
 - 🧠 **ListenBrainz** (import/export playlists)
 - 🍎 **Apple Music XML exports** (library/playlists snapshot import)
 - 📁 **M3U/M3U8 files** (local and remote)

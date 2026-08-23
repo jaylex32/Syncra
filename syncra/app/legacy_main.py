@@ -18,7 +18,7 @@ import socket
 import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.21.0"
+__version__ = "2.22.0"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -79,6 +79,12 @@ from syncra.theme.styles import (
     GROUP_SPACING,
     LABEL_COLUMN,
     MAIN_STYLESHEET,
+    TOKENS,
+    available_themes,
+    build_qpalette,
+    build_stylesheet,
+    current_theme,
+    set_theme,
     PAGE_MARGIN,
     PAGE_SPACING,
     SPACE_LG,
@@ -94,6 +100,7 @@ from syncra.services.match_memory import KIND_MISSING, MatchMemoryStore
 from syncra.services.missing_tracks import STATUS_MISSING, MissingTracksStore
 from syncra.services.sync_history import SyncHistoryStore, diff_snapshots, snapshot_tracks
 from syncra.services.sync_options import SyncOptions
+from syncra.services import youtube_music
 from syncra.services.track_identity import display_name, track_fingerprint
 from syncra.ui.dialogs.match_memory_dialog import MatchMemoryDialog
 from syncra.ui.dialogs.metadata_fixer_dialog import MetadataFixerDialog
@@ -103,6 +110,8 @@ from syncra.ui.dialogs.sonic_discovery_dialog import (
     MODE_SIMILAR,
     SonicDiscoveryDialog,
 )
+from syncra.ui.dialogs.export_files_dialog import ExportFilesDialog
+from syncra.ui.dialogs.share_playlist_dialog import SharePlaylistDialog
 from syncra.ui.dialogs.sync_history_dialog import SyncHistoryDialog
 from syncra.ui.widgets.flow_layout import FlowLayout
 from syncra.ui.widgets.playlist_grid import (
@@ -110,6 +119,7 @@ from syncra.ui.widgets.playlist_grid import (
     COVER_SIZE,
     COVER_STATE_ROLE,
     COVER_URL_ROLE,
+    POSTER_KEY_ROLE,
     SUBTITLE_ROLE,
     TITLE_ROLE,
     CoverFetcher,
@@ -125,6 +135,36 @@ from syncra.ui.widgets.playlist_grid import (
 )
 
 CONFIG_FILE = "app_config.json"
+
+def repolish(widget):
+    """Re-evaluate a widget's stylesheet after a dynamic property changed.
+
+    Qt only reads dynamic properties when it styles a widget, so a property set after
+    the widget is on screen has no effect until it is unpolished and polished again.
+    """
+    if widget is None:
+        return
+    try:
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+        widget.update()
+    except Exception:
+        pass
+
+
+def set_widget_status(widget, kind):
+    """Colour a label semantically (muted/info/ok/warn/danger/notice).
+
+    Replaces the inline colour stylesheets these labels used to carry, which froze a
+    colour at construction time and would survive a theme change.
+    """
+    if widget is None:
+        return
+    widget.setProperty("status", kind)
+    repolish(widget)
+
+
 # Keep startup connection attempts short. plexapi defaults to 30s, which makes an
 # unreachable/renamed server look like a frozen app during boot.
 PLEX_CONNECT_TIMEOUT = 10
@@ -144,17 +184,17 @@ patch_qt_legacy_apis()
 
 
 def get_syncra_logo_svg():
-    return """
+    return f"""
     <svg width="250" height="100" xmlns="http://www.w3.org/2000/svg">
         <defs>
             <linearGradient id="mainGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" style="stop-color:#00E676"/>
-                <stop offset="50%" style="stop-color:#00BCD4"/>
-                <stop offset="100%" style="stop-color:#2196F3"/>
+                <stop offset="0%" style="stop-color:{TOKENS['accent_ok']}"/>
+                <stop offset="50%" style="stop-color:{TOKENS['accent']}"/>
+                <stop offset="100%" style="stop-color:{TOKENS['accent']}"/>
             </linearGradient>
             <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" style="stop-color:#42A5F5"/>
-                <stop offset="100%" style="stop-color:#2196F3"/>
+                <stop offset="0%" style="stop-color:{TOKENS['accent']}"/>
+                <stop offset="100%" style="stop-color:{TOKENS['accent']}"/>
             </linearGradient>
         </defs>
         <g transform="translate(10, 20)">
@@ -182,39 +222,39 @@ class StartupSplashScreen(QWidget):
     def _build_ui(self):
         from PyQt6.QtCore import QByteArray
 
-        self.setStyleSheet("""
-            QWidget#startupSplash {
-                background-color: #0f1726;
-                border: 1px solid #243248;
+        self.setStyleSheet(f"""
+            QWidget#startupSplash {{
+                background-color: {TOKENS['bg_0']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 18px;
-            }
-            QLabel#startupTitle {
-                color: #f4f7fb;
+            }}
+            QLabel#startupTitle {{
+                color: {TOKENS['txt_0']};
                 font-size: 20px;
                 font-weight: 700;
-            }
-            QLabel#startupSubtitle {
-                color: #9ab0cc;
+            }}
+            QLabel#startupSubtitle {{
+                color: {TOKENS['txt_muted']};
                 font-size: 12px;
-            }
-            QLabel#startupStatus {
-                color: #dce7f5;
+            }}
+            QLabel#startupStatus {{
+                color: {TOKENS['txt_1']};
                 font-size: 13px;
                 font-weight: 600;
-            }
-            QProgressBar {
-                border: 1px solid #32455f;
+            }}
+            QProgressBar {{
+                border: 1px solid {TOKENS['bg_3']};
                 border-radius: 8px;
-                background: #111a29;
-                color: #f4f7fb;
+                background: {TOKENS['bg_0']};
+                color: {TOKENS['txt_0']};
                 text-align: center;
                 height: 18px;
-            }
-            QProgressBar::chunk {
+            }}
+            QProgressBar::chunk {{
                 border-radius: 7px;
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00c7a4, stop:0.55 #20b8d9, stop:1 #2d8cff);
-            }
+                    stop:0 {TOKENS['accent_ok']}, stop:0.55 {TOKENS['accent']}, stop:1 {TOKENS['accent']});
+            }}
         """)
 
         layout = QVBoxLayout(self)
@@ -2887,11 +2927,11 @@ class PortableBackupDialog(QDialog):
         layout = QVBoxLayout(self)
 
         header = QLabel("Portable Backup")
-        header.setStyleSheet("font-size: 20px; font-weight: 700; color: #f5f7fb;")
+        header.setStyleSheet(f"font-size: 20px; font-weight: 700; color: {TOKENS['txt_0']};")
         layout.addWidget(header)
 
         subtitle = QLabel("Back up playlist files and copy the actual audio files to a portable folder.")
-        subtitle.setStyleSheet("color: #a8b9cf;")
+        set_widget_status(subtitle, "muted")
         layout.addWidget(subtitle)
 
         scope_group = QGroupBox("Scope")
@@ -3684,7 +3724,7 @@ _EDITOR_ICON_PATHS = {
 }
 
 
-def _make_dots_icon(color="#7f92ad", size=18, dot=3, gap=5):
+def _make_dots_icon(color=f"{TOKENS['txt_muted']}", size=18, dot=3, gap=5):
     """Draw the overflow glyph directly rather than via SVG.
 
     Scaling a 24-unit viewBox down to 16px put the three circles on three different
@@ -3707,7 +3747,7 @@ def _make_dots_icon(color="#7f92ad", size=18, dot=3, gap=5):
     return QIcon(pixmap)
 
 
-def _make_editor_icon(name, color="#c9d1df", size=18):
+def _make_editor_icon(name, color=f"{TOKENS['txt_1']}", size=18):
     """Render one of the stroke icons above into a QIcon at the requested tint."""
     paths = _EDITOR_ICON_PATHS.get(name)
     if not paths:
@@ -3869,7 +3909,7 @@ class LoadingDialog(QDialog):
         
         self.detail_label = QLabel("")
         self.detail_label.setAlignment(Qt.AlignCenter)
-        self.detail_label.setStyleSheet("color: #888888; font-size: 12px;")
+        set_widget_status(self.detail_label, "muted")
         layout.addWidget(self.detail_label)
 
         button_row = QHBoxLayout()
@@ -4405,263 +4445,263 @@ class PlaylistEditorDialog(QDialog):
             QTimer.singleShot(0, self.start_background_loading)
 
     def _dialog_stylesheet(self):
-        return """
-            QDialog#playlistEditorDialog {
-                background-color: #0d1420;
-            }
-            QDialog#playlistEditorDialog QLabel#editorTitleLabel {
+        return f"""
+            QDialog#playlistEditorDialog {{
+                background-color: {TOKENS['bg_0']};
+            }}
+            QDialog#playlistEditorDialog QLabel#editorTitleLabel {{
                 font-weight: 700;
                 font-size: 19px;
-                color: #f2f6fc;
+                color: {TOKENS['txt_0']};
                 letter-spacing: -0.01em;
-            }
+            }}
             /* Track count reads as a pill beside the title, not a second sentence. */
-            QDialog#playlistEditorDialog QLabel#editorTrackCount {
-                background-color: #1f2f40;
-                border: 1px solid #2fb8ff;
+            QDialog#playlistEditorDialog QLabel#editorTrackCount {{
+                background-color: {TOKENS['chip_accent_bg']};
+                border: 1px solid {TOKENS['accent']};
                 border-radius: 999px;
-                color: #8ad8ff;
+                color: {TOKENS['chip_accent_fg']};
                 font-size: 11px;
                 font-weight: 700;
                 padding: 4px 12px;
-            }
+            }}
             QDialog#playlistEditorDialog QFrame#editorCoverCard,
-            QDialog#playlistEditorDialog QFrame#editorTracksCard {
-                background-color: #141d2c;
-                border: 1px solid #253449;
+            QDialog#playlistEditorDialog QFrame#editorTracksCard {{
+                background-color: {TOKENS['bg_1']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 14px;
-            }
-            QDialog#playlistEditorDialog QLabel#editorCoverPreview {
-                background-color: #0d1420;
-                border: 1px solid #253449;
+            }}
+            QDialog#playlistEditorDialog QLabel#editorCoverPreview {{
+                background-color: {TOKENS['bg_0']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 12px;
-                color: #7f92ad;
+                color: {TOKENS['txt_muted']};
                 font-size: 12px;
-            }
-            QDialog#playlistEditorDialog QLabel#editorCoverTitle {
-                color: #8fa1ba;
+            }}
+            QDialog#playlistEditorDialog QLabel#editorCoverTitle {{
+                color: {TOKENS['txt_muted']};
                 font-size: 10px;
                 font-weight: 700;
                 letter-spacing: 0.14em;
-            }
-            QDialog#playlistEditorDialog QLabel#editorCoverStatus {
-                color: #a8b9cf;
+            }}
+            QDialog#playlistEditorDialog QLabel#editorCoverStatus {{
+                color: {TOKENS['txt_muted']};
                 font-size: 12px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorFilterButton {
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorFilterButton {{
                 background: transparent;
                 border: none;
                 border-radius: 8px;
                 padding: 6px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorFilterButton:hover {
-                background-color: #1f2c3f;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorFilterButton:checked {
-                background-color: #1f2f40;
-            }
-            QDialog#playlistEditorDialog QLabel#editorLoadingLabel {
-                color: #b6c9e6;
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorFilterButton:hover {{
+                background-color: {TOKENS['bg_1']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorFilterButton:checked {{
+                background-color: {TOKENS['chip_accent_bg']};
+            }}
+            QDialog#playlistEditorDialog QLabel#editorLoadingLabel {{
+                color: {TOKENS['txt_subtle']};
                 font-size: 15px;
                 font-weight: 700;
                 padding: 6px 4px;
-            }
-            QDialog#playlistEditorDialog QLabel#editorLoadingSub {
-                color: #8ca3c6;
+            }}
+            QDialog#playlistEditorDialog QLabel#editorLoadingSub {{
+                color: {TOKENS['txt_muted']};
                 font-size: 12px;
                 padding: 0 4px 8px 4px;
-            }
-            QDialog#playlistEditorDialog QLabel#editorLoadingDetail {
-                color: #8ca3c6;
+            }}
+            QDialog#playlistEditorDialog QLabel#editorLoadingDetail {{
+                color: {TOKENS['txt_muted']};
                 font-size: 12px;
                 padding: 8px;
-            }
-            QDialog#playlistEditorDialog QFrame#editorLoadingCard {
-                background-color: #132136;
-                border: 1px solid #355078;
+            }}
+            QDialog#playlistEditorDialog QFrame#editorLoadingCard {{
+                background-color: {TOKENS['bg_1']};
+                border: 1px solid {TOKENS['border']};
                 border-radius: 12px;
-            }
-            QDialog#playlistEditorDialog QProgressBar#editorLoadingProgress {
-                background-color: #16243a;
-                border: 1px solid #355078;
+            }}
+            QDialog#playlistEditorDialog QProgressBar#editorLoadingProgress {{
+                background-color: {TOKENS['bg_1']};
+                border: 1px solid {TOKENS['border']};
                 border-radius: 8px;
                 text-align: center;
                 font-weight: 700;
-                color: #d7e8ff;
+                color: {TOKENS['txt_metric']};
                 min-height: 24px;
-            }
-            QDialog#playlistEditorDialog QProgressBar#editorLoadingProgress::chunk {
-                background-color: #2ed27a;
+            }}
+            QDialog#playlistEditorDialog QProgressBar#editorLoadingProgress::chunk {{
+                background-color: {TOKENS['accent_ok']};
                 border-radius: 7px;
-            }
+            }}
             /* Search is a single pill spanning the panel, magnifier inside it. */
-            QDialog#playlistEditorDialog QLineEdit#editorSearchInput {
-                background-color: #141d2c;
-                border: 1px solid #253449;
+            QDialog#playlistEditorDialog QLineEdit#editorSearchInput {{
+                background-color: {TOKENS['bg_1']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 10px;
                 padding: 10px 14px;
-                color: #f2f6fc;
+                color: {TOKENS['txt_0']};
                 font-size: 14px;
-            }
-            QDialog#playlistEditorDialog QLineEdit#editorSearchInput:focus {
-                border: 1px solid #2fb8ff;
-                background-color: #101827;
-            }
+            }}
+            QDialog#playlistEditorDialog QLineEdit#editorSearchInput:focus {{
+                border: 1px solid {TOKENS['accent']};
+                background-color: {TOKENS['bg_0']};
+            }}
             /* Table is flush inside its card: no border, no grid, hairline rows. */
-            QDialog#playlistEditorDialog QTableWidget#editorTracksTable {
+            QDialog#playlistEditorDialog QTableWidget#editorTracksTable {{
                 background-color: transparent;
-                color: #e6edf7;
+                color: {TOKENS['txt_0']};
                 gridline-color: transparent;
                 border: none;
                 outline: none;
                 font-size: 13px;
-            }
-            QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item {
+            }}
+            QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item {{
                 padding: 10px 12px;
-                border-bottom: 1px solid #1c2839;
-            }
-            QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item:selected {
-                background-color: #24344c;
-                color: #ffffff;
-            }
-            QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item:hover {
-                background-color: #18222f;
-            }
-            QDialog#playlistEditorDialog QHeaderView {
-                background-color: #101827;
+                border-bottom: 1px solid {TOKENS['bg_1']};
+            }}
+            QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item:selected {{
+                background-color: {TOKENS['bg_2']};
+                color: {TOKENS['txt_title']};
+            }}
+            QDialog#playlistEditorDialog QTableWidget#editorTracksTable::item:hover {{
+                background-color: {TOKENS['bg_1']};
+            }}
+            QDialog#playlistEditorDialog QHeaderView {{
+                background-color: {TOKENS['bg_0']};
                 border: none;
-            }
-            QDialog#playlistEditorDialog QHeaderView::section:horizontal {
-                background-color: #101827;
-                color: #8fa1ba;
+            }}
+            QDialog#playlistEditorDialog QHeaderView::section:horizontal {{
+                background-color: {TOKENS['bg_0']};
+                color: {TOKENS['txt_muted']};
                 border: none;
-                border-bottom: 1px solid #253449;
+                border-bottom: 1px solid {TOKENS['bg_2']};
                 padding: 10px 12px;
                 font-size: 12px;
                 font-weight: 600;
-            }
+            }}
             /* The vertical header is the '#' column from the mockup. Using it instead
                of a real column keeps every existing column index (0=Title..3=Duration)
                valid, and it renumbers itself automatically on reorder and delete. */
-            QDialog#playlistEditorDialog QHeaderView::section:vertical {
+            QDialog#playlistEditorDialog QHeaderView::section:vertical {{
                 background-color: transparent;
-                color: #6d7c93;
+                color: {TOKENS['disabled_fg']};
                 border: none;
-                border-bottom: 1px solid #1c2839;
+                border-bottom: 1px solid {TOKENS['bg_1']};
                 padding: 0;
                 font-size: 12px;
                 font-weight: 500;
-            }
-            QDialog#playlistEditorDialog QLabel#editorCornerLabel {
-                background-color: #101827;
-                border-bottom: 1px solid #253449;
-                color: #8fa1ba;
+            }}
+            QDialog#playlistEditorDialog QLabel#editorCornerLabel {{
+                background-color: {TOKENS['bg_0']};
+                border-bottom: 1px solid {TOKENS['bg_2']};
+                color: {TOKENS['txt_muted']};
                 font-size: 12px;
                 font-weight: 600;
-            }
-            QDialog#playlistEditorDialog QTableWidget#editorTracksTable QTableCornerButton::section {
-                background-color: #101827;
+            }}
+            QDialog#playlistEditorDialog QTableWidget#editorTracksTable QTableCornerButton::section {{
+                background-color: {TOKENS['bg_0']};
                 border: none;
-                border-bottom: 1px solid #253449;
-            }
+                border-bottom: 1px solid {TOKENS['bg_2']};
+            }}
             /* Toolbar buttons: dark chips with an icon, per the mockup. */
-            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral {
-                background-color: #141d2c;
-                border: 1px solid #253449;
+            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral {{
+                background-color: {TOKENS['bg_1']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 10px;
-                color: #dbe4f0;
+                color: {TOKENS['txt_1']};
                 font-weight: 600;
                 padding: 10px 18px;
                 min-height: 22px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:hover {
-                background-color: #1b2637;
-                border-color: #33465f;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:pressed {
-                background-color: #101827;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:checked {
-                background-color: #1f2f40;
-                border-color: #2fb8ff;
-                color: #8ad8ff;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:disabled {
-                background-color: #111823;
-                border-color: #1d2938;
-                color: #55637a;
-            }
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:hover {{
+                background-color: {TOKENS['bg_1']};
+                border-color: {TOKENS['bg_3']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:pressed {{
+                background-color: {TOKENS['bg_0']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:checked {{
+                background-color: {TOKENS['chip_accent_bg']};
+                border-color: {TOKENS['accent']};
+                color: {TOKENS['chip_accent_fg']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnNeutral:disabled {{
+                background-color: {TOKENS['bg_0']};
+                border-color: {TOKENS['bg_1']};
+                color: {TOKENS['disabled_fg']};
+            }}
             /* Destructive: red text on a dark chip rather than a solid red slab, so it
                is legible as dangerous without dominating the toolbar. */
-            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive {
-                background-color: #1d1620;
-                border: 1px solid #5e2b32;
+            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive {{
+                background-color: {TOKENS['danger_bg']};
+                border: 1px solid {TOKENS['danger_border']};
                 border-radius: 10px;
-                color: #ff8b86;
+                color: {TOKENS['danger_fg']};
                 font-weight: 600;
                 padding: 10px 18px;
                 min-height: 22px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive:hover {
-                background-color: #2a1a20;
-                border-color: #7a3b44;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive:disabled {
-                background-color: #111823;
-                border-color: #1d2938;
-                color: #55637a;
-            }
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive:hover {{
+                background-color: {TOKENS['danger_bg']};
+                border-color: {TOKENS['danger_border']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnDestructive:disabled {{
+                background-color: {TOKENS['bg_0']};
+                border-color: {TOKENS['bg_1']};
+                color: {TOKENS['disabled_fg']};
+            }}
             /* Save is the one committing action, so it is the one filled button. */
-            QDialog#playlistEditorDialog QPushButton#editorBtnPrimary {
-                background-color: #16a34a;
-                border: 1px solid #22c55e;
+            QDialog#playlistEditorDialog QPushButton#editorBtnPrimary {{
+                background-color: {TOKENS['ok_border']};
+                border: 1px solid {TOKENS['accent_ok']};
                 border-radius: 10px;
-                color: #ffffff;
+                color: {TOKENS['txt_title']};
                 font-weight: 700;
                 padding: 10px 22px;
                 min-height: 22px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnPrimary:hover {
-                background-color: #1cb555;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnPrimary:disabled {
-                background-color: #111823;
-                border-color: #1d2938;
-                color: #55637a;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnDanger {
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnPrimary:hover {{
+                background-color: {TOKENS['ok_border']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnPrimary:disabled {{
+                background-color: {TOKENS['bg_0']};
+                border-color: {TOKENS['bg_1']};
+                color: {TOKENS['disabled_fg']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnDanger {{
                 background-color: transparent;
-                border: 1px solid #253449;
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 10px;
-                color: #c9d1df;
+                color: {TOKENS['txt_1']};
                 font-weight: 600;
                 padding: 10px 22px;
                 min-height: 22px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnDanger:hover {
-                background-color: #1b2637;
-                color: #f2f6fc;
-            }
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnDanger:hover {{
+                background-color: {TOKENS['bg_1']};
+                color: {TOKENS['txt_0']};
+            }}
             /* Primary cover action: the accent-filled control on the left panel. */
-            QDialog#playlistEditorDialog QPushButton#editorBtnAccent {
-                background-color: #2fb8ff;
-                border: 1px solid #2fb8ff;
+            QDialog#playlistEditorDialog QPushButton#editorBtnAccent {{
+                background-color: {TOKENS['accent']};
+                border: 1px solid {TOKENS['accent']};
                 border-radius: 10px;
-                color: #06121f;
+                color: {TOKENS['bg_0']};
                 font-weight: 700;
                 padding: 11px 16px;
                 min-height: 22px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnAccent:hover {
-                background-color: #57c7ff;
-                border-color: #57c7ff;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorBtnAccent:disabled {
-                background-color: #111823;
-                border-color: #1d2938;
-                color: #55637a;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorRowMenuButton {
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnAccent:hover {{
+                background-color: {TOKENS['accent_hover']};
+                border-color: {TOKENS['accent_hover']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorBtnAccent:disabled {{
+                background-color: {TOKENS['bg_0']};
+                border-color: {TOKENS['bg_1']};
+                color: {TOKENS['disabled_fg']};
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorRowMenuButton {{
                 background: transparent;
                 border: none;
                 border-radius: 6px;
@@ -4669,15 +4709,15 @@ class PlaylistEditorDialog(QDialog):
                 margin: 0px;
                 min-width: 0px;
                 min-height: 0px;
-            }
-            QDialog#playlistEditorDialog QPushButton#editorRowMenuButton:hover {
-                background-color: #24344c;
-            }
-            QDialog#playlistEditorDialog QFrame#editorActionBar {
-                background-color: #101827;
-                border: 1px solid #253449;
+            }}
+            QDialog#playlistEditorDialog QPushButton#editorRowMenuButton:hover {{
+                background-color: {TOKENS['bg_2']};
+            }}
+            QDialog#playlistEditorDialog QFrame#editorActionBar {{
+                background-color: {TOKENS['bg_0']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 14px;
-            }
+            }}
         """
         
     def setup_ui(self):
@@ -4782,7 +4822,7 @@ class PlaylistEditorDialog(QDialog):
         status_row.setSpacing(SPACE_SM)
         self.cover_status_icon = QLabel()
         self.cover_status_icon.setPixmap(
-            _make_editor_icon("check_badge", "#2ed27a", 16).pixmap(QSize(16, 16))
+            _make_editor_icon("check_badge", f"{TOKENS['accent_ok']}", 16).pixmap(QSize(16, 16))
         )
         self.cover_status_icon.setFixedSize(16, 16)
         status_row.addWidget(self.cover_status_icon, 0, Qt.AlignmentFlag.AlignTop)
@@ -4794,7 +4834,7 @@ class PlaylistEditorDialog(QDialog):
 
         self.change_cover_btn = QPushButton("Change Cover...")
         self.change_cover_btn.setObjectName("editorBtnAccent")
-        self.change_cover_btn.setIcon(_make_editor_icon("image", "#06121f"))
+        self.change_cover_btn.setIcon(_make_editor_icon("image", f"{TOKENS['bg_0']}"))
         self.change_cover_btn.setIconSize(QSize(18, 18))
         self.change_cover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.change_cover_btn.clicked.connect(self.choose_cover_image)
@@ -4803,7 +4843,7 @@ class PlaylistEditorDialog(QDialog):
 
         self.clear_cover_btn = QPushButton("Clear Pending Cover")
         self.clear_cover_btn.setObjectName("editorBtnNeutral")
-        self.clear_cover_btn.setIcon(_make_editor_icon("trash", "#c9d1df"))
+        self.clear_cover_btn.setIcon(_make_editor_icon("trash", f"{TOKENS['txt_1']}"))
         self.clear_cover_btn.setIconSize(QSize(18, 18))
         self.clear_cover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_cover_btn.clicked.connect(self.clear_pending_cover)
@@ -4829,7 +4869,7 @@ class PlaylistEditorDialog(QDialog):
         self.search_input.setClearButtonEnabled(True)
         # Magnifier lives inside the field, replacing the external "Search:" label.
         self.search_input.addAction(
-            _make_editor_icon("search", "#7f92ad"),
+            _make_editor_icon("search", f"{TOKENS['txt_muted']}"),
             QLineEdit.ActionPosition.LeadingPosition,
         )
         self.search_input.textChanged.connect(self.filter_tracks)
@@ -4837,7 +4877,7 @@ class PlaylistEditorDialog(QDialog):
 
         self.highlight_duplicates_button = QPushButton()
         self.highlight_duplicates_button.setObjectName("editorFilterButton")
-        self.highlight_duplicates_button.setIcon(_make_editor_icon("sliders", "#8fa1ba"))
+        self.highlight_duplicates_button.setIcon(_make_editor_icon("sliders", f"{TOKENS['txt_muted']}"))
         self.highlight_duplicates_button.setIconSize(QSize(20, 20))
         self.highlight_duplicates_button.setFixedSize(38, 38)
         self.highlight_duplicates_button.setCheckable(True)
@@ -4878,7 +4918,7 @@ class PlaylistEditorDialog(QDialog):
         self.tracks_table.setColumnWidth(4, 56)
 
         duration_header = QTableWidgetItem("Duration")
-        duration_header.setIcon(_make_editor_icon("clock", "#8fa1ba", 14))
+        duration_header.setIcon(_make_editor_icon("clock", f"{TOKENS['txt_muted']}", 14))
         self.tracks_table.setHorizontalHeaderItem(3, duration_header)
         self.tracks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tracks_table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
@@ -4915,7 +4955,7 @@ class PlaylistEditorDialog(QDialog):
         button_layout.setSpacing(SPACE_SM)
 
         def toolbar_button(text, icon_name, handler, object_name="editorBtnNeutral",
-                           tint="#c9d1df", enabled=False):
+                           tint=f"{TOKENS['txt_1']}", enabled=False):
             button = QPushButton(text)
             button.setObjectName(object_name)
             button.setIcon(_make_editor_icon(icon_name, tint))
@@ -4928,7 +4968,7 @@ class PlaylistEditorDialog(QDialog):
 
         self.delete_button = toolbar_button(
             "Delete Selected", "trash", self.delete_selected,
-            object_name="editorBtnDestructive", tint="#ff8b86",
+            object_name="editorBtnDestructive", tint=f"{TOKENS['danger_fg']}",
         )
         self.move_up_button = toolbar_button("Move Up", "chevrons_up", self.move_up)
         self.move_down_button = toolbar_button("Move Down", "chevrons_down", self.move_down)
@@ -4945,7 +4985,7 @@ class PlaylistEditorDialog(QDialog):
 
         self.save_button = toolbar_button(
             "Save Changes", "check_circle", self.save_changes,
-            object_name="editorBtnPrimary", tint="#ffffff",
+            object_name="editorBtnPrimary", tint=f"{TOKENS['txt_title']}",
         )
 
         self.cancel_button = toolbar_button(
@@ -4960,7 +5000,7 @@ class PlaylistEditorDialog(QDialog):
         """Put the per-row overflow button, centred, in the trailing column."""
         button = QPushButton()
         button.setObjectName("editorRowMenuButton")
-        button.setIcon(_make_dots_icon("#7f92ad", 18))
+        button.setIcon(_make_dots_icon(f"{TOKENS['txt_muted']}", 18))
         button.setIconSize(QSize(18, 18))
         button.setFixedSize(28, 28)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -5269,7 +5309,7 @@ class PlaylistEditorDialog(QDialog):
             if any(signature):
                 duplicate_counts[signature] = duplicate_counts.get(signature, 0) + 1
 
-        duplicate_color = QColor("#4b355f")
+        duplicate_color = QColor(f"{TOKENS['neutral_bg']}")
         normal_color = QColor()
         for row in range(self.tracks_table.rowCount()):
             signature = self._snapshot_row_signature(row)
@@ -5510,27 +5550,27 @@ class PlaylistEditorDialog(QDialog):
         
         # Create context menu
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #141d2c;
-                color: #e6edf7;
-                border: 1px solid #253449;
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {TOKENS['bg_1']};
+                color: {TOKENS['txt_0']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 10px;
                 padding: 6px;
-            }
-            QMenu::item {
+            }}
+            QMenu::item {{
                 padding: 8px 18px;
                 border-radius: 6px;
-            }
-            QMenu::item:selected {
-                background-color: #24344c;
-                color: #ffffff;
-            }
-            QMenu::separator {
+            }}
+            QMenu::item:selected {{
+                background-color: {TOKENS['bg_2']};
+                color: {TOKENS['txt_title']};
+            }}
+            QMenu::separator {{
                 height: 1px;
-                background: #253449;
+                background: {TOKENS['bg_2']};
                 margin: 6px 8px;
-            }
+            }}
         """)
         
         # Add actions
@@ -5743,27 +5783,27 @@ class PlaylistEditorDialog(QDialog):
             return
 
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #141d2c;
-                color: #e6edf7;
-                border: 1px solid #253449;
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {TOKENS['bg_1']};
+                color: {TOKENS['txt_0']};
+                border: 1px solid {TOKENS['bg_2']};
                 border-radius: 10px;
                 padding: 6px;
-            }
-            QMenu::item {
+            }}
+            QMenu::item {{
                 padding: 8px 18px;
                 border-radius: 6px;
-            }
-            QMenu::item:selected {
-                background-color: #24344c;
-                color: #ffffff;
-            }
-            QMenu::separator {
+            }}
+            QMenu::item:selected {{
+                background-color: {TOKENS['bg_2']};
+                color: {TOKENS['txt_title']};
+            }}
+            QMenu::separator {{
                 height: 1px;
-                background: #253449;
+                background: {TOKENS['bg_2']};
                 margin: 6px 8px;
-            }
+            }}
         """)
 
         actions = {
@@ -5915,10 +5955,10 @@ class PlaylistEditorDialog(QDialog):
     def on_tracks_error(self, error_message):
         """Handle error loading tracks with user-friendly display"""
         self.loading_progress.setValue(0)
-        self.loading_progress.setStyleSheet("""
-            QProgressBar::chunk {
-                background-color: #f44336;
-            }
+        self.loading_progress.setStyleSheet(f"""
+            QProgressBar::chunk {{
+                background-color: {TOKENS['danger_border']};
+            }}
         """)
         self.loading_label.setText("❌ Error Loading Tracks")
         self.loading_detail.setText(f"Error: {error_message}")
@@ -5932,10 +5972,10 @@ class PlaylistEditorDialog(QDialog):
         self.loading_detail.setText("Attempting to reload tracks...")
         self.loading_progress.setValue(0)
         self.retry_loading_btn.setVisible(False)
-        self.loading_progress.setStyleSheet("""
-            QProgressBar::chunk {
-                background-color: #2ed27a;
-            }
+        self.loading_progress.setStyleSheet(f"""
+            QProgressBar::chunk {{
+                background-color: {TOKENS['accent_ok']};
+            }}
         """)
         
         # Restart loading
@@ -6491,6 +6531,8 @@ class SyncThread(QThread):
                 source_tracks = self.get_tidal_tracks(source_url)
             elif "listenbrainz.org" in source_url:
                 source_tracks = self.get_listenbrainz_tracks(source_url)
+            elif youtube_music.is_youtube_url(source_url):
+                source_tracks = self.get_youtube_tracks(source_url)
             elif source_url.endswith('.m3u') or source_url.endswith('.m3u8'):
                 source_tracks = self.get_m3u_tracks(source_url)
 
@@ -6755,6 +6797,19 @@ class SyncThread(QThread):
             return tracks
         except Exception as e:
             logging.error(f"Error getting ListenBrainz tracks: {str(e)}")
+            return []
+
+    def get_youtube_tracks(self, url):
+        """Tracks from a public YouTube / YouTube Music playlist.
+
+        Only metadata is read; nothing is downloaded. Titles are cleaned of upload
+        furniture first -- on a real playlist 40% of them carry "(Official Music
+        Video)" and similar, which the matcher would otherwise take literally.
+        """
+        try:
+            return youtube_music.fetch_playlist(url)["tracks"]
+        except Exception as e:
+            logging.error(f"Error getting YouTube tracks: {str(e)}")
             return []
 
     def get_m3u_tracks(self, file_path):
@@ -7292,18 +7347,18 @@ class TrackMatchConfirmationDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         
         # Main dark theme matching the app
-        self.setStyleSheet("""
-            QDialog { 
-                background-color: #2b2b2b; 
-                color: #ffffff; 
-            }
-            QLabel { 
-                color: #ffffff; 
+        self.setStyleSheet(f"""
+            QDialog {{ 
+                background-color: {TOKENS['bg_2']}; 
+                color: {TOKENS['txt_title']}; 
+            }}
+            QLabel {{ 
+                color: {TOKENS['txt_title']}; 
                 background-color: transparent;
-            }
-            QFrame {
-                background-color: #2b2b2b;
-            }
+            }}
+            QFrame {{
+                background-color: {TOKENS['bg_2']};
+            }}
         """)
         
         # Create main layout
@@ -7317,29 +7372,29 @@ class TrackMatchConfirmationDialog(QDialog):
         scroll_area.setFrameShape(QFrame.NoFrame)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setStyleSheet("""
-            QScrollArea {
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{
                 border: none;
-                background-color: #2b2b2b;
-            }
-            QScrollBar:vertical {
-                background-color: #3a3a3a;
+                background-color: {TOKENS['bg_2']};
+            }}
+            QScrollBar:vertical {{
+                background-color: {TOKENS['bg_3']};
                 width: 12px;
                 border-radius: 6px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #555555;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {TOKENS['txt_muted']};
                 border-radius: 6px;
                 min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #666666;
-            }
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {TOKENS['txt_muted']};
+            }}
         """)
         
         # Content widget inside scroll area
         content_widget = QWidget()
-        content_widget.setStyleSheet("background-color: #2b2b2b;")
+        content_widget.setStyleSheet(f"background-color: {TOKENS['bg_2']};")
         content_layout = QVBoxLayout(content_widget)
         content_layout.setSpacing(25)
         content_layout.setContentsMargins(10, 10, 10, 10)
@@ -7377,14 +7432,14 @@ class TrackMatchConfirmationDialog(QDialog):
     def create_header_section(self):
         """Create the header with title and score"""
         frame = QFrame()
-        frame.setStyleSheet("background-color: #2b2b2b;")
+        frame.setProperty("surface", "sunken")
         layout = QVBoxLayout(frame)
         layout.setSpacing(15)
         
         # Title
         title = QLabel("🎵 Track Match Confirmation")
         title.setFont(QFont("Arial", 24, QFont.Bold))
-        title.setStyleSheet("color: #00bcd4;")
+        set_widget_status(title, "info")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
@@ -7399,7 +7454,7 @@ class TrackMatchConfirmationDialog(QDialog):
         # Warning
         warning = QLabel("⚠️ Please review this track match carefully")
         warning.setFont(QFont("Arial", 16, QFont.Bold))
-        warning.setStyleSheet("color: #ffa726;")
+        set_widget_status(warning, "warn")
         warning.setAlignment(Qt.AlignCenter)
         layout.addWidget(warning)
         
@@ -7408,14 +7463,14 @@ class TrackMatchConfirmationDialog(QDialog):
     def create_source_section(self):
         """Create the source track section"""
         frame = QFrame()
-        frame.setStyleSheet("background-color: #2b2b2b;")
+        frame.setProperty("surface", "sunken")
         layout = QVBoxLayout(frame)
         layout.setSpacing(10)
         
         # Header
         header = QLabel("📱 SOURCE TRACK (From Streaming Service)")
         header.setFont(QFont("Arial", 16, QFont.Bold))
-        header.setStyleSheet("color: #00bcd4; padding: 5px;")
+        header.setStyleSheet(f"color: {TOKENS['accent']}; padding: 5px;")
         layout.addWidget(header)
         
         # Content box
@@ -7423,17 +7478,17 @@ class TrackMatchConfirmationDialog(QDialog):
         content_box.setWordWrap(True)
         content_box.setAlignment(Qt.AlignTop)
         content_box.setMinimumHeight(80)
-        content_box.setStyleSheet("""
-            QLabel {
-                background-color: #3a3a3a;
-                border: 2px solid #00bcd4;
+        content_box.setStyleSheet(f"""
+            QLabel {{
+                background-color: {TOKENS['bg_3']};
+                border: 2px solid {TOKENS['accent']};
                 border-radius: 8px;
                 padding: 20px;
                 font-size: 14px;
                 font-weight: bold;
-                color: #ffffff;
+                color: {TOKENS['txt_title']};
                 line-height: 1.4;
-            }
+            }}
         """)
         layout.addWidget(content_box)
         
@@ -7442,14 +7497,14 @@ class TrackMatchConfirmationDialog(QDialog):
     def create_plex_section(self):
         """Create the Plex track section"""
         frame = QFrame()
-        frame.setStyleSheet("background-color: #2b2b2b;")
+        frame.setProperty("surface", "sunken")
         layout = QVBoxLayout(frame)
         layout.setSpacing(10)
         
         # Header
         header = QLabel("🎬 PLEX LIBRARY MATCH")
         header.setFont(QFont("Arial", 16, QFont.Bold))
-        header.setStyleSheet("color: #888888; padding: 5px;")
+        header.setStyleSheet(f"color: {TOKENS['txt_muted']}; padding: 5px;")
         layout.addWidget(header)
         
         # Content box
@@ -7458,17 +7513,17 @@ class TrackMatchConfirmationDialog(QDialog):
         content_box.setWordWrap(True)
         content_box.setAlignment(Qt.AlignTop)
         content_box.setMinimumHeight(80)
-        content_box.setStyleSheet("""
-            QLabel {
-                background-color: #404040;
-                border: 2px solid #666666;
+        content_box.setStyleSheet(f"""
+            QLabel {{
+                background-color: {TOKENS['bg_3']};
+                border: 2px solid {TOKENS['txt_muted']};
                 border-radius: 8px;
                 padding: 20px;
                 font-size: 14px;
                 font-weight: bold;
-                color: #ffffff;
+                color: {TOKENS['txt_title']};
                 line-height: 1.4;
-            }
+            }}
         """)
         layout.addWidget(content_box)
         
@@ -7477,13 +7532,13 @@ class TrackMatchConfirmationDialog(QDialog):
     def create_instructions_section(self):
         """Create the instructions section"""
         frame = QFrame()
-        frame.setStyleSheet("background-color: #2b2b2b;")
+        frame.setProperty("surface", "sunken")
         layout = QVBoxLayout(frame)
         layout.setSpacing(10)
         
         instructions = QLabel("Choose what to do with this track match:")
         instructions.setFont(QFont("Arial", 16, QFont.Bold))
-        instructions.setStyleSheet("color: #ffffff; padding: 10px;")
+        set_widget_status(instructions, "muted")
         instructions.setAlignment(Qt.AlignCenter)
         layout.addWidget(instructions)
         
@@ -7492,12 +7547,12 @@ class TrackMatchConfirmationDialog(QDialog):
     def create_button_section(self):
         """Create the button section"""
         frame = QFrame()
-        frame.setStyleSheet("""
-            QFrame {
-                background-color: #353535;
-                border-top: 2px solid #555555;
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {TOKENS['bg_2']};
+                border-top: 2px solid {TOKENS['txt_muted']};
                 border-radius: 0px;
-            }
+            }}
         """)
         
         layout = QHBoxLayout(frame)
@@ -7507,22 +7562,22 @@ class TrackMatchConfirmationDialog(QDialog):
         # Create buttons
         self.use_btn = self.create_button(
             "✅ Use This Match", 
-            "#00bcd4", 
-            "#00acc1",
+            f"{TOKENS['accent']}", 
+            f"{TOKENS['accent']}",
             self.use_match
         )
         
         self.skip_btn = self.create_button(
             "❌ Skip This Track", 
-            "#666666", 
-            "#777777",
+            f"{TOKENS['txt_muted']}", 
+            f"{TOKENS['txt_muted']}",
             self.skip_track
         )
         
         self.skip_all_btn = self.create_button(
             "⏭️ Skip All Low Matches", 
-            "#888888", 
-            "#999999",
+            f"{TOKENS['txt_muted']}", 
+            f"{TOKENS['txt_muted']}",
             self.skip_all_low_matches
         )
         
@@ -7562,11 +7617,11 @@ class TrackMatchConfirmationDialog(QDialog):
     def get_score_color(self):
         """Get color based on match score"""
         if self.match_score < 70:
-            return "#ff6b6b"  # Soft red
+            return f"{TOKENS['danger_fg']}"  # Soft red
         elif self.match_score < 80:
-            return "#ffa726"  # Soft orange
+            return f"{TOKENS['warn_border']}"  # Soft orange
         else:
-            return "#00bcd4"  # App's teal color
+            return f"{TOKENS['accent']}"  # App's teal color
             
     def get_plex_info(self):
         """Get Plex track info with better formatting"""
@@ -7687,7 +7742,7 @@ class SpotifyLoginDialog(QDialog):
         # Status
         self.status_label = QLabel("Paste your cookie and it will be validated automatically")
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("color: #888888; padding: 10px;")
+        set_widget_status(self.status_label, "muted")
         layout.addWidget(self.status_label)
         
         # Buttons
@@ -7696,20 +7751,20 @@ class SpotifyLoginDialog(QDialog):
         self.ok_button = QPushButton("✅ Save & Login")
         self.ok_button.clicked.connect(self.accept)
         self.ok_button.setEnabled(False)
-        self.ok_button.setStyleSheet("""
-            QPushButton {
-                background-color: #1DB954;
+        self.ok_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {TOKENS['ok_border']};
                 color: white;
                 font-weight: bold;
                 padding: 10px 20px;
                 border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1ed760;
-            }
-            QPushButton:disabled {
-                background-color: #666666;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {TOKENS['ok_border']};
+            }}
+            QPushButton:disabled {{
+                background-color: {TOKENS['txt_muted']};
+            }}
         """)
         button_layout.addWidget(self.ok_button)
         
@@ -7729,15 +7784,15 @@ class SpotifyLoginDialog(QDialog):
         
         if len(cookie_text) < 10:
             self.status_label.setText("Paste your sp_dc cookie value above")
-            self.status_label.setStyleSheet("color: #888;")
+            set_widget_status(self.status_label, "muted")
             self.ok_button.setEnabled(False)
         elif len(cookie_text) < 50:
             self.status_label.setText("❌ Value seems too short - make sure you copied the full value")
-            self.status_label.setStyleSheet("color: #f44336;")
+            set_widget_status(self.status_label, "danger")
             self.ok_button.setEnabled(False)
         else:
             self.status_label.setText("✅ Cookie looks valid! Click 'Save & Login' to continue")
-            self.status_label.setStyleSheet("color: #1DB954; font-weight: bold;")
+            set_widget_status(self.status_label, "ok")
             self.sp_dc_cookie = cookie_text
             self.login_successful = True
             self.ok_button.setEnabled(True)
@@ -7763,7 +7818,7 @@ class SpotifyUserPlaylistsDialog(QDialog):
         # Loading label
         self.loading_label = QLabel("Loading your playlists...")
         self.loading_label.setAlignment(Qt.AlignCenter)
-        self.loading_label.setStyleSheet("color: #888888; padding: 20px;")
+        set_widget_status(self.loading_label, "muted")
         layout.addWidget(self.loading_label)
         
         # Progress bar
@@ -7798,20 +7853,20 @@ class SpotifyUserPlaylistsDialog(QDialog):
         self.import_button = QPushButton("Import Selected Playlists")
         self.import_button.clicked.connect(self.accept)
         self.import_button.setEnabled(False)
-        self.import_button.setStyleSheet("""
-            QPushButton {
-                background-color: #1DB954;
+        self.import_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {TOKENS['ok_border']};
                 color: white;
                 font-weight: bold;
                 padding: 10px 20px;
                 border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1ed760;
-            }
-            QPushButton:disabled {
-                background-color: #666666;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {TOKENS['ok_border']};
+            }}
+            QPushButton:disabled {{
+                background-color: {TOKENS['txt_muted']};
+            }}
         """)
         button_layout.addWidget(self.import_button)
         
@@ -7917,7 +7972,7 @@ class ManualCookieDialog(QDialog):
         # Status
         self.status_label = QLabel("Paste your cookie and click validate")
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("color: #888888; padding: 10px;")
+        set_widget_status(self.status_label, "muted")
         layout.addWidget(self.status_label)
         
         # Buttons
@@ -7926,20 +7981,20 @@ class ManualCookieDialog(QDialog):
         self.ok_button = QPushButton("✅ Use Cookie")
         self.ok_button.clicked.connect(self.accept)
         self.ok_button.setEnabled(False)
-        self.ok_button.setStyleSheet("""
-            QPushButton {
-                background-color: #1DB954;
+        self.ok_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {TOKENS['ok_border']};
                 color: white;
                 font-weight: bold;
                 padding: 10px 20px;
                 border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1ed760;
-            }
-            QPushButton:disabled {
-                background-color: #666666;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {TOKENS['ok_border']};
+            }}
+            QPushButton:disabled {{
+                background-color: {TOKENS['txt_muted']};
+            }}
         """)
         button_layout.addWidget(self.ok_button)
         
@@ -8171,7 +8226,7 @@ class PostOAuthCookieDialog(QDialog):
         # Status
         self.status_label = QLabel("Paste the sp_dc cookie value")
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("color: #888888; padding: 10px;")
+        set_widget_status(self.status_label, "muted")
         layout.addWidget(self.status_label)
         
         # Buttons
@@ -8180,20 +8235,20 @@ class PostOAuthCookieDialog(QDialog):
         self.ok_button = QPushButton("✅ Complete Setup")
         self.ok_button.clicked.connect(self.accept)
         self.ok_button.setEnabled(False)
-        self.ok_button.setStyleSheet("""
-            QPushButton {
-                background-color: #1DB954;
+        self.ok_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {TOKENS['ok_border']};
                 color: white;
                 font-weight: bold;
                 padding: 10px 20px;
                 border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1ed760;
-            }
-            QPushButton:disabled {
-                background-color: #666666;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {TOKENS['ok_border']};
+            }}
+            QPushButton:disabled {{
+                background-color: {TOKENS['txt_muted']};
+            }}
         """)
         button_layout.addWidget(self.ok_button)
         
@@ -9215,6 +9270,8 @@ class PlaylistConverterThread(QThread):
                 tracks, playlist_name, playlist_image_url = self.get_tidal_playlist_info()
             elif "listenbrainz.org" in self.playlist_source:
                 tracks, playlist_name, playlist_image_url = self.get_listenbrainz_playlist_info()
+            elif youtube_music.is_youtube_url(self.playlist_source):
+                tracks, playlist_name, playlist_image_url = self.get_youtube_playlist_info()
             else:
                 raise ValueError("Unsupported playlist source")
 
@@ -9493,6 +9550,21 @@ class PlaylistConverterThread(QThread):
                     raise ValueError(f"Failed to fetch Spotify playlist after {max_retries} attempts: {str(e)}")
         
         raise ValueError("Failed to fetch Spotify playlist after all retry attempts")
+
+    def get_youtube_playlist_info(self):
+        self._ensure_not_cancelled()
+        self.progress_message.emit('Fetching YouTube playlist metadata...')
+        result = youtube_music.fetch_playlist(self.playlist_source)
+
+        tracks = result["tracks"]
+        total = max(1, len(tracks))
+        for index, _track in enumerate(tracks, start=1):
+            self._ensure_not_cancelled()
+            self.progress_update.emit(int(index / total * 50))
+            self.progress_message.emit(f"Processing YouTube track {index}/{total}")
+
+        logging.info(f"Fetched {len(tracks)} tracks from YouTube playlist '{result['name']}'")
+        return tracks, result["name"], result["image_url"]
 
     def get_deezer_playlist_info(self):
         self._ensure_not_cancelled()
@@ -10061,8 +10133,8 @@ class LibraryDuplicateManagerDialog(QDialog):
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
 
-        muted = QColor("#8fa1ba")
-        keep_colour = QColor("#7ef0b4")
+        muted = QColor(f"{TOKENS['txt_muted']}")
+        keep_colour = QColor(f"{TOKENS['ok_fg']}")
         top_level = []
 
         for index, group in enumerate(self.duplicate_groups, start=1):
@@ -10418,92 +10490,92 @@ class UserSelectionDialog(QDialog):
         self.setMinimumSize(620, 500)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
 
-        self.setStyleSheet("""
-            QDialog#userSelectionDialog {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #121b2b, stop:1 #0f1828);
-                border: 1px solid #344d70;
+        self.setStyleSheet(f"""
+            QDialog#userSelectionDialog {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {TOKENS['bg_0']}, stop:1 {TOKENS['bg_0']});
+                border: 1px solid {TOKENS['bg_3']};
                 border-radius: 12px;
-            }
-            QFrame#userSelectionHeaderCard {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1d2c43, stop:1 #1a2334);
-                border: 1px solid #465876;
+            }}
+            QFrame#userSelectionHeaderCard {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {TOKENS['bg_2']}, stop:1 {TOKENS['bg_1']});
+                border: 1px solid {TOKENS['border']};
                 border-radius: 12px;
-            }
-            QLabel#userSelectionTitle {
-                color: #f4f8ff;
+            }}
+            QLabel#userSelectionTitle {{
+                color: {TOKENS['txt_title']};
                 font-size: 25px;
                 font-weight: 800;
-            }
-            QLabel#userSelectionSubtitle {
-                color: #b8c9df;
+            }}
+            QLabel#userSelectionSubtitle {{
+                color: {TOKENS['txt_subtle']};
                 font-size: 13px;
-            }
-            QLabel#userSelectionChip {
-                color: #8ad8ff;
-                background-color: #1f2f40;
-                border: 1px solid #2fb8ff;
+            }}
+            QLabel#userSelectionChip {{
+                color: {TOKENS['chip_accent_fg']};
+                background-color: {TOKENS['chip_accent_bg']};
+                border: 1px solid {TOKENS['accent']};
                 border-radius: 10px;
                 padding: 4px 10px;
                 font-size: 11px;
                 font-weight: 700;
-            }
-            QListWidget#userSelectionList {
-                background-color: #16253a;
-                border: 1px solid #36527a;
+            }}
+            QListWidget#userSelectionList {{
+                background-color: {TOKENS['bg_1']};
+                border: 1px solid {TOKENS['bg_3']};
                 border-radius: 10px;
-                color: #f3f8ff;
+                color: {TOKENS['txt_title']};
                 padding: 8px;
                 outline: none;
                 font-size: 14px;
-            }
-            QListWidget#userSelectionList::item {
-                background-color: #1d2e46;
-                border: 1px solid #345173;
+            }}
+            QListWidget#userSelectionList::item {{
+                background-color: {TOKENS['bg_2']};
+                border: 1px solid {TOKENS['bg_3']};
                 border-radius: 8px;
                 padding: 12px 14px;
                 margin: 4px 0;
-            }
-            QListWidget#userSelectionList::item:hover {
-                background-color: #29415f;
-                border: 1px solid #4b6f9d;
-            }
-            QListWidget#userSelectionList::item:selected {
-                background-color: #2c8fdb;
-                border: 1px solid #4fa8ee;
-                color: #ffffff;
-            }
-            QPushButton#userSelectPrimaryButton {
-                background-color: #2fb8ff;
-                border: 1px solid #53c6ff;
+            }}
+            QListWidget#userSelectionList::item:hover {{
+                background-color: {TOKENS['bg_3']};
+                border: 1px solid {TOKENS['border_scroll_handle']};
+            }}
+            QListWidget#userSelectionList::item:selected {{
+                background-color: {TOKENS['accent_pressed']};
+                border: 1px solid {TOKENS['accent_hover']};
+                color: {TOKENS['txt_title']};
+            }}
+            QPushButton#userSelectPrimaryButton {{
+                background-color: {TOKENS['accent']};
+                border: 1px solid {TOKENS['accent_hover']};
                 border-radius: 9px;
-                color: #ffffff;
+                color: {TOKENS['txt_title']};
                 font-size: 14px;
                 font-weight: 800;
                 padding: 10px 18px;
                 min-width: 140px;
-            }
-            QPushButton#userSelectPrimaryButton:hover {
-                background-color: #239ede;
-            }
-            QPushButton#userSelectPrimaryButton:pressed {
-                background-color: #1f88c0;
-            }
-            QPushButton#userSelectSecondaryButton {
-                background-color: #24364f;
-                border: 1px solid #4a6187;
+            }}
+            QPushButton#userSelectPrimaryButton:hover {{
+                background-color: {TOKENS['accent_pressed']};
+            }}
+            QPushButton#userSelectPrimaryButton:pressed {{
+                background-color: {TOKENS['accent_pressed']};
+            }}
+            QPushButton#userSelectSecondaryButton {{
+                background-color: {TOKENS['bg_2']};
+                border: 1px solid {TOKENS['border_soft']};
                 border-radius: 9px;
-                color: #d9e7ff;
+                color: {TOKENS['txt_metric']};
                 font-size: 14px;
                 font-weight: 700;
                 padding: 10px 18px;
                 min-width: 120px;
-            }
-            QPushButton#userSelectSecondaryButton:hover {
-                background-color: #31496b;
-            }
-            QPushButton#userSelectSecondaryButton:pressed {
-                background-color: #2a3f5c;
-            }
+            }}
+            QPushButton#userSelectSecondaryButton:hover {{
+                background-color: {TOKENS['bg_3']};
+            }}
+            QPushButton#userSelectSecondaryButton:pressed {{
+                background-color: {TOKENS['bg_2']};
+            }}
         """)
 
         layout = QVBoxLayout(self)
@@ -10704,6 +10776,11 @@ class PlexPlaylistManager(QMainWindow):
         self._update_startup_progress("Preparing metadata services...", 84)
         self.setup_metadata_service()
         self._update_startup_progress("Finalizing window...", 94)
+        _app = QApplication.instance()
+        if _app is not None:
+            # Palette first: widgets Qt paints itself read it rather than the QSS.
+            _app.setPalette(build_qpalette())
+            _app.setStyleSheet(self.get_stylesheet())
         self.setStyleSheet(self.get_stylesheet())
         self.setWindowTitle('Syncra - Playlist Manager')
         self.setWindowIcon(get_app_icon())
@@ -10878,7 +10955,7 @@ class PlexPlaylistManager(QMainWindow):
         self.home_btn.clicked.connect(lambda: self.navigate_to_page(0, "Home", "Quick actions and system overview"))
         self.connection_btn.clicked.connect(lambda: self.navigate_to_page(1, "Connection", "Connect and authenticate with Plex"))
         self.playlists_btn.clicked.connect(lambda: self.navigate_to_page(2, "Playlists", "Manage import, export, and editing"))
-        self.streaming_btn.clicked.connect(lambda: self.navigate_to_page(3, "Streaming Import", "Import from Spotify, Deezer, Tidal, ListenBrainz, and Apple Music XML"))
+        self.streaming_btn.clicked.connect(lambda: self.navigate_to_page(3, "Streaming Import", "Import from Spotify, Deezer, Tidal, YouTube, ListenBrainz, and Apple Music XML"))
         self.local_tracks_btn.clicked.connect(lambda: self.navigate_to_page(4, "Local Tracks", "Scan folders and build playlists"))
         self.sync_btn.clicked.connect(lambda: self.navigate_to_page(5, "Sync Manager", "Configure recurring sync jobs"))
         self.tools_btn.clicked.connect(lambda: self.navigate_to_page(6, "Tools & Utilities", "Advanced maintenance and analysis"))
@@ -11163,7 +11240,7 @@ class PlexPlaylistManager(QMainWindow):
         fetch_quick.clicked.connect(lambda: self.navigate_to_page(2, "Playlists", "Manage import, export, and editing"))
         self._set_button_icon(fetch_quick, "playlists", QStyle.StandardPixmap.SP_FileDialogListView)
         stream_quick = ModernButton("Import Streaming URL")
-        stream_quick.clicked.connect(lambda: self.navigate_to_page(3, "Streaming Import", "Import from Spotify, Deezer, Tidal, ListenBrainz, and Apple Music XML"))
+        stream_quick.clicked.connect(lambda: self.navigate_to_page(3, "Streaming Import", "Import from Spotify, Deezer, Tidal, YouTube, ListenBrainz, and Apple Music XML"))
         self._set_button_icon(stream_quick, "streaming_import", QStyle.StandardPixmap.SP_MediaPlay)
         sync_quick = ModernButton("Open Sync Manager")
         sync_quick.clicked.connect(lambda: self.navigate_to_page(5, "Sync Manager", "Configure recurring sync jobs"))
@@ -11373,7 +11450,7 @@ class PlexPlaylistManager(QMainWindow):
 
         self.sync_source_input = QLineEdit()
         self.sync_source_input.setMinimumHeight(CONTROL_HEIGHT)
-        self.sync_source_input.setPlaceholderText("Enter streaming URL (Spotify/Deezer/Tidal/ListenBrainz) or M3U file path")
+        self.sync_source_input.setPlaceholderText("Enter streaming URL (Spotify/Deezer/Tidal/YouTube/ListenBrainz) or M3U file path")
         self.sync_source_input.setMinimumWidth(SIDE_FIELD_MIN)
         self.sync_source_input.setMaximumWidth(FIELD_MAX_WIDTH)
         add_config_layout.addWidget(self.sync_source_input, 1, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -12772,6 +12849,29 @@ class PlexPlaylistManager(QMainWindow):
         layout = QVBoxLayout(page)
         self.add_unified_page_header(layout, "Settings", "Adjust feature flags, metadata behavior, and matching preferences", "settings")
 
+        # Appearance
+        appearance_group = QGroupBox("🎨 Appearance")
+        appearance_layout = QFormLayout(appearance_group)
+        self.theme_combo = QComboBox()
+        self.theme_combo.setMinimumHeight(CONTROL_HEIGHT)
+        self.theme_combo.setMaximumWidth(FIELD_MAX_WIDTH)
+        for key, label, description in available_themes():
+            self.theme_combo.addItem(label, key)
+            self.theme_combo.setItemData(
+                self.theme_combo.count() - 1, description, Qt.ItemDataRole.ToolTipRole
+            )
+        index = self.theme_combo.findData(current_theme())
+        if index >= 0:
+            self.theme_combo.setCurrentIndex(index)
+        self.theme_combo.currentIndexChanged.connect(self.on_theme_selected)
+        appearance_layout.addRow("Colour theme:", self.theme_combo)
+
+        self.theme_description_label = QLabel("")
+        set_widget_status(self.theme_description_label, "muted")
+        self.theme_description_label.setWordWrap(True)
+        appearance_layout.addRow("", self.theme_description_label)
+        layout.addWidget(appearance_group)
+
         # Feature flags
         feature_group = QGroupBox("🧪 Runtime Features")
         feature_layout = QFormLayout(feature_group)
@@ -12974,7 +13074,7 @@ class PlexPlaylistManager(QMainWindow):
         )
         matching_info.setWordWrap(True)
         matching_info.setTextFormat(Qt.RichText)
-        matching_info.setStyleSheet("color: #dceaff; padding: 10px; background-color: #1c2a40; border: 1px solid #3f587a; border-radius: 6px; margin: 5px 0;")
+        matching_info.setStyleSheet(f"color: {TOKENS['txt_metric']}; padding: 10px; background-color: {TOKENS['bg_1']}; border: 1px solid {TOKENS['border']}; border-radius: 6px; margin: 5px 0;")
         matching_mode_layout.addWidget(matching_info)
 
         # Radio buttons for matching mode
@@ -12989,27 +13089,27 @@ class PlexPlaylistManager(QMainWindow):
         self.m3u_path_matching_radio.stateChanged.connect(self.on_m3u_matching_mode_changed)
 
         # Style the radio buttons
-        radio_style = """
-            QCheckBox {
-                color: #ffffff;
+        radio_style = f"""
+            QCheckBox {{
+                color: {TOKENS['txt_title']};
                 padding: 8px;
                 font-size: 13px;
                 font-weight: bold;
-            }
-            QCheckBox::indicator {
+            }}
+            QCheckBox::indicator {{
                 width: 18px;
                 height: 18px;
-            }
-            QCheckBox::indicator:unchecked {
-                border: 2px solid #2196F3;
+            }}
+            QCheckBox::indicator:unchecked {{
+                border: 2px solid {TOKENS['accent']};
                 background-color: transparent;
                 border-radius: 9px;
-            }
-            QCheckBox::indicator:checked {
-                border: 2px solid #2196F3;
-                background-color: #2196F3;
+            }}
+            QCheckBox::indicator:checked {{
+                border: 2px solid {TOKENS['accent']};
+                background-color: {TOKENS['accent']};
                 border-radius: 9px;
-            }
+            }}
         """
 
         self.m3u_smart_matching_radio.setStyleSheet(radio_style)
@@ -13025,7 +13125,7 @@ class PlexPlaylistManager(QMainWindow):
         )
         path_warning.setWordWrap(True)
         path_warning.setTextFormat(Qt.RichText)
-        path_warning.setStyleSheet("color: #ffc56a; font-style: italic; padding: 10px; background-color: #1a2435; border: 1px solid #7a6436; border-radius: 6px; margin: 5px 0;")
+        path_warning.setStyleSheet(f"color: {TOKENS['warn_fg']}; font-style: italic; padding: 10px; background-color: {TOKENS['bg_1']}; border: 1px solid {TOKENS['warn_border']}; border-radius: 6px; margin: 5px 0;")
         matching_mode_layout.addWidget(path_warning)
 
         smart_match_cache_group = QGroupBox("Smart Match Cache")
@@ -13033,7 +13133,7 @@ class PlexPlaylistManager(QMainWindow):
 
         self.smart_match_cache_status_label = QLabel("Status: No library selected")
         self.smart_match_cache_status_label.setWordWrap(True)
-        self.smart_match_cache_status_label.setStyleSheet("color: #dceaff; padding: 6px 0;")
+        set_widget_status(self.smart_match_cache_status_label, "muted")
         smart_match_cache_layout.addWidget(self.smart_match_cache_status_label)
 
         self.smart_match_cache_detail_label = QLabel("Built: n/a • Indexed tracks: 0")
@@ -13203,12 +13303,12 @@ class PlexPlaylistManager(QMainWindow):
         if logged_in:
             user_name = SPOTIFY_USER_INFO.get('display_name', 'Spotify User')
             self.spotify_status_label.setText(f"✅ Logged in as: {user_name}")
-            self.spotify_status_label.setStyleSheet("color: #1DB954; font-weight: bold;")
+            set_widget_status(self.spotify_status_label, "ok")
             self.spotify_login_btn.setEnabled(False)
             self.spotify_logout_btn.setEnabled(True)
         else:
             self.spotify_status_label.setText("❌ Not logged in")
-            self.spotify_status_label.setStyleSheet("color: #888888; font-weight: bold;")
+            set_widget_status(self.spotify_status_label, "muted")
             self.spotify_login_btn.setEnabled(True)
             self.spotify_logout_btn.setEnabled(False)
     
@@ -13359,18 +13459,18 @@ class PlexPlaylistManager(QMainWindow):
         
         # Create context menu
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #2a2a2a;
-                color: #ffffff;
-                border: 1px solid #3a3a3a;
-            }
-            QMenu::item {
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {TOKENS['bg_2']};
+                color: {TOKENS['txt_title']};
+                border: 1px solid {TOKENS['bg_3']};
+            }}
+            QMenu::item {{
                 padding: 8px 20px;
-            }
-            QMenu::item:selected {
-                background-color: #4CAF50;
-            }
+            }}
+            QMenu::item:selected {{
+                background-color: {TOKENS['accent_ok']};
+            }}
         """)
         
         # Add actions
@@ -13378,6 +13478,8 @@ class PlexPlaylistManager(QMainWindow):
         menu.addSeparator()
         edit_action = menu.addAction("✏️ Edit Playlist")
         rename_action = menu.addAction("🏷️ Rename Playlist...")
+        share_action = menu.addAction("👥 Share with Household...")
+        takeaway_action = menu.addAction("💾 Export with Audio Files...")
         delete_action = menu.addAction("🗑️ Delete Playlist")
 
         # Show menu and handle selection
@@ -13387,6 +13489,10 @@ class PlexPlaylistManager(QMainWindow):
             self.sort_playlist_by_streaming_service(item)
         elif action == rename_action:
             self.rename_playlist_item(item)
+        elif action == share_action:
+            self.share_playlist_item(item)
+        elif action == takeaway_action:
+            self.export_playlist_with_files(item)
         elif action == edit_action:
             self.edit_playlist_item(item)
         elif action == delete_action:
@@ -13627,7 +13733,7 @@ class PlexPlaylistManager(QMainWindow):
         self.connection_banner.setWordWrap(True)
         self.connection_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.connection_banner.setStyleSheet(
-            "color: #ffd9d9; background-color: #3a1d22; border: 1px solid #7a3b44;"
+            f"color: {TOKENS['danger_fg']}; background-color: {TOKENS['danger_bg']}; border: 1px solid {TOKENS['danger_border']};"
             " border-radius: 8px; padding: 10px; font-size: 12px;"
         )
         self.connection_banner.setVisible(False)
@@ -13867,9 +13973,8 @@ class PlexPlaylistManager(QMainWindow):
         )
 
         self.playlist_card_delegate = self.playlist_listwidget.card_delegate
-        # Read defensively: the page is also built in contexts where load_config()
-        # has not populated app_config.
-        stored_mode = (getattr(self, "app_config", None) or {}).get("playlist_view_mode")
+        # load_config() runs before this page is built and stashes the saved value.
+        stored_mode = getattr(self, "_saved_playlist_view_mode", None)
         self.playlist_view_mode = stored_mode if stored_mode in ("grid", "list") else "grid"
         self._apply_playlist_view_mode()
 
@@ -13917,9 +14022,7 @@ class PlexPlaylistManager(QMainWindow):
         for index in range(self.playlist_listwidget.count()):
             self._refresh_playlist_item_text(self.playlist_listwidget.item(index))
 
-        if isinstance(getattr(self, "app_config", None), dict):
-            self.app_config["playlist_view_mode"] = mode
-            self.save_config()
+        self.save_config()
 
     def _refresh_playlist_item_text(self, item, title=None, subtitle=None):
         """Set an item's roles and rebuild its display string for the current mode."""
@@ -14019,6 +14122,53 @@ class PlexPlaylistManager(QMainWindow):
         self.statusBar().showMessage(message, 5000)
         return True
 
+    def share_playlist_item(self, item):
+        """Open the household sharing dialog for one playlist."""
+        if item is None:
+            return False
+
+        playlist = item.data(Qt.UserRole)
+        if playlist is None:
+            QMessageBox.warning(self, "Share Playlist",
+                                "That playlist is no longer loaded. Fetch playlists and try again.")
+            return False
+
+        if not self.plex_server:
+            QMessageBox.warning(self, "Not Connected", "Connect to your Plex server first.")
+            return False
+
+        if not self.plex_account:
+            QMessageBox.warning(
+                self,
+                "Sign In Required",
+                "Sharing needs your Plex account, not just a server token. "
+                "Sign in on the Connection page and try again.",
+            )
+            return False
+
+        dialog = SharePlaylistDialog(playlist, self.plex_server, self.plex_account, self)
+        dialog.exec()
+        return True
+
+    def export_playlist_with_files(self, item):
+        """Export a playlist plus its audio into a folder or USB drive."""
+        if item is None:
+            return False
+
+        playlist = item.data(Qt.UserRole)
+        if playlist is None:
+            QMessageBox.warning(self, "Export Playlist",
+                                "That playlist is no longer loaded. Fetch playlists and try again.")
+            return False
+
+        if not self.plex_server:
+            QMessageBox.warning(self, "Not Connected", "Connect to your Plex server first.")
+            return False
+
+        dialog = ExportFilesDialog(playlist, self.plex_server, self)
+        dialog.exec()
+        return True
+
     def _rename_sync_config_playlist(self, old_name, new_name):
         """Point an existing sync configuration at the playlist's new name."""
         table = getattr(self, "sync_configs_table", None)
@@ -14086,6 +14236,7 @@ class PlexPlaylistManager(QMainWindow):
         if fetcher is None:
             fetcher = CoverFetcher(self, user_agent=f"Syncra/{__version__}")
             fetcher.cover_ready.connect(self._on_playlist_cover_ready)
+            fetcher.cover_url_resolved.connect(self._on_playlist_poster_resolved)
             self.playlist_cover_fetcher = fetcher
         return fetcher
 
@@ -14126,6 +14277,12 @@ class PlexPlaylistManager(QMainWindow):
         item.setData(COVER_URL_ROLE, url)
         fetcher = self._ensure_cover_fetcher()
 
+        # The listing's thumb is the auto-generated composite even when the user has
+        # uploaded their own poster, so ask the server which one is actually selected.
+        # Queued before the cache check below: that path returns early, and a cached
+        # composite would otherwise mean the custom cover was never looked up at all.
+        self._queue_selected_poster_lookup(item, playlist)
+
         cached = fetcher.cached_bytes(url)
         if cached:
             pixmap = QPixmap()
@@ -14136,6 +14293,74 @@ class PlexPlaylistManager(QMainWindow):
 
         item.setData(COVER_STATE_ROLE, "loading")
         fetcher.request(url)
+
+    def _selected_poster_url(self, playlist):
+        """URL of the poster Plex has actually selected for this playlist.
+
+        Returns "" when the selection is the default composite, so callers can leave
+        the cheap listing thumb in place rather than re-fetching the same image.
+        """
+        try:
+            posters = self.plex_server.query(
+                f"/library/metadata/{playlist.ratingKey}/posters"
+            )
+        except Exception as error:
+            logging.debug(f"Could not read posters for {playlist.title}: {error}")
+            return ""
+
+        chosen = ""
+        for poster in posters:
+            attrib = getattr(poster, "attrib", {}) or {}
+            if str(attrib.get("selected", "0")) != "1":
+                continue
+            if str(attrib.get("ratingKey", "")) == "default://":
+                return ""  # the composite is selected; nothing to swap in
+            chosen = str(attrib.get("key", "") or "").strip()
+            break
+
+        if not chosen:
+            return ""
+        if chosen.startswith("http://") or chosen.startswith("https://"):
+            return chosen
+        side = COVER_SIZE * 2
+        encoded = urllib.parse.quote(chosen, safe="")
+        path = (
+            f"/photo/:/transcode?width={side}&height={side}"
+            f"&minSize=1&upscale=1&url={encoded}"
+        )
+        return self.plex_server.url(path, includeToken=True)
+
+    def _queue_selected_poster_lookup(self, item, playlist):
+        rating_key = str(getattr(playlist, "ratingKey", "") or "")
+        if not rating_key:
+            return
+        item.setData(POSTER_KEY_ROLE, rating_key)
+        self._ensure_cover_fetcher().resolve(
+            rating_key, lambda p=playlist: self._selected_poster_url(p)
+        )
+
+    def _on_playlist_poster_resolved(self, rating_key, url):
+        """A custom poster was found; point the tile at it instead of the composite."""
+        if not url:
+            return
+        for index in range(self.playlist_listwidget.count()):
+            item = self.playlist_listwidget.item(index)
+            if item.data(POSTER_KEY_ROLE) != rating_key:
+                continue
+            if item.data(COVER_URL_ROLE) == url:
+                return
+            item.setData(COVER_URL_ROLE, url)
+
+            fetcher = self._ensure_cover_fetcher()
+            cached = fetcher.cached_bytes(url)
+            if cached:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(cached):
+                    item.setData(COVER_ROLE, rounded_cover(pixmap))
+                    item.setData(COVER_STATE_ROLE, "ready")
+                    return
+            fetcher.request(url)
+            return
 
     def _on_playlist_cover_ready(self, url, data):
         """Cover bytes arrived; build the pixmap here, on the GUI thread."""
@@ -14221,7 +14446,7 @@ class PlexPlaylistManager(QMainWindow):
     def create_streaming_services_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        self.add_unified_page_header(layout, "Streaming Import", "Bring playlists from Spotify, Deezer, Tidal, ListenBrainz, and Apple Music XML into Plex", "streaming_import")
+        self.add_unified_page_header(layout, "Streaming Import", "Bring playlists from Spotify, Deezer, Tidal, YouTube, ListenBrainz, and Apple Music XML into Plex", "streaming_import")
         tabs = QTabWidget()
 
         streaming_tab = QWidget()
@@ -14231,7 +14456,7 @@ class PlexPlaylistManager(QMainWindow):
         spotify_login_layout = QVBoxLayout(spotify_login_group)
 
         self.spotify_status_label = QLabel("Not logged in")
-        self.spotify_status_label.setStyleSheet("color: #888888; font-weight: bold;")
+        set_widget_status(self.spotify_status_label, "muted")
         spotify_login_layout.addWidget(self.spotify_status_label)
 
         login_buttons_layout = QHBoxLayout()
@@ -14262,7 +14487,7 @@ class PlexPlaylistManager(QMainWindow):
 
         self.playlist_url_input = QLineEdit()
         self.playlist_url_input.setMinimumHeight(CONTROL_HEIGHT)
-        self.playlist_url_input.setPlaceholderText("Enter Spotify, Deezer, or Tidal playlist URL")
+        self.playlist_url_input.setPlaceholderText("Enter Spotify, Deezer, Tidal, or YouTube playlist URL")
         self.playlist_url_input.setMaximumWidth(FIELD_MAX_WIDTH)
         streaming_layout.addWidget(self.playlist_url_input)
 
@@ -15660,10 +15885,10 @@ class PlexPlaylistManager(QMainWindow):
                 status = f"⏰ Scheduled for {time_str} (in {hours}h {minutes}m)"
 
             self.scheduled_status_label.setText(status)
-            self.scheduled_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            set_widget_status(self.scheduled_status_label, "ok")
         else:
             self.scheduled_status_label.setText("⚠️ Scheduled time is in the past")
-            self.scheduled_status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
+            set_widget_status(self.scheduled_status_label, "warn")
 
     def check_scheduled_sync(self):
         """Check if it's time to run scheduled sync (called every minute)"""
@@ -16295,13 +16520,13 @@ class PlexPlaylistManager(QMainWindow):
 
         # Header
         header = QLabel("🔍 Configure Library Duplicate Scan")
-        header.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196F3; padding: 10px;")
+        header.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TOKENS['accent']}; padding: 10px;")
         layout.addWidget(header)
 
         # Description
         desc = QLabel("This will scan your entire music library for duplicate tracks based on title and artist matching.")
         desc.setWordWrap(True)
-        desc.setStyleSheet("color: #666; padding: 10px; font-size: 14px;")
+        set_widget_status(desc, "muted")
         layout.addWidget(desc)
 
         # Options group
@@ -16316,20 +16541,20 @@ class PlexPlaylistManager(QMainWindow):
 
         playlist_warning = QLabel("⚠️ Playlist checking can add significant time for large libraries but provides valuable information for decision-making.")
         playlist_warning.setWordWrap(True)
-        playlist_warning.setStyleSheet("color: #ff9800; font-size: 12px; font-style: italic; padding: 5px 20px;")
+        set_widget_status(playlist_warning, "warn")
         options_layout.addWidget(playlist_warning)
 
         # Fast scan info
         fast_info = QLabel("💨 Disable playlist checking for faster scanning (you can still see full track details and delete safely)")
         fast_info.setWordWrap(True)
-        fast_info.setStyleSheet("color: #4CAF50; font-size: 12px; padding: 5px 20px;")
+        fast_info.setStyleSheet(f"color: {TOKENS['accent_ok']}; font-size: 12px; padding: 5px 20px;")
         options_layout.addWidget(fast_info)
 
         layout.addWidget(options_group)
 
         # Time estimate
         time_estimate = QLabel("⏱️ Estimated time: 30 seconds - 5 minutes depending on library size and options")
-        time_estimate.setStyleSheet("color: #666; font-style: italic; padding: 10px; text-align: center;")
+        set_widget_status(time_estimate, "muted")
         layout.addWidget(time_estimate)
 
         # Buttons
@@ -16341,18 +16566,18 @@ class PlexPlaylistManager(QMainWindow):
         button_layout.addWidget(cancel_btn)
 
         start_btn = QPushButton("🚀 Start Scan")
-        start_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
+        start_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {TOKENS['accent_ok']};
                 color: white;
                 font-weight: bold;
                 padding: 8px 16px;
                 border-radius: 6px;
                 border: none;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {TOKENS['success_hover']};
+            }}
         """)
         start_btn.clicked.connect(scan_dialog.accept)
         start_btn.setDefault(True)
@@ -17117,9 +17342,9 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             banner.setVisible(False)
             return
         palette = {
-            "error": ("#ffd9d9", "#3a1d22", "#7a3b44"),
-            "warn": ("#ffeccc", "#3a2f1d", "#7a663b"),
-            "info": ("#dceaff", "#1c2a40", "#3f587a"),
+            "error": (f"{TOKENS['danger_fg']}", f"{TOKENS['danger_bg']}", f"{TOKENS['danger_border']}"),
+            "warn": (f"{TOKENS['warn_fg']}", f"{TOKENS['warn_bg']}", f"{TOKENS['warn_border']}"),
+            "info": (f"{TOKENS['txt_metric']}", f"{TOKENS['bg_1']}", f"{TOKENS['border']}"),
         }
         fg, bg, border = palette.get(level, palette["error"])
         banner.setStyleSheet(
@@ -18123,7 +18348,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         if not self.path_mappings:
             item = QListWidgetItem("No path mappings configured")
-            item.setForeground(QColor('#888888'))
+            item.setForeground(QColor(f'{TOKENS['txt_muted']}'))
             self.path_mappings_list.addItem(item)
         else:
             for mapping in self.path_mappings:
@@ -18225,6 +18450,72 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     # ==================== END PATH MAPPING SYSTEM ====================
 
+    def _playlist_temp_folder(self):
+        """Return the scratch folder used for upload copies, creating and pruning it.
+
+        Playlists are uploaded from a temporary copy so the user's own file is never
+        modified. Keeps the three most recent files for post-mortem on a failed upload.
+        """
+        if hasattr(sys, '_MEIPASS'):
+            # Running as PyInstaller bundle
+            script_dir = os.path.dirname(sys.executable)
+        else:
+            # Running as Python script
+            script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+        temp_folder = os.path.join(script_dir, "playlist_temp")
+        if not os.path.exists(temp_folder):
+            os.makedirs(temp_folder)
+            logging.debug(f"Created temp folder: {temp_folder}")
+
+        # Clean up old temp files - keep only last 3 files. Matches .m3u8 as well so
+        # copies left behind by older versions are cleared out too.
+        try:
+            temp_files = []
+            for file in os.listdir(temp_folder):
+                if file.lower().endswith(('.m3u', '.m3u8')):
+                    file_path = os.path.join(temp_folder, file)
+                    temp_files.append((file_path, os.path.getmtime(file_path)))
+
+            temp_files.sort(key=lambda x: x[1], reverse=True)
+
+            if len(temp_files) > 3:
+                for file_path, _ in temp_files[3:]:
+                    try:
+                        os.remove(file_path)
+                        logging.debug(f"Removed old temp file: {os.path.basename(file_path)}")
+                    except OSError:
+                        pass  # Ignore if file is in use or can't be deleted
+
+            logging.debug(f"Temp folder cleanup: keeping {min(len(temp_files), 3)} most recent files")
+        except Exception as e:
+            logging.debug(f"Temp folder cleanup failed: {e}")
+
+        return temp_folder
+
+    def _copy_playlist_to_temp(self, path):
+        """Copy a playlist verbatim into the temp folder under a .m3u name.
+
+        Used for a .m3u8 whose contents need no rewriting: the bytes are preserved
+        exactly, only the extension of the copy differs. Returns None on failure, which
+        leaves the caller uploading straight from the original -- still without
+        modifying it.
+        """
+        try:
+            temp_folder = self._playlist_temp_folder()
+            temp_path = os.path.join(
+                temp_folder, os.path.splitext(os.path.basename(path))[0] + '.m3u'
+            )
+            if os.path.abspath(temp_path) == os.path.abspath(path):
+                # Refuse to copy a file over itself.
+                return None
+            shutil.copyfile(path, temp_path)
+            logging.info(f"Copied .m3u8 to temp for upload: {temp_path}")
+            return temp_path
+        except Exception as e:
+            logging.warning(f"Could not copy playlist to temp folder: {e}")
+            return None
+
     def _prepare_playlist_for_upload(self, path):
         """Normalize playlist file for Plex upload (handle relative paths, path separators, and Unicode)."""
         temp_path = None
@@ -18282,6 +18573,12 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 break
 
         if not needs_normalization:
+            # A .m3u8 source still needs a temp file even when its paths are clean:
+            # the upload wants a .m3u extension, and the way that used to be achieved
+            # was renaming the user's own file on disk. Copy it instead.
+            if os.path.splitext(path)[1].lower() == '.m3u8':
+                logging.info(f"=== NO NORMALIZATION NEEDED, COPYING .m3u8 FOR UPLOAD: {path} ===")
+                return self._copy_playlist_to_temp(path)
             logging.info(f"=== NO NORMALIZATION NEEDED FOR: {path} ===")
             return None  # No temp file needed
 
@@ -18395,46 +18692,12 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         # Create temp folder for playlist processing
         try:
-            # Get script directory - handle both .py and .exe scenarios
-            if hasattr(sys, '_MEIPASS'):
-                # Running as PyInstaller bundle
-                script_dir = os.path.dirname(sys.executable)
-            else:
-                # Running as Python script
-                script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            temp_folder = self._playlist_temp_folder()
 
-            # Create temp folder
-            temp_folder = os.path.join(script_dir, "playlist_temp")
-            if not os.path.exists(temp_folder):
-                os.makedirs(temp_folder)
-                logging.debug(f"Created temp folder: {temp_folder}")
-
-            # Clean up old temp files - keep only last 3 files
-            try:
-                temp_files = []
-                for file in os.listdir(temp_folder):
-                    if file.endswith('.m3u'):
-                        file_path = os.path.join(temp_folder, file)
-                        temp_files.append((file_path, os.path.getmtime(file_path)))
-
-                # Sort by modification time (newest first)
-                temp_files.sort(key=lambda x: x[1], reverse=True)
-
-                # Remove all but the 3 newest files
-                if len(temp_files) > 3:
-                    for file_path, _ in temp_files[3:]:
-                        try:
-                            os.remove(file_path)
-                            logging.debug(f"Removed old temp file: {os.path.basename(file_path)}")
-                        except OSError:
-                            pass  # Ignore if file is in use or can't be deleted
-
-                logging.debug(f"Temp folder cleanup: keeping {min(len(temp_files), 3)} most recent files")
-            except Exception as e:
-                logging.debug(f"Temp folder cleanup failed: {e}")
-
-            # Use original filename (not _normalized suffix)
-            original_filename = os.path.basename(path)
+            # Always land on a .m3u name. The upload posts the file under a .m3u
+            # filename regardless, and the old way of getting there was renaming the
+            # user's own .m3u8 file on disk.
+            original_filename = os.path.splitext(os.path.basename(path))[0] + '.m3u'
             temp_path = os.path.join(temp_folder, original_filename)
 
             # Remove existing temp file if it exists
@@ -18547,12 +18810,12 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     playlist_name = new_playlist_name
                     logging.info(f"Renamed playlist to: {playlist_name}")
             
-            # Rename .m3u8 to .m3u if necessary
-            if path.endswith('.m3u8'):
-                new_path = path.rsplit('.', 1)[0] + '.m3u'
-                os.rename(path, new_path)
-                path = new_path
-        
+            # NOTE: a .m3u8 source is deliberately left alone here. This used to
+            # os.rename() the user's own file to .m3u before uploading, permanently
+            # changing a file the app was only asked to read.
+            # _prepare_playlist_for_upload() now returns a .m3u temp copy instead,
+            # and the direct upload posts it under a .m3u filename either way.
+
             plex_server = self.server_ip_input.text()
             plex_port = self.server_port_input.text()
             library_section_id = self.section_combo.currentData()
@@ -18915,49 +19178,49 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         dialog.setMinimumHeight(450)
 
         # Apply dark theme styling to dialog
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #1a1a1a;
-                color: #ffffff;
-            }
-            QLabel {
-                color: #ffffff;
-            }
-            QScrollArea {
-                background-color: #1a1a1a;
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background-color: {TOKENS['bg_1']};
+                color: {TOKENS['txt_title']};
+            }}
+            QLabel {{
+                color: {TOKENS['txt_title']};
+            }}
+            QScrollArea {{
+                background-color: {TOKENS['bg_1']};
                 border: none;
-            }
+            }}
         """)
 
         layout = QVBoxLayout(dialog)
 
         # Original track info
         original_info = QLabel(
-            f"<h3 style='color: #2196F3; margin-bottom: 5px;'>Looking for:</h3>"
+            f"<h3 style='color: {TOKENS['accent']}; margin-bottom: 5px;'>Looking for:</h3>"
             f"<p style='font-size: 14px; line-height: 1.6;'>"
-            f"<b style='color: #4CAF50;'>Title:</b> <span style='color: #ffffff;'>{original_title}</span><br>"
-            f"<b style='color: #4CAF50;'>Artist:</b> <span style='color: #ffffff;'>{original_artist or 'Unknown'}</span></p>"
+            f"<b style='color: {TOKENS['accent_ok']};'>Title:</b> <span style='color: {TOKENS['txt_title']};'>{original_title}</span><br>"
+            f"<b style='color: {TOKENS['accent_ok']};'>Artist:</b> <span style='color: {TOKENS['txt_title']};'>{original_artist or 'Unknown'}</span></p>"
         )
         original_info.setTextFormat(Qt.RichText)
-        original_info.setStyleSheet("""
-            background-color: #2a2a2a;
+        original_info.setStyleSheet(f"""
+            background-color: {TOKENS['bg_2']};
             padding: 15px;
             border-radius: 5px;
-            border: 1px solid #3a3a3a;
+            border: 1px solid {TOKENS['bg_3']};
         """)
         layout.addWidget(original_info)
 
         # Instructions
         instructions = QLabel(
-            "<span style='color: #FF9800;'>⚠️</span> "
-            "<span style='color: #ffffff;'>No exact match found. Please select the correct track from the options below, or skip if none match:</span>"
+            f"<span style='color: {TOKENS['warn_border']};'>⚠️</span> "
+            f"<span style='color: {TOKENS['txt_title']};'>No exact match found. Please select the correct track from the options below, or skip if none match:</span>"
         )
         instructions.setTextFormat(Qt.RichText)
         instructions.setWordWrap(True)
-        instructions.setStyleSheet("""
+        instructions.setStyleSheet(f"""
             padding: 12px;
-            background-color: #2a2a2a;
-            border-left: 3px solid #FF9800;
+            background-color: {TOKENS['bg_2']};
+            border-left: 3px solid {TOKENS['warn_border']};
             border-radius: 3px;
             margin-top: 10px;
             margin-bottom: 10px;
@@ -18965,7 +19228,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         layout.addWidget(instructions)
 
         # Candidates list
-        candidates_label = QLabel("<h4 style='color: #2196F3; margin-bottom: 8px;'>Available matches:</h4>")
+        candidates_label = QLabel(f"<h4 style='color: {TOKENS['accent']}; margin-bottom: 8px;'>Available matches:</h4>")
         candidates_label.setTextFormat(Qt.RichText)
         candidates_label.setStyleSheet("padding: 5px;")
         layout.addWidget(candidates_label)
@@ -18974,30 +19237,30 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         button_group = QButtonGroup(dialog)
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet("""
-            QScrollArea {
-                background-color: #1a1a1a;
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {TOKENS['bg_1']};
                 border: none;
-            }
-            QScrollBar:vertical {
-                background-color: #1a1a1a;
+            }}
+            QScrollBar:vertical {{
+                background-color: {TOKENS['bg_1']};
                 width: 12px;
                 border: none;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #4a4a4a;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {TOKENS['border']};
                 border-radius: 6px;
                 min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #5a5a5a;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {TOKENS['border']};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0px;
-            }
+            }}
         """)
         scroll_widget = QWidget()
-        scroll_widget.setStyleSheet("background-color: #1a1a1a;")
+        scroll_widget.setProperty("surface", "sunken")
         scroll_layout = QVBoxLayout(scroll_widget)
 
         radio_buttons = []
@@ -19013,56 +19276,56 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
                 # Create radio button with track info
                 confidence = "🟢" if score >= 80 else "🟡" if score >= 50 else "🔴"
-                confidence_color = "#4CAF50" if score >= 80 else "#FF9800" if score >= 50 else "#f44336"
+                confidence_color = f"{TOKENS['accent_ok']}" if score >= 80 else f"{TOKENS['warn_border']}" if score >= 50 else f"{TOKENS['danger_border']}"
 
                 radio_text = (
-                    f"{confidence} <b style='color: #ffffff; font-size: 14px;'>{track.title}</b> "
-                    f"<span style='color: #aaaaaa;'>by</span> "
-                    f"<span style='color: #2196F3;'>{track_artist}</span><br>"
-                    f"<span style='color: #888888; font-size: 12px;'>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
-                    f"Album: <i style='color: #aaaaaa;'>{album}{year}</i></span><br>"
+                    f"{confidence} <b style='color: {TOKENS['txt_title']}; font-size: 14px;'>{track.title}</b> "
+                    f"<span style='color: {TOKENS['txt_muted']};'>by</span> "
+                    f"<span style='color: {TOKENS['accent']};'>{track_artist}</span><br>"
+                    f"<span style='color: {TOKENS['txt_muted']}; font-size: 12px;'>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+                    f"Album: <i style='color: {TOKENS['txt_muted']};'>{album}{year}</i></span><br>"
                     f"<span style='color: {confidence_color}; font-size: 11px; font-weight: bold;'>"
                     f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Match confidence: {score}%</span>"
                 )
 
                 radio = QRadioButton()
                 radio.setText("")  # We'll use a label for rich text
-                radio.setStyleSheet("""
-                    QRadioButton::indicator {
+                radio.setStyleSheet(f"""
+                    QRadioButton::indicator {{
                         width: 18px;
                         height: 18px;
-                    }
-                    QRadioButton::indicator::unchecked {
-                        border: 2px solid #555555;
-                        background-color: #1a1a1a;
+                    }}
+                    QRadioButton::indicator::unchecked {{
+                        border: 2px solid {TOKENS['txt_muted']};
+                        background-color: {TOKENS['bg_1']};
                         border-radius: 9px;
-                    }
-                    QRadioButton::indicator::unchecked:hover {
-                        border: 2px solid #2196F3;
-                        background-color: #2a2a2a;
-                    }
-                    QRadioButton::indicator::checked {
-                        border: 2px solid #2196F3;
-                        background-color: #2196F3;
+                    }}
+                    QRadioButton::indicator::unchecked:hover {{
+                        border: 2px solid {TOKENS['accent']};
+                        background-color: {TOKENS['bg_2']};
+                    }}
+                    QRadioButton::indicator::checked {{
+                        border: 2px solid {TOKENS['accent']};
+                        background-color: {TOKENS['accent']};
                         border-radius: 9px;
-                    }
+                    }}
                 """)
 
                 label = QLabel(radio_text)
                 label.setTextFormat(Qt.RichText)
                 label.setWordWrap(True)
-                label.setStyleSheet("""
-                    QLabel {
+                label.setStyleSheet(f"""
+                    QLabel {{
                         padding: 12px;
-                        background-color: #1e1e1e;
+                        background-color: {TOKENS['bg_1']};
                         border-radius: 5px;
-                        border: 1px solid #3a3a3a;
+                        border: 1px solid {TOKENS['bg_3']};
                         margin: 3px 0px;
-                    }
-                    QLabel:hover {
-                        background-color: #2a2a2a;
-                        border: 1px solid #2196F3;
-                    }
+                    }}
+                    QLabel:hover {{
+                        background-color: {TOKENS['bg_2']};
+                        border: 1px solid {TOKENS['accent']};
+                    }}
                 """)
 
                 # Make label clickable
@@ -19332,7 +19595,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     def import_streaming_playlist(self):
         playlist_url = self.playlist_url_input.text()
         if not playlist_url:
-            QMessageBox.warning(self, "Missing Information", "Please enter a Spotify, Deezer, Tidal, or ListenBrainz playlist URL.")
+            QMessageBox.warning(self, "Missing Information", "Please enter a Spotify, Deezer, Tidal, YouTube, or ListenBrainz playlist URL.")
             return
 
         if not self.plex_server:
@@ -19768,6 +20031,37 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self._pending_auto_connect = True
 
         self._config_loaded = True
+
+        # Apply the saved palette before anything is shown, so the window never
+        # flashes the default theme on the way to the chosen one.
+        # initUI() runs before this, so the Playlists page has already been built with
+        # the default view; apply the saved one now rather than at construction.
+        self._saved_playlist_view_mode = str(
+            config.get("playlist_view_mode", "") or ""
+        ).strip().lower() or None
+        if (
+            self._saved_playlist_view_mode in ("grid", "list")
+            and hasattr(self, "playlist_listwidget")
+            and self._saved_playlist_view_mode != getattr(self, "playlist_view_mode", "grid")
+        ):
+            try:
+                self.set_playlist_view_mode(self._saved_playlist_view_mode)
+            except Exception as error:
+                logging.warning(f"Could not restore playlist view mode: {error}")
+
+        saved_theme = str(config.get("theme", "") or "").strip().lower()
+        if saved_theme and saved_theme != current_theme():
+            try:
+                self.apply_theme(saved_theme, save=False)
+            except Exception as error:
+                logging.warning(f"Could not apply saved theme {saved_theme!r}: {error}")
+        if getattr(self, "theme_combo", None) is not None:
+            index = self.theme_combo.findData(current_theme())
+            if index >= 0:
+                self.theme_combo.blockSignals(True)
+                self.theme_combo.setCurrentIndex(index)
+                self.theme_combo.blockSignals(False)
+
         self.refresh_feature_dependent_ui()
         self.refresh_smart_match_cache_status()
 
@@ -19799,6 +20093,14 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             
             # Update only Plex-related settings, preserve everything else
             config = existing_config.copy()  # Start with existing config
+
+            # Preferences that live in memory rather than in a widget. This function
+            # rebuilds the file from what is already on disk, so anything only ever
+            # written to self.app_config never reached it -- which is why the chosen
+            # theme and grid/list view were forgotten on every restart.
+            config["theme"] = current_theme()
+            if hasattr(self, "playlist_view_mode"):
+                config["playlist_view_mode"] = self.playlist_view_mode
             
             # Update Plex settings
             # Save password securely using platform-specific credential storage
@@ -19901,7 +20203,68 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
            return False           
 
     def get_stylesheet(self):
-        return MAIN_STYLESHEET
+        """The stylesheet for the palette in force right now."""
+        return build_stylesheet()
+
+    def apply_theme(self, name, save=True):
+        """Switch palette and restyle everything already on screen.
+
+        Almost all colour comes from the application stylesheet, so re-applying it
+        repaints the running window. The few widgets that carry their own stylesheet
+        are rebuilt here; dialogs pick the new palette up when they are next opened.
+        """
+        sheet = set_theme(name)
+        app = QApplication.instance()
+        if app is not None:
+            # The palette matters as much as the stylesheet: anything Qt paints itself
+            # (scroll-area viewports, message boxes, native dialogs) reads the palette,
+            # and leaving it dark under a light theme shows black panels.
+            app.setPalette(build_qpalette())
+            app.setStyleSheet(sheet)
+        self.setStyleSheet(sheet)
+
+        # Long-lived widgets that hold a stylesheet of their own.
+        for refresh in (
+            getattr(self, "_refresh_connection_banner_style", None),
+            getattr(self, "refresh_playlist_covers_for_theme", None),
+        ):
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception as error:
+                    logging.debug(f"Theme refresh step failed: {error}")
+
+        repolish(self)
+        for child in self.findChildren(QWidget):
+            repolish(child)
+
+        if save:
+            # save_config() reads current_theme() directly, so there is nothing to
+            # stage first -- and there is no self.app_config to stage it in.
+            self.save_config()
+
+        logging.info(f"Theme changed to {current_theme()}")
+        return sheet
+
+    def refresh_playlist_covers_for_theme(self):
+        """Regenerate the placeholder tiles, which are painted from palette colours."""
+        widget = getattr(self, "playlist_listwidget", None)
+        if widget is None:
+            return
+        for index in range(widget.count()):
+            item = widget.item(index)
+            if item.data(COVER_STATE_ROLE) != "ready":
+                item.setData(COVER_ROLE, None)
+        widget.viewport().update()
+
+    def on_theme_selected(self, _index=None):
+        combo = getattr(self, "theme_combo", None)
+        if combo is None:
+            return
+        name = combo.currentData()
+        if name and name != current_theme():
+            self.apply_theme(name)
+            self.statusBar().showMessage(f"Theme changed to {combo.currentText()}.", 4000)
 
     def closeEvent(self, event):
         """Handle application close event"""
@@ -20010,6 +20373,8 @@ class PlaylistNameFetchThread(QThread):
                 playlist_name = self.get_tidal_playlist_name()
             elif "listenbrainz.org" in self.playlist_url:
                 playlist_name = self.get_listenbrainz_playlist_name()
+            elif youtube_music.is_youtube_url(self.playlist_url):
+                playlist_name = youtube_music.fetch_playlist_name(self.playlist_url)
             else:
                 raise ValueError("Unsupported playlist source")
             
