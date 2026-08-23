@@ -8,7 +8,7 @@
 ![Home](https://github.com/user-attachments/assets/980e7ef3-069f-4f2a-9ab1-4658130fb02e)
 
 ### Advanced Playlist Editor
-![Playlist Editor](https://github.com/user-attachments/assets/2d463fd3-e548-4c9e-8605-51c5afeda003)
+![Playlist Editor](https://github.com/user-attachments/assets/a6703fa8-dbd7-4dca-8796-cc57ee9dd962)
 
 ### Sync Manager
 ![Sync Manager](https://github.com/user-attachments/assets/c68ab5eb-dab6-493a-b51f-df90b3206dd5)
