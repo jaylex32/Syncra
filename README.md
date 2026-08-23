@@ -5,16 +5,16 @@
 ## 📸 Screenshots
 
 ### Home
-![Home](https://github.com/user-attachments/assets/e9857b64-c7d4-4cbb-99e2-ef92ed2ca37c)
+![Home](https://github.com/user-attachments/assets/980e7ef3-069f-4f2a-9ab1-4658130fb02e)
 
 ### Advanced Playlist Editor
-![Playlist Editor](https://github.com/user-attachments/assets/c9b11924-f87f-4e3f-8ebb-c9dfb9c3f17f)
+![Playlist Editor](https://github.com/user-attachments/assets/2d463fd3-e548-4c9e-8605-51c5afeda003)
 
 ### Sync Manager
-![Sync Manager](https://github.com/user-attachments/assets/fb07dc8d-a905-457b-91f2-6a436a2fdf2d)
+![Sync Manager](https://github.com/user-attachments/assets/c68ab5eb-dab6-493a-b51f-df90b3206dd5)
 
 ### Tools & Utilities
-![Tools & Utilities](https://github.com/user-attachments/assets/02bd9f7d-7eab-4c83-950a-5a9d8ea20863)
+![Tools & Utilities](https://github.com/user-attachments/assets/012e5289-6fab-4d86-baf3-cc044d1d9979)
 
 ## ✨ Features
 
