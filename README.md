@@ -1,3 +1,4 @@
+<img width="1024" height="1024" alt="Image" src="https://github.com/user-attachments/assets/cd49a523-6908-49cd-ab4e-13b774ba7103" />
 # Syncra - Plex Playlist Manager
 
 🎵 **Advanced playlist management for Plex Media Server with streaming service integration**
