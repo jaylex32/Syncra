@@ -121,3 +121,4 @@ duplicate_deletion_log_*.txt
 
 # Editor workspace
 *.code-workspace
+_pibuild/

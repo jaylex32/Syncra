@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.22.1 - 2026-08-23
+
+Hotfix. **v2.22.0 would not start** -- it failed on launch with
+`ImportError: cannot import name 'legacy_main' from 'syncra.app'`. Please update.
+
+### 🚨 Fixed: the packaged app could not start
+- One line used an f-string with its own quote character nested inside the replacement
+  field. That is PEP 701, valid from **Python 3.12** and a `SyntaxError` before it --
+  and the release workflow builds on **Python 3.11**.
+- PyInstaller does not fail when a module will not compile; it logs and carries on. So
+  `syncra/app/legacy_main.py` was silently left out of the executable. The shipped
+  build contained 6 of the app's 47 modules, and died at startup pointing at an import
+  error that had nothing to do with the real cause.
+- Development and the test suite both ran on Python 3.12, so every test passed and the
+  build went green.
+- Added a `compileall` step to both build workflows, so a file that will not compile
+  now fails the build instead of quietly shipping a broken binary.
+- Added a test that compiles every source file with the minimum supported Python
+  (3.11), and a second that fails if the workflows move to a different version without
+  that minimum being updated.
+
 ## v2.22.0 - 2026-08-23
 
 Five colour themes including a light one, YouTube playlist import, sharing playlists

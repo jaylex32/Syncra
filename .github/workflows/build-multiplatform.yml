@@ -46,6 +46,13 @@ jobs:
         pip install pyinstaller
         pip install -r requirements.txt
 
+    - name: Verify sources compile on this Python
+      # PyInstaller does not fail when a module will not compile -- it logs and moves
+      # on, silently leaving it out of the executable. v2.22.0 shipped without
+      # syncra/app/legacy_main.py for exactly that reason, because one line used
+      # Python 3.12 f-string syntax while this job builds on 3.11.
+      run: python -m compileall -q syncra main.py
+
     - name: Verify PyInstaller
       run: |
         pyinstaller --version

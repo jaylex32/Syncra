@@ -18,7 +18,7 @@ import socket
 import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "2.22.0"
+__version__ = "2.22.1"
 from typing import Dict, Any, Optional, List, Tuple
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
@@ -18348,7 +18348,7 @@ Last Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         if not self.path_mappings:
             item = QListWidgetItem("No path mappings configured")
-            item.setForeground(QColor(f'{TOKENS['txt_muted']}'))
+            item.setForeground(QColor(TOKENS["txt_muted"]))
             self.path_mappings_list.addItem(item)
         else:
             for mapping in self.path_mappings:
